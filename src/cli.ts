@@ -13,6 +13,7 @@ const { values, positionals } = parseArgs({
     dir: { type: "string", short: "d", default: process.cwd() },
     "max-concurrent": { type: "string", default: "5" },
     "max-queue": { type: "string", default: "50" },
+    "queue-timeout": { type: "string", default: "120" },
     "rate-limit": { type: "string", default: "60" },
     help: { type: "boolean", short: "h", default: false },
     version: { type: "boolean", short: "v", default: false },
@@ -22,7 +23,7 @@ const { values, positionals } = parseArgs({
 const command = positionals[0] || "serve";
 
 if (values.version) {
-  console.log("0.4.1");
+  console.log("0.5.0");
   process.exit(0);
 }
 
@@ -39,6 +40,7 @@ if (values.help || command === "help") {
     -d, --dir <path>            Working directory for Claude (default: cwd)
     --max-concurrent <number>   Max concurrent requests (default: 5)
     --max-queue <number>        Max queued requests (default: 50)
+    --queue-timeout <seconds>   Max time a request waits in queue before 408 (default: 120)
     --rate-limit <number>       Requests per minute per client (default: 60)
     -v, --version               Print version
     -h, --help                  Show this help
@@ -63,6 +65,7 @@ if (command === "serve") {
     workingDir: values.dir,
     maxConcurrent: parseInt(values["max-concurrent"]!, 10),
     maxQueueSize: parseInt(values["max-queue"]!, 10),
+    queueTimeoutMs: parseInt(values["queue-timeout"]!, 10) * 1000,
     requestsPerMinute: parseInt(values["rate-limit"]!, 10),
   }).then((handle) => {
     // Graceful shutdown on SIGTERM/SIGINT

@@ -28,7 +28,7 @@ export class RequestQueue {
   constructor(opts: QueueOptions = {}) {
     this.maxConcurrent = opts.maxConcurrent ?? 5;
     this.maxQueueSize = opts.maxQueueSize ?? 50;
-    this.queueTimeoutMs = opts.queueTimeoutMs ?? 30_000;
+    this.queueTimeoutMs = opts.queueTimeoutMs ?? 120_000;
   }
 
   async run<T>(fn: () => Promise<T>): Promise<T> {

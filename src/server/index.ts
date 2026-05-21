@@ -68,6 +68,7 @@ export interface ApiServerOptions {
   workingDir?: string;
   maxConcurrent?: number;
   maxQueueSize?: number;
+  queueTimeoutMs?: number;
   requestsPerMinute?: number;
   requestTimeoutMs?: number;
   streamTimeoutMs?: number;
@@ -92,6 +93,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
   const queue = new RequestQueue({
     maxConcurrent: opts.maxConcurrent,
     maxQueueSize: opts.maxQueueSize,
+    queueTimeoutMs: opts.queueTimeoutMs,
   });
   const rateLimiter = new RateLimiter({ requestsPerMinute: opts.requestsPerMinute });
   const circuitBreaker = new CircuitBreaker();
@@ -150,7 +152,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
 
     // GET / — server info
     if (req.method === "GET" && path === "/") {
-      jsonResponse(res, 200, { name: "otterly", version: "0.4.1", playground: "/playground" });
+      jsonResponse(res, 200, { name: "otterly", version: "0.5.0", playground: "/playground" });
       return;
     }
 
