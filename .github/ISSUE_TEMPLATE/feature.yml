@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest a small, focused improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        otterly stays narrow on purpose. Read
+        [CONTRIBUTING.md](../../CONTRIBUTING.md) before opening this —
+        in particular the "probably not welcome" list. If your idea is
+        on that list, this issue will likely be closed.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the use case, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This doesn't add a new runtime dependency
+          required: false
+        - label: This doesn't move otterly toward being a hosted service
+          required: false
+        - label: This doesn't add prompt logging, filtering, or moderation
+          required: false

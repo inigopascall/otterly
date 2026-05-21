@@ -1,0 +1,37 @@
+name: Recipe / Tool compatibility
+description: Confirm or request otterly support for a specific tool
+labels: ["recipe"]
+body:
+  - type: input
+    id: tool
+    attributes:
+      label: Tool name
+      placeholder: "e.g. Cursor, Aider, Continue.dev, LangChain, …"
+    validations:
+      required: true
+  - type: input
+    id: tool-version
+    attributes:
+      label: Tool version
+    validations:
+      required: true
+  - type: dropdown
+    id: status
+    attributes:
+      label: Result
+      options:
+        - Works out of the box
+        - Works with a small config tweak
+        - Doesn't work yet
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Config / setup steps
+      description: If the tool needs a specific `baseURL` or env var, paste it here.
+      render: yaml
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else worth knowing

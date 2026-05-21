@@ -1,0 +1,66 @@
+name: Bug report
+description: Something in otterly isn't working
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Install otterly via `npm i otterly`
+        2. Run `otterly serve`
+        3. POST to `/v1/chat/completions` with ...
+        4. See error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: otterly version
+      placeholder: "0.4.1"
+    validations:
+      required: true
+  - type: input
+    id: node-version
+    attributes:
+      label: Node version
+      placeholder: "v22.0.0"
+    validations:
+      required: true
+  - type: input
+    id: claude-cli
+    attributes:
+      label: claude CLI version
+      description: Output of `claude --version`
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows (WSL)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: otterly stdout, errors, anything useful. Redact prompts if needed.
+      render: shell
