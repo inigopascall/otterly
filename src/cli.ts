@@ -23,7 +23,7 @@ const { values, positionals } = parseArgs({
 const command = positionals[0] || "serve";
 
 if (values.version) {
-  console.log("0.5.0");
+  console.log("0.6.0");
   process.exit(0);
 }
 

@@ -152,7 +152,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
 
     // GET / — server info
     if (req.method === "GET" && path === "/") {
-      jsonResponse(res, 200, { name: "otterly", version: "0.5.0", playground: "/playground" });
+      jsonResponse(res, 200, { name: "otterly", version: "0.6.0", playground: "/playground" });
       return;
     }
 
