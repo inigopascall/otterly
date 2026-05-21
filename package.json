@@ -1,0 +1,73 @@
+{
+  "name": "otterly",
+  "version": "0.4.1",
+  "description": "Ollama for Claude. Use your Claude Code subscription as a local OpenAI-compatible API — no API keys, no per-token billing.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "otterly": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./server": {
+      "import": "./dist/server/index.js",
+      "types": "./dist/server/index.d.ts"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/claude-code": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/claude-code": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@anthropic-ai/claude-code": "^1.0.128",
+    "@types/node": "^25.6.2",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "claude-api",
+    "anthropic",
+    "coding-agent",
+    "ai",
+    "sdk",
+    "local",
+    "agent",
+    "otterly",
+    "openai-compatible",
+    "inference-server"
+  ],
+  "author": "Harsh Joshi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/josharsh/otterly.git"
+  }
+}
