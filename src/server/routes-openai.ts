@@ -232,18 +232,39 @@ async function handleStreaming(
   // Send initial role chunk
   await sseWrite(res, sseData(makeStreamChunk(completionId, { role: "assistant" }, null, model)));
 
+  // SSE keepalive heartbeats every 5s until first content arrives.
+  // Without this, clients with idle-detection (e.g. OpenAI/JS SDK) abandon
+  // long-running streams during Claude Code cold spawn or large-prompt processing.
+  let firstContentSeen = false;
+  const heartbeat = setInterval(() => {
+    if (firstContentSeen || res.writableEnded) return;
+    try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
+  }, 5000);
+
   try {
     for await (const event of engine.stream(prompt, options)) {
+      if (event.type === "text" || event.type === "text_delta" || event.type === "result") {
+        firstContentSeen = true;
+        clearInterval(heartbeat);
+      }
       if (abortController.signal.aborted) break;
 
       if (event.type === "text_delta") {
         await sseWrite(res, sseData(makeStreamChunk(completionId, { content: event.delta }, null, model)));
+      } else if (event.type === "text") {
+        // CLI mode emits a single `text` event with the full answer
+        // (vs SDK streaming which emits text_delta). Relay it as a content chunk.
+        if (event.text) {
+          await sseWrite(res, sseData(makeStreamChunk(completionId, { content: event.text }, null, model)));
+        }
       } else if (event.type === "result") {
+        // Don't re-emit result.text — text/text_delta already covered it for both paths.
         await sseWrite(res, sseData(makeStreamChunk(completionId, {}, "stop", model)));
       }
     }
     circuitBreaker?.onSuccess();
   } catch (err) {
+    clearInterval(heartbeat);
     const e = err instanceof Error ? err : new Error(String(err));
     if (e.name !== "AbortError" && !abortController.signal.aborted) {
       const code = err instanceof AgentError ? err.code : undefined;
@@ -253,6 +274,7 @@ async function handleStreaming(
     }
   }
 
+  clearInterval(heartbeat);
   await sseWrite(res, "data: [DONE]\n\n");
   if (!res.writableEnded) {
     res.end();
