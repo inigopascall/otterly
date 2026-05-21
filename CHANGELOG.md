@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 and uses [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) formatting.
 
+## [0.6.0] - 2026-05-22
+
+### Documentation
+
+- New **"Best configuration for OpenClaw"** subsection in the README with the
+  specific tuning advice we wish every OpenClaw user knew before plugging
+  otterly in: `--max-concurrent` sizing per machine class, `--queue-timeout`
+  guidance for slow first spawns, a copy-paste systemd unit, and a sanity
+  check command (`openclaw capability model run`) to validate the provider
+  before flipping the default model.
+- Documented the failure mode to recognize: *"Agent couldn't generate a
+  response"* on a turn that should obviously work means otterly is below
+  0.5.0 (streaming response was dropped).
+- Documented `--queue-timeout` flag and `queueTimeoutMs` programmatic option
+  in the server config table.
+- README pass: removed em-dash overuse so the prose reads less like it was
+  generated and more like it was written.
+
 ## [0.5.0] - 2026-05-22
 
 ### Fixed

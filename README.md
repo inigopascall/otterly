@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">otterly</h1>
-  <p align="center"><strong>Ollama for Claude.</strong> Use your Claude Code subscription as a local AI API — for free.</p>
+  <p align="center"><strong>Ollama for Claude.</strong> Use your Claude Code subscription as a local AI API. For free.</p>
 </p>
 
 <p align="center">
@@ -14,16 +14,16 @@
 
 ## The pitch in one breath
 
-You already pay **\$20–\$200/month** for Claude Code. Then you build a side project, a script, a tiny agent — and Anthropic charges you **again** per token via the API. That's double-paying for the same brain.
+You already pay **\$20–\$200/month** for Claude Code. Then you build a side project, a script, a tiny agent, and Anthropic charges you **again** per token via the API. That's double-paying for the same brain.
 
-**Otterly fixes that.** It turns your existing Claude Code subscription into a local, OpenAI-compatible API — exactly like Ollama does for open-source models — but powered by the Claude that you're already paying for.
+**Otterly fixes that.** It turns your existing Claude Code subscription into a local, OpenAI-compatible API, exactly like Ollama does for open-source models, powered by the Claude that you're already paying for.
 
 ```bash
 npx otterly serve
 ```
 
 ```
-  otterly — local inference server
+  otterly: local inference server
   ──────────────────────────────────────
   OpenAI compat : http://localhost:11434/v1/chat/completions
   Playground    : http://localhost:11434/playground
@@ -40,7 +40,7 @@ Same port as Ollama. Same OpenAI-compatible API. Zero per-token cost. No API key
 |---|---|---|---|
 | How | `import { claude } from "otterly"` | `npx otterly serve` | `await startApiServer({ port })` |
 | Best for | Node.js scripts & agents | Any language, any tool | Bundling the server into your app |
-| Network | None — in-process | localhost HTTP/WS | localhost HTTP/WS |
+| Network | None, in-process | localhost HTTP/WS | localhost HTTP/WS |
 | Analogy | Direct function call | `ollama serve` | `ollama` as a library |
 
 Pick one. Mix all three.
@@ -50,7 +50,7 @@ Pick one. Mix all three.
 ## The without / with comparison
 
 ```typescript
-// ❌ Without otterly — pay Anthropic twice
+// Without otterly: pay Anthropic twice
 import Anthropic from "@anthropic-ai/sdk";
 const client = new Anthropic({ apiKey: "sk-ant-..." });          // $3 / MTok in
 const res = await client.messages.create({                        // $15 / MTok out
@@ -60,14 +60,14 @@ const res = await client.messages.create({                        // $15 / MTok 
 ```
 
 ```typescript
-// ✅ With otterly (library) — direct, in-process, $0
+// With otterly (library): direct, in-process, $0
 import { claude } from "otterly";
 const result = await claude.run("Fix the failing tests", { cwd: "./app" });
 console.log(result.text, result.cost);
 ```
 
 ```typescript
-// ✅ With otterly (server) — your existing OpenAI SDK, any language, $0
+// With otterly (server): your existing OpenAI SDK, any language, $0
 import OpenAI from "openai";
 const ai = new OpenAI({ baseURL: "http://localhost:11434/v1", apiKey: "unused" });
 const res = await ai.chat.completions.create({
@@ -86,7 +86,7 @@ That's the whole product. Keep reading if you want details.
 npm install otterly
 ```
 
-You also need Claude Code installed and signed in. Otterly auto-detects npm installs, Homebrew, and standalone binaries — anything that gives you a working `claude` command.
+You also need Claude Code installed and signed in. Otterly auto-detects npm installs, Homebrew, and standalone binaries. Anything that gives you a working `claude` command.
 
 ```bash
 # Verify
@@ -98,13 +98,13 @@ claude --version
 ## Get your subscription back.
 
 > *"Claude Code subscribers can no longer use their Claude subscription limits for third-party harnesses including OpenClaw."*
-> — [TechCrunch](https://techcrunch.com/2026/04/04/anthropic-says-claude-code-subscribers-will-need-to-pay-extra-for-openclaw-support/), April 4, 2026
+> [TechCrunch](https://techcrunch.com/2026/04/04/anthropic-says-claude-code-subscribers-will-need-to-pay-extra-for-openclaw-support/), April 4, 2026
 
 If you use **OpenClaw**, this is the section that pays for otterly.
 
 On **April 4, 2026**, Anthropic severed the direct path between OpenClaw and your Claude Code subscription. Overnight, OpenClaw users had three new (worse) options: buy extra usage bundles, supply a separate Anthropic API key at full pay-per-token rates, or drain a small parallel "Agent SDK credit" pool. Heavy users reported bills jumping up to **50× their previous monthly outlay**. The OpenClaw author publicly called it a betrayal.
 
-otterly is the routing layer. OpenClaw talks to `localhost:11434`. otterly spawns your authenticated `claude` CLI — Anthropic's own product, still allowed to use your subscription — and the request arrives at the exact destination OpenClaw was locked out of. No extra bundles, no API key, no credit-pool draining. Same model, same brain, same subscription.
+otterly is the routing layer. OpenClaw talks to `localhost:11434`. otterly spawns your authenticated `claude` CLI, which is Anthropic's own product and still allowed to use your subscription, and the request arrives at the exact destination OpenClaw was locked out of. No extra bundles, no API key, no credit-pool draining. Same model, same brain, same subscription.
 
 ### Three steps. Then OpenClaw is yours again.
 
@@ -149,13 +149,56 @@ otterly serve   # listens on localhost:11434
 openclaw models set otterly/claude-sonnet-4-20250514
 ```
 
-That's the whole patch. Every OpenClaw call now lands on your Claude Code subscription via the local `claude` CLI. **The Agent SDK credit pool never moves, no API-key meter ticks, no extra-usage bundles get consumed.** Watch your Anthropic dashboard — the only thing that moves is your normal Claude Code subscription usage.
+That's the whole patch. Every OpenClaw call now lands on your Claude Code subscription via the local `claude` CLI. **The Agent SDK credit pool never moves, no API-key meter ticks, no extra-usage bundles get consumed.** Watch your Anthropic dashboard. The only thing that moves is your normal Claude Code subscription usage.
 
-> **Running headless?** (Raspberry Pi, EC2, a container) — run `claude` once over an interactive SSH session to complete the browser login. The token persists. Then run `otterly serve` as a systemd user service. Same pattern as any long-lived daemon.
+> **Running headless?** (Raspberry Pi, EC2, a container.) Run `claude` once over an interactive SSH session to complete the browser login. The token persists. Then run `otterly serve` as a systemd user service. Same pattern as any long-lived daemon.
+
+### Best configuration for OpenClaw
+
+The defaults work fine on a developer laptop. On a Pi or any small machine, four dials make Friday feel instant instead of flaky.
+
+**Match concurrency to the box.** Each `claude` spawn uses about 1–2 GB of RAM and a full CPU core while it runs. On a Pi or a 2-vCPU VPS, set `--max-concurrent 2`. On a 16 GB laptop the default of `5` is fine. Going higher than your real parallelism mostly creates queue contention.
+
+**Raise the queue timeout for slow first spawns.** Claude Code's first cold spawn can take 20–30 seconds when the OpenClaw prompt is large (workspace files, skills, tool schemas). Set `--queue-timeout 300` so a burst of concurrent OpenClaw cron jobs does not 408 itself into a death loop while waiting for a worker slot.
+
+**Use otterly 0.5.0 or newer.** Earlier versions silently dropped streaming response text when otterly was driving the `claude` CLI binary (the common install path). OpenClaw uses `stream: true`. If you see *"Agent couldn't generate a response"* on a turn that should obviously work, you are on an older otterly. Upgrade.
+
+**Run otterly as a system service, not a tmux pane.** Drop this into `~/.config/systemd/user/otterly.service`:
+
+```ini
+[Unit]
+Description=otterly local inference server
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/node /home/youruser/.npm-global/bin/otterly serve --port 11434 --max-concurrent 2 --queue-timeout 300
+Restart=always
+RestartSec=5
+Environment=HOME=/home/youruser
+Environment=PATH=/usr/bin:/home/youruser/.npm-global/bin
+
+[Install]
+WantedBy=default.target
+```
+
+Then:
+
+```bash
+systemctl --user enable --now otterly.service
+loginctl enable-linger youruser     # survives reboot without a login
+```
+
+**Sanity check before flipping the default model.** Once `openclaw.json` is patched, test the new provider before pointing all of OpenClaw at it:
+
+```bash
+openclaw capability model run --model otterly/claude-sonnet-4-20250514 --prompt "ping"
+```
+
+If that returns text in a few seconds, you are good: `openclaw models set otterly/claude-sonnet-4-20250514`. If it hangs, `curl http://localhost:11434/api/status` tells you exactly which queue slot is stuck.
 
 ---
 
-## Mode 1: Library — in-process, no server
+## Mode 1: Library, in-process, no server
 
 Just import and call. Perfect for Node scripts, custom agents, cron jobs, build tools.
 
@@ -174,7 +217,7 @@ for await (const event of claude.stream("Refactor auth", { cwd: "." })) {
   if (event.type === "tool_use") console.log(`\n[using ${event.tool}]`);
 }
 
-// Multi-turn session — context persists in-memory, no server
+// Multi-turn session. Context persists in-memory, no server.
 const session = claude.session({ cwd: "./app" });
 await session.send("Create a REST API");
 await session.send("Now add auth to it");   // remembers the API you just built
@@ -185,7 +228,7 @@ Sessions run entirely in-process. No WebSocket. No HTTP. The async generator sta
 
 ---
 
-## Mode 2: CLI server — the Ollama experience
+## Mode 2: CLI server, the Ollama experience
 
 When you want one running daemon that **any tool, any language, any framework** can talk to.
 
@@ -196,7 +239,7 @@ npx otterly serve
 That's it. Now you have an OpenAI-compatible API on `localhost:11434`. Point anything at it:
 
 ```typescript
-// TypeScript — the OpenAI SDK
+// TypeScript with the OpenAI SDK
 import OpenAI from "openai";
 const ai = new OpenAI({ baseURL: "http://localhost:11434/v1", apiKey: "unused" });
 const res = await ai.chat.completions.create({
@@ -206,7 +249,7 @@ const res = await ai.chat.completions.create({
 ```
 
 ```python
-# Python — the OpenAI SDK
+# Python with the OpenAI SDK
 from openai import OpenAI
 ai = OpenAI(base_url="http://localhost:11434/v1", api_key="unused")
 res = ai.chat.completions.create(
@@ -216,7 +259,7 @@ res = ai.chat.completions.create(
 ```
 
 ```bash
-# Anything that speaks HTTP — curl, your shell, your dog
+# Anything that speaks HTTP. curl, your shell, your dog.
 curl -X POST http://localhost:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -225,15 +268,15 @@ curl -X POST http://localhost:11434/v1/chat/completions \
   }'
 ```
 
-It works in Cursor, Continue, Aider, Open WebUI, LiteLLM, LangChain, llamafile UIs, your own clients — anything with a `baseURL` field. If it talks to OpenAI, it talks to otterly.
+It works in Cursor, Continue, Aider, Open WebUI, LiteLLM, LangChain, llamafile UIs, your own clients. Anything with a `baseURL` field. If it talks to OpenAI, it talks to otterly.
 
 Open the **playground** at [http://localhost:11434/playground](http://localhost:11434/playground) to poke the API from your browser.
 
 ---
 
-## Mode 3: Embedded server — programmatic, no CLI
+## Mode 3: Embedded server, programmatic, no CLI
 
-Run the full HTTP + WebSocket server **inside your own Node app**. Same endpoints, same playground, same WebSocket sessions — but no separate process to babysit.
+Run the full HTTP + WebSocket server **inside your own Node app**. Same endpoints, same playground, same WebSocket sessions, but no separate process to babysit.
 
 ```typescript
 import { startApiServer } from "otterly";
@@ -253,7 +296,7 @@ const handle = await startApiServer({
 await handle.shutdown(10_000);
 ```
 
-This is exactly what `npx otterly serve` runs under the hood. Bundle it inside an Electron app, an internal dev tool, a Tauri sidecar, a Cloudflare-style edge worker — anything that benefits from an AI endpoint without managing a second process.
+This is exactly what `npx otterly serve` runs under the hood. Bundle it inside an Electron app, an internal dev tool, a Tauri sidecar, a Cloudflare-style edge worker. Anything that benefits from an AI endpoint without managing a second process.
 
 ---
 
@@ -267,16 +310,16 @@ This is exactly what `npx otterly serve` runs under the hood. Bundle it inside a
 | `WS /ws` | WebSocket | Persistent multi-turn sessions |
 | `GET /playground` | HTML | Interactive API explorer in your browser |
 | `GET /api/status` | JSON | Health + queue stats |
-| `GET /swagger.json` | OpenAPI 3.0 | Full spec — generate a client in any language |
+| `GET /swagger.json` | OpenAPI 3.0 | Full spec. Generate a client in any language. |
 
 Plus all the boring-but-essential stuff:
 
-- **Concurrency control** — request queue prevents fork-bombing your machine
-- **Rate limiting** — per-IP token bucket, configurable
-- **Circuit breaker** — bails out on cascading Claude Code failures
-- **Auth** — set `OTTERLY_API_KEY` to require `Bearer` tokens
-- **Graceful shutdown** — drains in-flight requests before exiting
-- **CORS** — works straight from the browser
+- **Concurrency control.** Request queue prevents fork-bombing your machine.
+- **Rate limiting.** Per-IP token bucket, configurable.
+- **Circuit breaker.** Bails out on cascading Claude Code failures.
+- **Auth.** Set `OTTERLY_API_KEY` to require `Bearer` tokens.
+- **Graceful shutdown.** Drains in-flight requests before exiting.
+- **CORS.** Works straight from the browser.
 
 ---
 
@@ -292,9 +335,10 @@ npx otterly serve --port 11434 --dir ./project --max-concurrent 3
 | `-d, --dir` | cwd | Working directory Claude runs in |
 | `--max-concurrent` | `5` | Parallel Claude processes |
 | `--max-queue` | `50` | Max queued requests |
+| `--queue-timeout` | `120` | Seconds a request may wait in the queue before 408 |
 | `--rate-limit` | `60` | Requests/min per client |
 
-Programmatic options on `startApiServer()` mirror the flags, plus `requestTimeoutMs` and `streamTimeoutMs`. Set `OTTERLY_API_KEY` in the environment to require Bearer auth.
+Programmatic options on `startApiServer()` mirror the flags, plus `requestTimeoutMs`, `streamTimeoutMs`, and `queueTimeoutMs`. Set `OTTERLY_API_KEY` in the environment to require Bearer auth.
 
 ---
 
@@ -335,7 +379,7 @@ const handle = await startApiServer({ port: 11434 });
 
 Otterly is a **transport layer**. It does not jailbreak Claude, does not bypass any usage limits, does not redistribute model weights, does not store your prompts. Every request flows through your **own** authenticated Claude Code installation, subject to your subscription's normal limits.
 
-What you save is the *second meter* — the per-token API bill on top of the subscription you already pay.
+What you save is the *second meter*: the per-token API bill on top of the subscription you already pay.
 
 Why is it called "otterly"? Because otters carry their tools with them, and your local Claude already has all the tools it needs. Also because the domain was available.
 
