@@ -33,3 +33,6 @@ Thumbs.db
 # Local-only working copies
 *.local
 .cache/
+
+# ui-ux-pro-max skill output (generated, not source of truth)
+design-system/

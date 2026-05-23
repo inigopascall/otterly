@@ -261,7 +261,7 @@ describe("API Server Routes", () => {
 
       expect(result.status).toBe(200);
       expect(result.contentType).toContain("text/html");
-      expect(result.body).toContain("otterly playground");
+      expect(result.body).toContain("otterly");
       expect(result.body).toContain("<!DOCTYPE html>");
     });
   });

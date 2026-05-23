@@ -4,11 +4,20 @@
 </p>
 
 <p align="center">
+  <a href="https://otterly.josharsh.com">otterly.josharsh.com</a> · <a href="https://www.npmjs.com/package/otterly">npm</a> · <a href="https://github.com/josharsh/otterly">github</a>
+</p>
+
+<p align="center">
   <a href="https://www.npmjs.com/package/otterly"><img src="https://img.shields.io/npm/v/otterly.svg" alt="npm version"></a>
   <a href="https://www.npmjs.com/package/otterly"><img src="https://img.shields.io/npm/dm/otterly.svg" alt="npm downloads"></a>
   <a href="https://github.com/josharsh/otterly/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/otterly.svg" alt="license"></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/node/v/otterly.svg" alt="node version"></a>
 </p>
+
+<p align="center">
+  <img src="docs/playground-light.png" alt="otterly playground — interactive API explorer with JSON syntax highlighting, line numbers, and indent guides" width="900">
+</p>
+<p align="center"><sub><code>otterly serve</code> → <a href="http://localhost:11434/playground"><code>localhost:11434/playground</code></a> to poke the API, or <a href="http://localhost:11434/dashboard"><code>/dashboard</code></a> for live spend, tokens, latency, and tool usage.</sub></p>
 
 ---
 
@@ -198,6 +207,66 @@ If that returns text in a few seconds, you are good: `openclaw models set otterl
 
 ---
 
+## Plug otterly into your coding tool
+
+Anything that speaks the OpenAI Chat Completions API can use otterly as a provider. Run `otterly serve` once, then drop one of these snippets in.
+
+### Cline (VS Code extension)
+
+In Cline's settings (Cmd-Shift-P → *Cline: Open Settings*), pick **OpenAI Compatible** as the API provider, then:
+
+| Field | Value |
+|---|---|
+| Base URL | `http://localhost:11434/v1` |
+| API Key | `unused` (any non-empty string) |
+| Model ID | `claude-sonnet-4-20250514` |
+
+Cline streams by default — otterly handles SSE with keepalives so cold spawns don't time out the extension.
+
+### Cursor
+
+Settings → **Models** → toggle **Override OpenAI Base URL**:
+
+```
+http://localhost:11434/v1
+```
+
+Set API Key to anything (e.g. `unused`), then add `claude-sonnet-4-20250514` to *Model Names*. Cursor will call otterly for chat, autocomplete, and Composer.
+
+### Continue (`~/.continue/config.json`)
+
+```json
+{
+  "models": [
+    {
+      "title": "Claude Sonnet 4 (via otterly)",
+      "provider": "openai",
+      "model": "claude-sonnet-4-20250514",
+      "apiBase": "http://localhost:11434/v1",
+      "apiKey": "unused"
+    }
+  ]
+}
+```
+
+`provider: "openai"` is intentional — Continue's OpenAI provider speaks the same chat-completions shape otterly serves.
+
+### Aider
+
+```bash
+export OPENAI_API_BASE=http://localhost:11434/v1
+export OPENAI_API_KEY=unused
+aider --model openai/claude-sonnet-4-20250514
+```
+
+The `openai/` prefix tells Aider to use the OpenAI-compatible path. Add to your shell profile to make it permanent.
+
+### LiteLLM / LangChain / anything else
+
+Same pattern everywhere: point the base URL at `http://localhost:11434/v1`, send any non-empty API key, name the model `claude-sonnet-4-20250514`. If your client talks to OpenAI today, it talks to otterly with one config change.
+
+---
+
 ## Mode 1: Library, in-process, no server
 
 Just import and call. Perfect for Node scripts, custom agents, cron jobs, build tools.
@@ -270,7 +339,11 @@ curl -X POST http://localhost:11434/v1/chat/completions \
 
 It works in Cursor, Continue, Aider, Open WebUI, LiteLLM, LangChain, llamafile UIs, your own clients. Anything with a `baseURL` field. If it talks to OpenAI, it talks to otterly.
 
-Open the **playground** at [http://localhost:11434/playground](http://localhost:11434/playground) to poke the API from your browser.
+Open the **playground** at [http://localhost:11434/playground](http://localhost:11434/playground) to poke the API from your browser, or the **dashboard** at [http://localhost:11434/dashboard](http://localhost:11434/dashboard) to see live spend, latency, and tool usage.
+
+<p align="center">
+  <img src="docs/dashboard-light.png" alt="otterly dashboard — today's spend, tokens, average latency, recent runs, top tools, and queue stats" width="900">
+</p>
 
 ---
 
@@ -308,8 +381,10 @@ This is exactly what `npx otterly serve` runs under the hood. Bundle it inside a
 | `POST /api/run` | JSON | Native one-shot with cost + tool logs |
 | `POST /api/stream` | NDJSON | Streaming with rich events |
 | `WS /ws` | WebSocket | Persistent multi-turn sessions |
+| `GET /dashboard` | HTML | Live spend, latency, recent runs, tool usage |
 | `GET /playground` | HTML | Interactive API explorer in your browser |
 | `GET /api/status` | JSON | Health + queue stats |
+| `GET /api/metrics` | JSON | Today + lifetime usage, recent runs, top tools |
 | `GET /swagger.json` | OpenAPI 3.0 | Full spec. Generate a client in any language. |
 
 Plus all the boring-but-essential stuff:

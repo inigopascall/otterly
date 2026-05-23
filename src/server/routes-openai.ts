@@ -11,6 +11,7 @@ import type { ParsedRequest, ServerContext } from "./routes-native.js";
 import { apiSessions } from "./session-store.js";
 import type { CircuitBreaker } from "./circuit-breaker.js";
 import { logError } from "./logger.js";
+import { metrics } from "./metrics.js";
 import {
   openaiToClaudeInput,
   claudeResultToOpenai,
@@ -189,10 +190,20 @@ async function handleNonStreaming(
   circuitBreaker?: CircuitBreaker,
 ): Promise<void> {
   const engine = new ClaudeEngine();
+  const startedAt = Date.now();
 
   try {
     const result = await engine.run(prompt, options);
     circuitBreaker?.onSuccess();
+    metrics.record({
+      ts: Date.now(), endpoint: "chat", status: 200,
+      durationMs: Date.now() - startedAt,
+      cost: result.cost || 0,
+      inputTokens: result.usage?.input_tokens || 0,
+      outputTokens: result.usage?.output_tokens || 0,
+      toolCalls: result.tools?.length || 0,
+    });
+    if (result.tools) for (const t of result.tools) metrics.recordToolUse(t.tool);
     const response = claudeResultToOpenai(result.text, model, result.usage);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(response));
@@ -203,6 +214,12 @@ async function handleNonStreaming(
     circuitBreaker?.onFailure(code);
     logError(req.requestId || "", e.message);
     const status = errorToHttpStatus(e);
+    metrics.record({
+      ts: Date.now(), endpoint: "chat", status,
+      durationMs: Date.now() - startedAt,
+      cost: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0,
+      error: e.message,
+    });
     if (!res.headersSent) {
       res.writeHead(status, { "Content-Type": "application/json" });
       res.end(JSON.stringify(openaiErrorBody(status, e.message)));
@@ -241,6 +258,9 @@ async function handleStreaming(
     try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
   }, 5000);
 
+  const startedAt = Date.now();
+  let toolCount = 0;
+  let lastResult: { cost: number; usage?: { input_tokens?: number; output_tokens?: number } } | null = null;
   try {
     for await (const event of engine.stream(prompt, options)) {
       if (event.type === "text" || event.type === "text_delta" || event.type === "result") {
@@ -249,7 +269,10 @@ async function handleStreaming(
       }
       if (abortController.signal.aborted) break;
 
-      if (event.type === "text_delta") {
+      if (event.type === "tool_use") {
+        toolCount++;
+        metrics.recordToolUse(event.tool);
+      } else if (event.type === "text_delta") {
         await sseWrite(res, sseData(makeStreamChunk(completionId, { content: event.delta }, null, model)));
       } else if (event.type === "text") {
         // CLI mode emits a single `text` event with the full answer
@@ -258,11 +281,20 @@ async function handleStreaming(
           await sseWrite(res, sseData(makeStreamChunk(completionId, { content: event.text }, null, model)));
         }
       } else if (event.type === "result") {
+        lastResult = { cost: event.cost, usage: event.usage };
         // Don't re-emit result.text — text/text_delta already covered it for both paths.
         await sseWrite(res, sseData(makeStreamChunk(completionId, {}, "stop", model)));
       }
     }
     circuitBreaker?.onSuccess();
+    metrics.record({
+      ts: Date.now(), endpoint: "chat", status: 200,
+      durationMs: Date.now() - startedAt,
+      cost: lastResult?.cost || 0,
+      inputTokens: lastResult?.usage?.input_tokens || 0,
+      outputTokens: lastResult?.usage?.output_tokens || 0,
+      toolCalls: toolCount,
+    });
   } catch (err) {
     clearInterval(heartbeat);
     const e = err instanceof Error ? err : new Error(String(err));
@@ -270,6 +302,12 @@ async function handleStreaming(
       const code = err instanceof AgentError ? err.code : undefined;
       circuitBreaker?.onFailure(code);
       logError(req.requestId || "", e.message);
+      metrics.record({
+        ts: Date.now(), endpoint: "chat", status: 500,
+        durationMs: Date.now() - startedAt,
+        cost: 0, inputTokens: 0, outputTokens: 0, toolCalls: toolCount,
+        error: e.message,
+      });
       await sseWrite(res, sseData({ error: { message: e.message, type: "server_error" } }));
     }
   }

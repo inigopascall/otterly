@@ -5,6 +5,43 @@ All notable changes to this project are documented in this file.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 and uses [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) formatting.
 
+## [Unreleased]
+
+### Added
+
+- **Dashboard** at `GET /dashboard` — live spend (today + lifetime), tokens
+  in/out, average latency, error count, recent runs table, top tools by
+  cumulative usage, and queue/circuit-breaker status. Auto-refreshes every
+  3 seconds. Backed by `GET /api/metrics`.
+- **`GET /api/metrics`** — JSON snapshot of in-memory rolling metrics
+  (`totals`, `today`, `topTools`, `recent`, `startedAt`).
+- **Light mode** for the playground and dashboard, with a header toggle
+  persisted to `localStorage` and an initial value derived from
+  `prefers-color-scheme`. Override per request with `?theme=light|dark`.
+- **Host integration recipes** in the README for Cline, Cursor, Continue,
+  and Aider — anyone arriving from those communities now sees themselves
+  in the docs.
+- README screenshots of the dashboard and playground (dark + light).
+
+### Changed
+
+- **Playground UI redesign**: sidebar nav (Dashboard / Playground / Reference),
+  per-pane segmented Formatted/Raw response toggle, JSON renderer with line
+  numbers and indent guides, copy button on response bodies, inline JSON
+  validation on the editor (red border + inline message when invalid),
+  `Cmd/Ctrl-Enter` to send, header status pill showing live queue stats,
+  proper SVG brand mark (replacing the emoji), and a Google Fonts stack
+  (Inter + JetBrains Mono).
+
+### Fixed
+
+- Status panel was reading `queue.active` from `/api/status`, but the queue
+  stats key is `queue.running`. The old "Active" metric therefore always
+  displayed `0`. Fixed in the new dashboard.
+- `PKG_VERSION` was hardcoded to `0.3.6` (and `0.6.0` in one place). It
+  now reads from `package.json` at startup and is threaded through
+  `/api/status`, `/api/metrics`, and the playground/dashboard header.
+
 ## [0.6.0] - 2026-05-22
 
 ### Documentation

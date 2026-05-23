@@ -2,6 +2,9 @@
 // Richer response format than OpenAI compat — includes cost, tools, duration.
 
 import type { IncomingMessage, ServerResponse } from "http";
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 import { ClaudeEngine } from "../engine.js";
 import type { AgentResult, AgentEvent, EngineOptions } from "../types.js";
 import { AgentError } from "../errors.js";
@@ -10,8 +13,27 @@ import { errorToHttpStatus } from "./openai-compat.js";
 import type { RequestQueue } from "./request-queue.js";
 import type { CircuitBreaker } from "./circuit-breaker.js";
 import { logError } from "./logger.js";
+import { metrics } from "./metrics.js";
 
-const PKG_VERSION = "0.3.6";
+function loadPkgVersion(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    // dist/server/routes-native.js → ../../package.json
+    for (const candidate of [
+      join(here, "..", "..", "package.json"),
+      join(here, "..", "package.json"),
+    ]) {
+      try {
+        const raw = readFileSync(candidate, "utf8");
+        const pkg = JSON.parse(raw);
+        if (pkg.name === "otterly" && typeof pkg.version === "string") return pkg.version;
+      } catch { /* try next */ }
+    }
+  } catch { /* fall through */ }
+  return "0.0.0";
+}
+
+export const PKG_VERSION = loadPkgVersion();
 
 export interface ServerContext {
   workingDir: string;
@@ -67,10 +89,12 @@ export async function handleRun(
   if (sessionId) {
     const entry = apiSessions.get(sessionId);
     if (entry?.session) {
+      const startedAt = Date.now();
       try {
         const result = await entry.session.send(body.prompt as string);
         apiSessions.recordRequest(sessionId, result.cost);
         circuitBreaker?.onSuccess();
+        recordRunMetrics("run", 200, startedAt, result);
         res.writeHead(200, {
           "Content-Type": "application/json",
           "X-Session-Id": result.sessionId || sessionId,
@@ -83,6 +107,14 @@ export async function handleRun(
         circuitBreaker?.onFailure(code);
         logError(req.requestId || "", e.message);
         const status = errorToHttpStatus(e);
+        metrics.record({
+          ts: Date.now(),
+          endpoint: "run",
+          status,
+          durationMs: Date.now() - startedAt,
+          cost: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0,
+          error: e.message,
+        });
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: e.message }));
         return;
@@ -110,9 +142,11 @@ export async function handleRun(
   if (bodyOpts?.model) options.model = bodyOpts.model as string;
   if (bodyOpts?.maxTurns) options.maxTurns = bodyOpts.maxTurns as number;
 
+  const startedAt = Date.now();
   try {
     const result: AgentResult = await engine.run(body.prompt as string, options);
     circuitBreaker?.onSuccess();
+    recordRunMetrics("run", 200, startedAt, result);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(result));
   } catch (err) {
@@ -128,8 +162,37 @@ export async function handleRun(
     circuitBreaker?.onFailure(code);
     logError(req.requestId || "", e.message);
     const status = errorToHttpStatus(e);
+    metrics.record({
+      ts: Date.now(),
+      endpoint: "run",
+      status,
+      durationMs: Date.now() - startedAt,
+      cost: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0,
+      error: e.message,
+    });
     res.writeHead(status, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: e.message }));
+  }
+}
+
+function recordRunMetrics(
+  endpoint: "run" | "stream" | "chat",
+  status: number,
+  startedAt: number,
+  result: AgentResult,
+): void {
+  metrics.record({
+    ts: Date.now(),
+    endpoint,
+    status,
+    durationMs: Date.now() - startedAt,
+    cost: result.cost || 0,
+    inputTokens: result.usage?.input_tokens || 0,
+    outputTokens: result.usage?.output_tokens || 0,
+    toolCalls: result.tools?.length || 0,
+  });
+  if (result.tools) {
+    for (const t of result.tools) metrics.recordToolUse(t.tool);
   }
 }
 
@@ -171,18 +234,40 @@ export async function handleStream(
   if (sessionId) {
     const entry = apiSessions.get(sessionId);
     if (entry?.session) {
+      const startedAt = Date.now();
+      let toolCount = 0;
+      let lastResult: { cost: number; usage?: { input_tokens?: number; output_tokens?: number } } | null = null;
       try {
         for await (const event of entry.session.sendStream(body.prompt as string)) {
           await sendStreamEvent(event, sendLine);
+          if (event.type === "tool_use") {
+            toolCount++;
+            metrics.recordToolUse(event.tool);
+          }
           if (event.type === "result") {
             apiSessions.recordRequest(sessionId, event.cost);
+            lastResult = { cost: event.cost, usage: event.usage };
           }
         }
         circuitBreaker?.onSuccess();
+        metrics.record({
+          ts: Date.now(), endpoint: "stream", status: 200,
+          durationMs: Date.now() - startedAt,
+          cost: lastResult?.cost || 0,
+          inputTokens: lastResult?.usage?.input_tokens || 0,
+          outputTokens: lastResult?.usage?.output_tokens || 0,
+          toolCalls: toolCount,
+        });
       } catch (err) {
         const e = err instanceof Error ? err : new Error(String(err));
         const code = err instanceof AgentError ? err.code : undefined;
         circuitBreaker?.onFailure(code);
+        metrics.record({
+          ts: Date.now(), endpoint: "stream", status: 500,
+          durationMs: Date.now() - startedAt,
+          cost: 0, inputTokens: 0, outputTokens: 0, toolCalls: toolCount,
+          error: e.message,
+        });
         await sendLine({ type: "error", message: e.message });
       }
       if (!res.writableEnded) res.end();
@@ -208,17 +293,41 @@ export async function handleStream(
   if (bodyOpts?.resume) options.resume = bodyOpts.resume as string;
   if (bodyOpts?.model) options.model = bodyOpts.model as string;
 
+  const startedAt = Date.now();
+  let toolCount = 0;
+  let lastResult: { cost: number; usage?: { input_tokens?: number; output_tokens?: number } } | null = null;
   try {
     for await (const event of engine.stream(body.prompt as string, options)) {
       if (abortController.signal.aborted) break;
+      if (event.type === "tool_use") {
+        toolCount++;
+        metrics.recordToolUse(event.tool);
+      }
+      if (event.type === "result") {
+        lastResult = { cost: event.cost, usage: event.usage };
+      }
       await sendStreamEvent(event, sendLine);
     }
     circuitBreaker?.onSuccess();
+    metrics.record({
+      ts: Date.now(), endpoint: "stream", status: 200,
+      durationMs: Date.now() - startedAt,
+      cost: lastResult?.cost || 0,
+      inputTokens: lastResult?.usage?.input_tokens || 0,
+      outputTokens: lastResult?.usage?.output_tokens || 0,
+      toolCalls: toolCount,
+    });
   } catch (err) {
     const e = err instanceof Error ? err : new Error(String(err));
     if (e.name !== "AbortError" && !abortController.signal.aborted) {
       const code = err instanceof AgentError ? err.code : undefined;
       circuitBreaker?.onFailure(code);
+      metrics.record({
+        ts: Date.now(), endpoint: "stream", status: 500,
+        durationMs: Date.now() - startedAt,
+        cost: 0, inputTokens: 0, outputTokens: 0, toolCalls: toolCount,
+        error: e.message,
+      });
       await sendLine({ type: "error", message: e.message });
     }
   }

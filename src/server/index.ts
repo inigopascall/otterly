@@ -5,7 +5,8 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "http";
 import { WebSocketServer } from "ws";
 import { handleChatCompletions } from "./routes-openai.js";
-import { handleStatus, handleRun, handleStream, type ParsedRequest, type ServerContext } from "./routes-native.js";
+import { handleStatus, handleRun, handleStream, PKG_VERSION, type ParsedRequest, type ServerContext } from "./routes-native.js";
+import { metrics } from "./metrics.js";
 import { attachWsHandler } from "./ws-handler.js";
 import { apiSessions } from "./session-store.js";
 import { RequestQueue, QueueFullError, QueueTimeoutError } from "./request-queue.js";
@@ -136,15 +137,24 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
       return;
     }
 
+    // GET /api/metrics — dashboard data
+    if (req.method === "GET" && path === "/api/metrics") {
+      jsonResponse(res, 200, {
+        version: PKG_VERSION,
+        ...metrics.snapshot(),
+      });
+      return;
+    }
+
     // GET /swagger.json — OpenAPI spec, no auth
     if (req.method === "GET" && path === "/swagger.json") {
       jsonResponse(res, 200, openApiSpec);
       return;
     }
 
-    // GET /playground — interactive API playground
-    if (req.method === "GET" && path === "/playground") {
-      const html = getPlaygroundHtml(port);
+    // GET /playground and /dashboard — both served by the same UI shell
+    if (req.method === "GET" && (path === "/playground" || path === "/dashboard")) {
+      const html = getPlaygroundHtml(port, PKG_VERSION);
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(html);
       return;
@@ -152,7 +162,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
 
     // GET / — server info
     if (req.method === "GET" && path === "/") {
-      jsonResponse(res, 200, { name: "otterly", version: "0.6.0", playground: "/playground" });
+      jsonResponse(res, 200, { name: "otterly", version: PKG_VERSION, playground: "/playground", dashboard: "/dashboard" });
       return;
     }
 
@@ -309,6 +319,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
       console.log(`  WebSocket     : ws://localhost:${port}/ws`);
       console.log(`  Health        : http://localhost:${port}/api/status`);
       console.log(`  Playground    : http://localhost:${port}/playground`);
+      console.log(`  Dashboard     : http://localhost:${port}/dashboard`);
       console.log(`  Working dir   : ${workingDir}`);
       if (apiKey) {
         console.log(`  Auth          : API key required (OTTERLY_API_KEY)`);
