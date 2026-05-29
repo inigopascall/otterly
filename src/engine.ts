@@ -64,7 +64,7 @@ function buildCLICommand(cliBin: string, prompt: string, opts: Record<string, un
  * process has actually exited. The whole point is that the upstream request
  * queue uses the promise lifecycle to track a worker slot — if we return early
  * while the child is still alive, the slot leaks and we end up with a stuck
- * queue (see https://github.com/josharsh/otterly/issues/3).
+ * queue (see https://github.com/josharsh/otterly/issues/4).
  *
  * On abort or timeout:
  *   1. Send SIGTERM to the child's process group.

@@ -12,7 +12,7 @@
 // The actual symptom in production: every `--max-concurrent` slot fills up
 // with hung calls within minutes of any agentic use, the queue starts
 // rejecting requests, and otterly is dead until restarted. See
-// https://github.com/josharsh/otterly/issues/3.
+// https://github.com/josharsh/otterly/issues/4.
 //
 // These tests pin the new contract enforced by `spawnWithAbort`:
 //
