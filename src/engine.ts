@@ -1,5 +1,4 @@
-import { execSync, execFileSync } from "child_process";
-import { Worker, isMainThread, parentPort, workerData } from "worker_threads";
+import { execFileSync, spawn } from "child_process";
 import type {
   AgentEvent,
   AgentResult,
@@ -59,11 +58,134 @@ function buildCLICommand(cliBin: string, prompt: string, opts: Record<string, un
 }
 
 /**
- * Build a QueryFn that runs `claude -p` via execSync in a worker thread.
+ * Spawn a shell command and return its stdout. Cancellable via AbortController.
  *
- * The Bun-compiled `claude` binary doesn't pipe stdout to Node.js child_process
- * async APIs (spawn/exec), but execSync through a shell works reliably.
- * We run it in a worker thread to avoid blocking the event loop.
+ * Hard rule: the returned promise must not resolve or reject until the child
+ * process has actually exited. The whole point is that the upstream request
+ * queue uses the promise lifecycle to track a worker slot — if we return early
+ * while the child is still alive, the slot leaks and we end up with a stuck
+ * queue (see https://github.com/josharsh/otterly/issues/4).
+ *
+ * On abort or timeout:
+ *   1. Send SIGTERM to the child's process group.
+ *   2. Wait `killGraceMs` for it to exit cleanly.
+ *   3. If still alive, send SIGKILL to the group.
+ *   4. Resolve only when the child's `exit` event fires.
+ *
+ * Spawned with `detached: true` so it owns its own process group — a Bun-
+ * compiled binary that re-execs or spawns helpers can be reaped in one shot
+ * via the negative-PID kill (`process.kill(-pid, signal)`).
+ *
+ * `shell: true` is used because the legacy execSync path worked through a
+ * shell and the Bun-compiled `claude` binary historically had stdout-piping
+ * quirks with direct `spawn`. Using a shell preserves the previous behavior
+ * while making the call cancellable.
+ */
+export interface SpawnWithAbortOptions {
+  cwd?: string;
+  abortController?: AbortController;
+  /** Hard timeout in ms. Triggers the same kill ladder as abort. */
+  timeoutMs: number;
+  /** Grace period between SIGTERM and SIGKILL. Default 5s. */
+  killGraceMs?: number;
+  /** Test-only injection hook. */
+  spawnFn?: typeof spawn;
+}
+
+export function spawnWithAbort(cmd: string, opts: SpawnWithAbortOptions): Promise<string> {
+  const killGraceMs = opts.killGraceMs ?? 5000;
+  const doSpawn = opts.spawnFn ?? spawn;
+
+  return new Promise<string>((resolve, reject) => {
+    const child = doSpawn(cmd, [], {
+      shell: true,
+      cwd: opts.cwd,
+      env: process.env,
+      detached: process.platform !== "win32",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    child.stdout?.on("data", (c: Buffer) => stdoutChunks.push(c));
+    child.stderr?.on("data", (c: Buffer) => stderrChunks.push(c));
+
+    let aborted = false;
+    let timedOut = false;
+    let sigkillTimer: NodeJS.Timeout | null = null;
+
+    const killGroup = (signal: NodeJS.Signals) => {
+      const pid = child.pid;
+      if (!pid) return;
+      try {
+        if (process.platform === "win32") {
+          // No process groups on Windows; kill the child directly.
+          child.kill(signal);
+        } else {
+          // Negative PID = whole process group (works because detached: true).
+          process.kill(-pid, signal);
+        }
+      } catch {
+        // Already gone — that is what we wanted.
+      }
+    };
+
+    const beginKillLadder = () => {
+      killGroup("SIGTERM");
+      sigkillTimer = setTimeout(() => killGroup("SIGKILL"), killGraceMs);
+    };
+
+    const hardTimer = setTimeout(() => {
+      timedOut = true;
+      beginKillLadder();
+    }, opts.timeoutMs);
+
+    const onAbort = () => {
+      aborted = true;
+      beginKillLadder();
+    };
+    opts.abortController?.signal.addEventListener("abort", onAbort, { once: true });
+
+    const cleanup = () => {
+      clearTimeout(hardTimer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
+      opts.abortController?.signal.removeEventListener("abort", onAbort);
+    };
+
+    child.on("error", (err) => {
+      cleanup();
+      reject(err);
+    });
+
+    // Resolve/reject only after the child has truly exited. This is the
+    // contract that prevents queue-slot leaks.
+    child.on("exit", () => {
+      cleanup();
+      if (aborted) {
+        reject(new Error("Aborted"));
+      } else if (timedOut) {
+        const stderr = Buffer.concat(stderrChunks).toString("utf-8").trim();
+        reject(new Error(`CLI timed out after ${opts.timeoutMs}ms${stderr ? `: ${stderr.slice(-500)}` : ""}`));
+      } else {
+        resolve(Buffer.concat(stdoutChunks).toString("utf-8"));
+      }
+    });
+  });
+}
+
+/**
+ * Build a QueryFn that runs `claude -p` via a cancellable subprocess.
+ *
+ * Historical context: an earlier version of this file ran `execSync` inside a
+ * worker thread because the Bun-compiled `claude` binary appeared not to pipe
+ * stdout to async `spawn`/`exec`. That implementation leaked worker slots —
+ * calling `worker.terminate()` on abort killed the worker but orphaned the
+ * underlying `claude` subprocess, which kept holding the request queue slot
+ * until it exited on its own (sometimes never, for hung interactive prompts).
+ *
+ * This implementation uses `spawn` through `sh -c '<cmd>'`, which preserves
+ * the shell-piping path that worked for execSync while making the child
+ * killable on abort. See `spawnWithAbort` for the signal handling.
  */
 function createCLIQueryFn(cliBin: string): QueryFn {
   return function cliQuery(args: { prompt: unknown; options: Record<string, unknown> }): AsyncIterable<Record<string, unknown>> {
@@ -73,57 +195,15 @@ function createCLIQueryFn(cliBin: string): QueryFn {
 
     return {
       async *[Symbol.asyncIterator]() {
-        // Run execSync in a worker thread to keep the event loop free
-        const stdout: string = await new Promise((resolve, reject) => {
-          const workerCode = `
-            const { parentPort, workerData } = require('worker_threads');
-            const { execSync } = require('child_process');
-            try {
-              const out = execSync(workerData.cmd, {
-                encoding: 'utf-8',
-                timeout: workerData.timeout,
-                maxBuffer: 50 * 1024 * 1024,
-                cwd: workerData.cwd || undefined,
-                env: process.env,
-              });
-              parentPort.postMessage({ ok: true, data: out });
-            } catch (err) {
-              parentPort.postMessage({ ok: false, error: err.message });
-            }
-          `;
+        const ac = opts.abortController as AbortController | undefined;
+        const timeoutMs = ac
+          ? 10 * 60 * 1000   // 10 min for streaming
+          : 5 * 60 * 1000;   // 5 min for one-shot
 
-          const timeout = (opts.abortController as AbortController | undefined)
-            ? 10 * 60 * 1000   // 10 min for streaming
-            : 5 * 60 * 1000;   // 5 min for one-shot
-
-          const cwd = opts.cwd ? String(opts.cwd) : undefined;
-
-          const worker = new Worker(workerCode, {
-            eval: true,
-            workerData: { cmd, timeout, cwd },
-          });
-
-          worker.on("message", (msg: { ok: boolean; data?: string; error?: string }) => {
-            if (msg.ok) {
-              resolve(msg.data || "");
-            } else {
-              reject(new Error(msg.error || "CLI execution failed"));
-            }
-          });
-
-          worker.on("error", reject);
-          worker.on("exit", (code) => {
-            if (code !== 0) reject(new Error(`Worker exited with code ${code}`));
-          });
-
-          // Handle abort
-          const ac = opts.abortController as AbortController | undefined;
-          if (ac) {
-            ac.signal.addEventListener("abort", () => {
-              worker.terminate();
-              reject(new Error("Aborted"));
-            });
-          }
+        const stdout = await spawnWithAbort(cmd, {
+          cwd: opts.cwd ? String(opts.cwd) : undefined,
+          abortController: ac,
+          timeoutMs,
         });
 
         // Parse the NDJSON output line by line and yield each event
