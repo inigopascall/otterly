@@ -1,6 +1,6 @@
 {
   "name": "otterly",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "description": "Ollama for Claude. Use your Claude Code subscription as a local OpenAI-compatible API — no API keys, no per-token billing.",
   "type": "module",
   "main": "dist/index.js",

@@ -5,6 +5,40 @@ All notable changes to this project are documented in this file.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 and uses [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) formatting.
 
+## [0.8.0] - 2026-06-03
+
+### Added
+
+- **Ollama-native API.** otterly now speaks Ollama's own protocol on port
+  `11434`, not just OpenAI compat — so Ollama-only tools (Open WebUI's native
+  connection, Raycast, oterm, homelab dashboards) auto-discover it with zero
+  config and list your Claude models in their picker.
+  - `GET /api/tags` — model discovery (tools poll this on startup).
+  - `POST /api/chat` — conversational chat, NDJSON stream (`stream` defaults to
+    `true`, matching Ollama).
+  - `POST /api/generate` — single-prompt completion, NDJSON stream.
+  - `POST /api/show` — model metadata (context length, capabilities).
+  - `GET /api/version`, `GET /api/ps`, and a `POST /api/pull` success stub.
+- **`GET /v1/models`** — OpenAI-format model list. Many OpenAI clients probe
+  this on startup; otterly now answers instead of returning 404.
+- **Real OpenAI function calling.** Supplying OpenAI `tools` now returns proper
+  `tool_calls` with `finish_reason: "tool_calls"` (non-streaming and streaming),
+  so agentic clients (Cline, Aider, your own scripts) get the structured calls
+  they expect. Supports `tool_choice` `none` / `required` / `{function}`,
+  multi-turn `tool` + assistant-`tool_calls` history, and multiple parallel
+  calls. The parser tolerates code fences and surrounding prose/thinking text.
+- Shared model catalog (`models.ts`) backing both `/v1/models` and `/api/tags`.
+- OpenAPI spec and README updated to document all new endpoints.
+
+### Changed
+
+- When a request carries OpenAI `tools`, otterly now disables Claude's own
+  built-in tools (`disallowedTools`) for that request, following OpenAI
+  semantics that the **caller** executes the functions. Previously the tool
+  names were mapped onto Claude's built-ins, which could let Claude run
+  `Bash`/`Write`/`Edit` on the server host. The new behavior is both correct and
+  safer.
+
 ## [0.7.0] - 2026-05-23
 
 ### Added
