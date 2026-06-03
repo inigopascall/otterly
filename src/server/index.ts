@@ -5,6 +5,14 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "http";
 import { WebSocketServer } from "ws";
 import { handleChatCompletions } from "./routes-openai.js";
+import {
+  handleOllamaChat,
+  handleOllamaGenerate,
+  handleOllamaShow,
+  handleOllamaPull,
+} from "./routes-ollama.js";
+import { buildModelsList } from "./openai-compat.js";
+import { buildOllamaTags, OLLAMA_COMPAT_VERSION } from "./ollama-compat.js";
 import { handleStatus, handleRun, handleStream, PKG_VERSION, type ParsedRequest, type ServerContext } from "./routes-native.js";
 import { metrics } from "./metrics.js";
 import { attachWsHandler } from "./ws-handler.js";
@@ -152,6 +160,39 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
       return;
     }
 
+    // ── Discovery endpoints (no auth, no Claude spawn) ──
+    // OpenAI clients call /v1/models on startup; Ollama clients poll /api/tags.
+
+    if (req.method === "GET" && path === "/v1/models") {
+      jsonResponse(res, 200, buildModelsList());
+      return;
+    }
+    if (req.method === "GET" && path === "/api/tags") {
+      jsonResponse(res, 200, buildOllamaTags());
+      return;
+    }
+    if (req.method === "GET" && path === "/api/version") {
+      jsonResponse(res, 200, { version: OLLAMA_COMPAT_VERSION });
+      return;
+    }
+    if (req.method === "GET" && path === "/api/ps") {
+      jsonResponse(res, 200, { models: [] });
+      return;
+    }
+
+    // Ollama metadata POSTs — no Claude spawn, so answered before the
+    // auth/rate-limit/queue pipeline. /api/show and /api/pull are pure model
+    // discovery (Ollama has no auth on these).
+    if (req.method === "POST" && (path === "/api/show" || path === "/api/pull")) {
+      const metaBody = await parseBody(req) ?? {};
+      if (path === "/api/show") {
+        handleOllamaShow(metaBody, res);
+      } else {
+        await handleOllamaPull(metaBody, res);
+      }
+      return;
+    }
+
     // GET /playground and /dashboard — both served by the same UI shell
     if (req.method === "GET" && (path === "/playground" || path === "/dashboard")) {
       const html = getPlaygroundHtml(port, PKG_VERSION);
@@ -218,9 +259,11 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
     parsed.requestId = requestId;
     parsed.startTime = startTime;
 
-    // Determine if streaming (affects timeout)
+    // Determine if streaming (affects timeout). Ollama defaults stream to true.
+    const isOllamaInfer = path === "/api/chat" || path === "/api/generate";
     const isStream = path === "/api/stream"
-      || (isOpenai && parsed.body?.stream === true);
+      || (isOpenai && parsed.body?.stream === true)
+      || (isOllamaInfer && parsed.body?.stream !== false);
     const timeoutMs = isStream ? streamTimeoutMs : requestTimeoutMs;
 
     // Queue + execute with timeout
@@ -235,6 +278,10 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
               await handleRun(parsed, res, ctx, circuitBreaker);
             } else if (path === "/api/stream") {
               await handleStream(parsed, res, ctx, circuitBreaker);
+            } else if (path === "/api/chat") {
+              await handleOllamaChat(parsed, res, ctx, circuitBreaker);
+            } else if (path === "/api/generate") {
+              await handleOllamaGenerate(parsed, res, ctx, circuitBreaker);
             } else {
               jsonResponse(res, 404, { error: "Not found" });
             }
@@ -314,6 +361,8 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
       console.log(`\n  otterly serve — local inference server`);
       console.log(`  ──────────────────────────────────────`);
       console.log(`  OpenAI compat : http://localhost:${port}/v1/chat/completions`);
+      console.log(`  OpenAI models : http://localhost:${port}/v1/models`);
+      console.log(`  Ollama API    : http://localhost:${port}/api/chat · /api/generate · /api/tags`);
       console.log(`  Native API    : http://localhost:${port}/api/run`);
       console.log(`  Streaming     : http://localhost:${port}/api/stream`);
       console.log(`  WebSocket     : ws://localhost:${port}/ws`);

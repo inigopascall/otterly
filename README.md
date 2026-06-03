@@ -347,6 +347,53 @@ Open the **playground** at [http://localhost:11434/playground](http://localhost:
 
 ---
 
+## Speak Ollama, not just OpenAI
+
+otterly listens on port `11434` *and* answers Ollama's own API — so Ollama-only
+tools (Open WebUI's native connection, Raycast, oterm, homelab dashboards) that
+auto-discover a local Ollama by polling `GET /api/tags` find otterly with **zero
+config** and list your Claude models in their picker.
+
+```bash
+# Discovery — exactly what Ollama tools hit on startup
+curl http://localhost:11434/api/tags
+
+# Ollama-native chat (NDJSON stream, like `ollama run`)
+curl http://localhost:11434/api/chat -d '{
+  "model": "claude-sonnet-4-20250514",
+  "messages": [{ "role": "user", "content": "Write a haiku about otters" }]
+}'
+```
+
+Point any tool that expects an Ollama endpoint at `http://localhost:11434` and it
+just works. `OLLAMA_HOST=http://localhost:11434` is all most of them need.
+
+## Function calling (OpenAI tools)
+
+Send OpenAI-format `tools` and otterly returns real `tool_calls` with
+`finish_reason: "tool_calls"` — so agentic clients (Cline, Aider, your own
+scripts) get the structured function calls they expect. **Your** code runs the
+function and sends the result back as a `role: "tool"` message, exactly like the
+OpenAI API. While a request carries `tools`, otterly disables Claude's own
+built-in tools, so it never touches your filesystem or shell — the functions are
+yours to execute.
+
+```typescript
+const res = await ai.chat.completions.create({
+  model: "claude-sonnet-4-20250514",
+  messages: [{ role: "user", content: "What's the weather in Paris?" }],
+  tools: [{
+    type: "function",
+    function: {
+      name: "get_weather",
+      description: "Get current weather for a city",
+      parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
+    },
+  }],
+});
+// res.choices[0].message.tool_calls → [{ function: { name: "get_weather", arguments: '{"city":"Paris"}' } }]
+```
+
 ## Mode 3: Embedded server, programmatic, no CLI
 
 Run the full HTTP + WebSocket server **inside your own Node app**. Same endpoints, same playground, same WebSocket sessions, but no separate process to babysit.
@@ -377,7 +424,12 @@ This is exactly what `npx otterly serve` runs under the hood. Bundle it inside a
 
 | Endpoint | Format | What it's for |
 |---|---|---|
-| `POST /v1/chat/completions` | OpenAI | Drop-in for any OpenAI client/SDK |
+| `POST /v1/chat/completions` | OpenAI | Drop-in for any OpenAI client/SDK (incl. function calling) |
+| `GET /v1/models` | OpenAI | Model list — clients probe this on startup |
+| `POST /api/chat` | Ollama | Ollama-native chat (NDJSON stream) |
+| `POST /api/generate` | Ollama | Ollama-native completion (NDJSON stream) |
+| `GET /api/tags` | Ollama | Model discovery — Ollama-only tools poll this to find otterly |
+| `POST /api/show` | Ollama | Model metadata (context length, capabilities) |
 | `POST /api/run` | JSON | Native one-shot with cost + tool logs |
 | `POST /api/stream` | NDJSON | Streaming with rich events |
 | `WS /ws` | WebSocket | Persistent multi-turn sessions |
