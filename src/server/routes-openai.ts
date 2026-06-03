@@ -19,7 +19,10 @@ import {
   sseData,
   errorToHttpStatus,
   openaiErrorBody,
-  openaiToolsToAllowedTools,
+  buildToolInstruction,
+  parseToolCalls,
+  toOpenAIToolCalls,
+  CLAUDE_BUILTIN_TOOLS,
   type OpenAIChatRequest,
 } from "./openai-compat.js";
 
@@ -65,6 +68,22 @@ export async function handleChatCompletions(
       ? `${finalSystemPrompt}\n\n${jsonInstruction}`
       : jsonInstruction;
   }
+
+  // Function calling: when the client supplies `tools`, OpenAI semantics say the
+  // CLIENT executes them. We teach Claude to emit a tool-call JSON object and
+  // disable its own built-in tools so it never runs Bash/Write on the server.
+  // The directive goes into the user turn (not the system prompt) because
+  // Claude Code's agentic prior otherwise overrides a system-level instruction
+  // and refuses ("I can't access live data") instead of emitting the call.
+  const wantsTools =
+    Array.isArray(body.tools) && body.tools.length > 0 && body.tool_choice !== "none";
+  let enginePrompt = prompt;
+  if (wantsTools) {
+    const instruction = buildToolInstruction(body.tools!, body.tool_choice);
+    enginePrompt = `${instruction}\n\n=== USER REQUEST ===\n${prompt}`;
+    options.disallowedTools = CLAUDE_BUILTIN_TOOLS;
+  }
+
   if (finalSystemPrompt) {
     options.systemPrompt = finalSystemPrompt;
   }
@@ -73,18 +92,14 @@ export async function handleChatCompletions(
     options.model = model;
   }
 
-  // Tools parameter → allowedTools filter
-  if (body.tools && Array.isArray(body.tools)) {
-    const allowed = openaiToolsToAllowedTools(body.tools);
-    if (allowed.length > 0) {
-      options.allowedTools = allowed;
-    }
-  }
-
-  // Session reuse via X-Session-Id header or session_id in body
-  const sessionId = (req.headers["x-session-id"] as string)
-    || (body as unknown as Record<string, unknown>).session_id as string
-    || null;
+  // Session reuse via X-Session-Id header or session_id in body.
+  // Skipped for function-calling turns — those clients carry their own history
+  // in `messages` and expect a fresh, stateless evaluation each call.
+  const sessionId = !wantsTools
+    ? ((req.headers["x-session-id"] as string)
+      || (body as unknown as Record<string, unknown>).session_id as string
+      || null)
+    : null;
 
   if (sessionId) {
     const entry = apiSessions.get(sessionId);
@@ -99,14 +114,106 @@ export async function handleChatCompletions(
     // Session not found — fall through to one-shot
   }
 
-  // Multimodal: for now, add a note to the prompt about image content.
-  // Full multimodal requires session-based path with SDKUserMessage.
-  // This is a pragmatic approach that works for most cases.
+  if (wantsTools) {
+    await handleFunctionCalling(req, res, enginePrompt, options, model, abortController, stream, circuitBreaker);
+    return;
+  }
+
+  // Multimodal note: image_url parts are currently flattened to a text marker
+  // (see openaiToClaudeInput). Real image passthrough needs the SDK content-block
+  // path and is not yet supported on the CLI spawn path.
 
   if (stream) {
     await handleStreaming(req, res, prompt, options, model, abortController, circuitBreaker);
   } else {
     await handleNonStreaming(req, res, prompt, options, model, abortController, circuitBreaker);
+  }
+}
+
+/**
+ * Function-calling path. Runs Claude to completion (buffered), parses its output
+ * for a tool-call request, and returns either OpenAI `tool_calls` (finish_reason
+ * "tool_calls") or a normal text answer. Buffering is required because the call
+ * is detected from the full response, so even streaming clients get the result
+ * emitted as a single terminal set of chunks.
+ */
+async function handleFunctionCalling(
+  req: ParsedRequest,
+  res: ServerResponse,
+  prompt: string,
+  options: EngineOptions,
+  model: string,
+  abortController: AbortController,
+  stream: boolean,
+  circuitBreaker?: CircuitBreaker,
+): Promise<void> {
+  const engine = new ClaudeEngine();
+  const startedAt = Date.now();
+
+  try {
+    const result = await engine.run(prompt, options);
+    if (abortController.signal.aborted) return;
+    circuitBreaker?.onSuccess();
+
+    const parsed = parseToolCalls(result.text);
+    const toolCalls = parsed ? toOpenAIToolCalls(parsed) : null;
+
+    metrics.record({
+      ts: Date.now(), endpoint: "chat", status: 200,
+      durationMs: Date.now() - startedAt,
+      cost: result.cost || 0,
+      inputTokens: result.usage?.input_tokens || 0,
+      outputTokens: result.usage?.output_tokens || 0,
+      toolCalls: toolCalls?.length || 0,
+    });
+
+    if (stream) {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+      });
+      const completionId = `chatcmpl-otterly-${crypto.randomUUID().slice(0, 12)}`;
+      await sseWrite(res, sseData(makeStreamChunk(completionId, { role: "assistant" }, null, model)));
+      if (toolCalls) {
+        await sseWrite(res, sseData(makeStreamChunk(completionId, {
+          tool_calls: toolCalls.map((tc, index) => ({
+            index, id: tc.id, type: tc.type, function: tc.function,
+          })),
+        }, null, model)));
+        await sseWrite(res, sseData(makeStreamChunk(completionId, {}, "tool_calls", model)));
+      } else {
+        if (result.text) {
+          await sseWrite(res, sseData(makeStreamChunk(completionId, { content: result.text }, null, model)));
+        }
+        await sseWrite(res, sseData(makeStreamChunk(completionId, {}, "stop", model)));
+      }
+      await sseWrite(res, "data: [DONE]\n\n");
+      if (!res.writableEnded) res.end();
+    } else {
+      const response = claudeResultToOpenai(result.text, model, result.usage, toolCalls || undefined);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(response));
+    }
+  } catch (err) {
+    const e = err instanceof Error ? err : new Error(String(err));
+    if (e.name === "AbortError" || abortController.signal.aborted) return;
+    const code = err instanceof AgentError ? err.code : undefined;
+    circuitBreaker?.onFailure(code);
+    logError(req.requestId || "", e.message);
+    const status = errorToHttpStatus(e);
+    metrics.record({
+      ts: Date.now(), endpoint: "chat", status,
+      durationMs: Date.now() - startedAt,
+      cost: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0,
+      error: e.message,
+    });
+    if (!res.headersSent) {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(openaiErrorBody(status, e.message)));
+    } else if (!res.writableEnded) {
+      res.end();
+    }
   }
 }
 

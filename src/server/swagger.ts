@@ -92,6 +92,128 @@ export const openApiSpec = {
         },
       },
     },
+    "/v1/models": {
+      get: {
+        summary: "List available models (OpenAI format)",
+        operationId: "listModels",
+        description: "Returned to OpenAI clients that probe for models on startup.",
+        responses: {
+          "200": {
+            description: "Model list",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    object: { type: "string", example: "list" },
+                    data: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          id: { type: "string" },
+                          object: { type: "string", example: "model" },
+                          created: { type: "integer" },
+                          owned_by: { type: "string", example: "anthropic" },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/api/tags": {
+      get: {
+        summary: "List models (Ollama format)",
+        operationId: "ollamaTags",
+        description: "Ollama-native discovery endpoint. Ollama-only tools poll this to auto-detect otterly and build their model picker.",
+        responses: {
+          "200": { description: "Ollama model list", content: { "application/json": { schema: { type: "object" } } } },
+        },
+      },
+    },
+    "/api/chat": {
+      post: {
+        summary: "Ollama-compatible chat",
+        operationId: "ollamaChat",
+        security: [{ BearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["messages"],
+                properties: {
+                  model: { type: "string", default: "claude-sonnet-4-20250514" },
+                  messages: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        role: { type: "string", enum: ["system", "user", "assistant", "tool"] },
+                        content: { type: "string" },
+                        images: { type: "array", items: { type: "string" } },
+                      },
+                    },
+                  },
+                  stream: { type: "boolean", default: true, description: "Ollama defaults to true; NDJSON stream when set" },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": { description: "Ollama chat response (NDJSON stream when stream=true)" },
+          "400": { description: "Invalid request" },
+          "401": { description: "Unauthorized" },
+        },
+      },
+    },
+    "/api/generate": {
+      post: {
+        summary: "Ollama-compatible completion",
+        operationId: "ollamaGenerate",
+        security: [{ BearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["prompt"],
+                properties: {
+                  model: { type: "string", default: "claude-sonnet-4-20250514" },
+                  prompt: { type: "string" },
+                  system: { type: "string" },
+                  stream: { type: "boolean", default: true },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": { description: "Ollama generate response (NDJSON stream when stream=true)" },
+          "400": { description: "Missing prompt" },
+          "401": { description: "Unauthorized" },
+        },
+      },
+    },
+    "/api/show": {
+      post: {
+        summary: "Model metadata (Ollama format)",
+        operationId: "ollamaShow",
+        requestBody: {
+          required: true,
+          content: { "application/json": { schema: { type: "object", properties: { model: { type: "string" } } } } },
+        },
+        responses: { "200": { description: "Model details incl. context length and capabilities" } },
+      },
+    },
     "/v1/chat/completions": {
       post: {
         summary: "OpenAI-compatible chat completions",
@@ -276,10 +398,28 @@ export const openApiSpec = {
                   type: "object",
                   properties: {
                     role: { type: "string" },
-                    content: { type: "string" },
+                    content: { type: "string", nullable: true },
+                    tool_calls: {
+                      type: "array",
+                      description: "Present when the model requests caller-executed functions",
+                      items: {
+                        type: "object",
+                        properties: {
+                          id: { type: "string" },
+                          type: { type: "string", example: "function" },
+                          function: {
+                            type: "object",
+                            properties: {
+                              name: { type: "string" },
+                              arguments: { type: "string", description: "JSON-encoded arguments" },
+                            },
+                          },
+                        },
+                      },
+                    },
                   },
                 },
-                finish_reason: { type: "string" },
+                finish_reason: { type: "string", enum: ["stop", "tool_calls", "length"] },
               },
             },
           },
