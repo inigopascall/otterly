@@ -61,6 +61,18 @@ export async function handleChatCompletions(
     maxTurns: 1,        // a pure chat completion is one turn; even a leaked tool can't loop
   };
 
+  // Reasoning effort: honour an OpenAI-style `reasoning_effort` field if the
+  // client sends one; otherwise crank to maximum for the big reasoning models
+  // (Fable, Opus, Mythos), else default to medium.
+  const reqEffort = (body as unknown as Record<string, unknown>).reasoning_effort;
+  if (typeof reqEffort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(reqEffort)) {
+    options.effort = reqEffort as EngineOptions["effort"];
+  } else if (/fable|opus|mythos/i.test(model)) {
+    options.effort = "max";
+  } else {
+    options.effort = "medium";
+  }
+
   // Build system prompt: original + JSON mode injection
   let finalSystemPrompt = systemPrompt || "";
   if (body.response_format?.type === "json_object") {
