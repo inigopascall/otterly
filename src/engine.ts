@@ -44,10 +44,29 @@ function buildCLICommand(cliBin: string, prompt: string, opts: Record<string, un
   const parts = [cliBin, "-p", "--output-format", "stream-json", "--verbose"];
 
   if (opts.model) parts.push("--model", String(opts.model));
-  if (opts.systemPrompt) {
-    const safe = String(opts.systemPrompt).replace(/'/g, "'\\''");
-    parts.push("--system-prompt", `'${safe}'`);
-  }
+
+  // Always override Claude Code's default system prompt. Per `claude --help`,
+  // the auto-injected "dynamic" sections (cwd, env info, memory paths, git
+  // status) live in the *default* system prompt and are dropped when a custom
+  // --system-prompt is supplied. Honour the caller's system prompt when present;
+  // otherwise fall back to a minimal neutral one so the model behaves like a
+  // plain text-in/text-out chat API rather than an agentic coding assistant.
+  const sysPrompt = opts.systemPrompt ? String(opts.systemPrompt) : "You are a helpful assistant.";
+  const safeSys = sysPrompt.replace(/'/g, "'\\''");
+  parts.push("--system-prompt", `'${safeSys}'`);
+
+  // Do not load user/project/local settings or CLAUDE.md project memory, so the
+  // model has no repo-specific context the caller did not explicitly send.
+  parts.push("--setting-sources", "''");
+
+  // Disable all of Claude Code's built-in tools (Bash/Read/Edit/etc). Per
+  // `claude --help`, an empty value to --tools disables the entire built-in
+  // set. This makes the model behave like a plain text-in/text-out chat API:
+  // it cannot autonomously read or edit files on disk. Tool orchestration is
+  // left entirely to the OpenAI-compatible client (e.g. AiderDesk/Aider), so
+  // every tool call is visible to and controlled by that client rather than
+  // happening invisibly inside the `claude` process.
+  parts.push("--tools", "''");
   if (opts.resume) parts.push("--resume", String(opts.resume));
   if (opts.permissionMode) parts.push("--permission-mode", String(opts.permissionMode));
   if (opts.allowedTools) {
@@ -373,7 +392,18 @@ export class ClaudeEngine {
     if (opts.mcpServers) queryOptions.mcpServers = opts.mcpServers;
     if (opts.effort) queryOptions.effort = opts.effort;
     if (opts.resume) queryOptions.resume = opts.resume;
-    if (opts.systemPrompt) queryOptions.systemPrompt = opts.systemPrompt;
+
+    // The SDK option is `customSystemPrompt` (see @anthropic-ai/claude-code
+    // sdk.d.ts), NOT `systemPrompt` — passing the latter is silently ignored,
+    // leaving Claude Code's *default* system prompt in place. That default is
+    // where the dynamic cwd / env info / git-status sections live (per
+    // `claude --help`: --exclude-dynamic-system-prompt-sections). So always
+    // set customSystemPrompt to strip that injection: honour the caller's
+    // system prompt when present, otherwise fall back to a neutral one so the
+    // model behaves like a plain text-in/text-out chat API.
+    queryOptions.customSystemPrompt = opts.systemPrompt
+      ? String(opts.systemPrompt)
+      : "You are a helpful assistant.";
 
     if (opts.onPermission) {
       queryOptions.permissionMode = "default";

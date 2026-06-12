@@ -100,7 +100,8 @@ export interface OpenAIStreamChunk {
 export const CLAUDE_BUILTIN_TOOLS = [
   "Read", "Write", "Edit", "MultiEdit", "Bash", "BashOutput", "KillShell",
   "Glob", "Grep", "WebFetch", "WebSearch", "Task", "NotebookEdit",
-  "TodoWrite", "ExitPlanMode", "AskUserQuestion",
+  "NotebookRead", "TodoWrite", "ExitPlanMode", "AskUserQuestion",
+  "SlashCommand", "Skill", "LS",
 ];
 
 // ── Conversion Functions ──
@@ -207,22 +208,22 @@ export function buildToolInstruction(
   }
 
   return [
-    "You are a function-call router. Your ONLY job is to read the user request below and decide which of these functions should be called to fulfill it:",
+    "You can call the following functions when they would help fulfil the user's request. A separate system executes them and returns the result to you:",
     JSON.stringify(defs, null, 2),
     "",
-    "Output ONLY this JSON object and nothing else — no prose, no explanation, no markdown fences:",
+    "To call one or more functions, output ONLY this JSON object and nothing else — no prose, no markdown fences:",
     '{"tool_calls": [{"name": "<function name>", "arguments": {<arguments as a JSON object>}}]}',
     "",
-    "Critical rules:",
-    "- You are NOT answering the user's request yourself. You only emit the function call(s); a separate system runs them and returns the real result.",
-    "- So NEVER reply that you lack access to data, the internet, tools, or live information — that is the function's job, not yours. Just emit the call.",
-    "- Fill arguments from the user request, matching each function's JSON Schema. Output the JSON object only.",
+    "Rules:",
+    "- When you emit a function call, do not also answer the request yourself; the function result will be returned to you.",
+    "- Never claim you lack access to data, the internet, or tools when a listed function provides it — emit the call instead.",
+    "- Fill arguments from the user request, matching each function's JSON Schema.",
     "- Do not invent functions that are not listed above.",
     forcedName
       ? `- You MUST call the function "${forcedName}".`
       : required
         ? "- You MUST call at least one of the listed functions. Do not reply with plain text."
-        : "- Only if NONE of the listed functions could possibly help, reply with a single line of plain text instead of JSON.",
+        : "- If no listed function is needed, ignore everything above and answer the user's request fully, completely, and normally.",
   ].join("\n");
 }
 
@@ -277,38 +278,42 @@ export function parseToolCalls(text: string): ParsedToolCall[] | null {
   const fence = s.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
   if (fence) s = fence[1].trim();
 
-  // Try the whole string first, then every balanced {...} region within it.
-  const candidates = [s, ...extractJsonObjects(s)];
+  const calls: ParsedToolCall[] = [];
 
-  for (const candidate of candidates) {
-    let obj: unknown;
+  const pushCall = (raw: unknown) => {
+    const entry = raw as { name?: string; arguments?: unknown; function?: { name?: string; arguments?: unknown } };
+    const name = entry?.name ?? entry?.function?.name;
+    if (typeof name !== "string" || !name) return;
+    let args: unknown = entry.arguments ?? entry.function?.arguments ?? {};
+    if (typeof args === "string") {
+      try { args = JSON.parse(args); } catch { args = { value: args }; }
+    }
+    if (typeof args !== "object" || args === null) args = {};
+    calls.push({ name, arguments: args as Record<string, unknown> });
+  };
+
+  // Format A (what we asked for): the whole reply is {"tool_calls": [...]}
+  try {
+    const obj = JSON.parse(s) as { tool_calls?: unknown };
+    if (Array.isArray(obj?.tool_calls)) {
+      for (const raw of obj.tool_calls) pushCall(raw);
+      if (calls.length > 0) return calls;
+    }
+  } catch { /* not a bare JSON object — try format B */ }
+
+  // Format B (what Claude actually emits): <function_calls>[{...}]</function_calls>
+  // blocks embedded in prose, each containing a JSON array (or object) of calls.
+  const blockRe = /<function_calls>\s*([\s\S]*?)\s*<\/function_calls>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = blockRe.exec(s)) !== null) {
     try {
-      obj = JSON.parse(candidate);
-    } catch {
-      continue;
-    }
-    const rawCalls = (obj as { tool_calls?: unknown })?.tool_calls;
-    if (!Array.isArray(rawCalls) || rawCalls.length === 0) continue;
-
-    const calls: ParsedToolCall[] = [];
-    for (const raw of rawCalls) {
-      const entry = raw as { name?: string; arguments?: unknown; function?: { name?: string; arguments?: unknown } };
-      const name = entry.name ?? entry.function?.name;
-      if (typeof name !== "string" || !name) continue;
-      let args: unknown = entry.arguments ?? entry.function?.arguments ?? {};
-      if (typeof args === "string") {
-        try {
-          args = JSON.parse(args);
-        } catch {
-          args = { value: args };
-        }
-      }
-      if (typeof args !== "object" || args === null) args = {};
-      calls.push({ name, arguments: args as Record<string, unknown> });
-    }
-    if (calls.length > 0) return calls;
+      const parsed = JSON.parse(m[1]);
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      for (const raw of arr) pushCall(raw);
+    } catch { /* malformed block — skip */ }
   }
-  return null;
+
+  return calls.length > 0 ? calls : null;
 }
 
 /** Convert parsed calls into OpenAI `tool_calls` with generated ids. */

@@ -58,6 +58,7 @@ export async function handleChatCompletions(
     cwd: ctx.workingDir,
     permissionMode: "bypassPermissions",
     signal: abortController.signal,
+    maxTurns: 1,        // a pure chat completion is one turn; even a leaked tool can't loop
   };
 
   // Build system prompt: original + JSON mode injection
@@ -81,6 +82,12 @@ export async function handleChatCompletions(
   if (wantsTools) {
     const instruction = buildToolInstruction(body.tools!, body.tool_choice);
     enginePrompt = `${instruction}\n\n=== USER REQUEST ===\n${prompt}`;
+    options.disallowedTools = CLAUDE_BUILTIN_TOOLS;
+  } else {
+    // No client tools: behave like a plain chat model. Disable Claude Code's
+    // built-in tools so it cannot autonomously read/edit files or run commands
+    // on the server — the OpenAI-compatible client (e.g. AiderDesk) drives all
+    // tool use, and every tool call stays visible to and controlled by it.
     options.disallowedTools = CLAUDE_BUILTIN_TOOLS;
   }
 
@@ -360,6 +367,12 @@ async function handleStreaming(
   // Without this, clients with idle-detection (e.g. OpenAI/JS SDK) abandon
   // long-running streams during Claude Code cold spawn or large-prompt processing.
   let firstContentSeen = false;
+  // SDK streaming (includePartialMessages) emits incremental `text_delta`
+  // events AND a final consolidated `text` block with the full answer. Relaying
+  // both duplicates the entire response. Track whether we streamed any delta;
+  // if so, suppress the terminal `text` block. CLI mode emits no deltas, only a
+  // single `text` event, so it still gets relayed.
+  let sawTextDelta = false;
   const heartbeat = setInterval(() => {
     if (firstContentSeen || res.writableEnded) return;
     try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
@@ -380,11 +393,14 @@ async function handleStreaming(
         toolCount++;
         metrics.recordToolUse(event.tool);
       } else if (event.type === "text_delta") {
+        sawTextDelta = true;
         await sseWrite(res, sseData(makeStreamChunk(completionId, { content: event.delta }, null, model)));
       } else if (event.type === "text") {
-        // CLI mode emits a single `text` event with the full answer
-        // (vs SDK streaming which emits text_delta). Relay it as a content chunk.
-        if (event.text) {
+        // CLI mode emits a single `text` event with the full answer (vs SDK
+        // streaming which emits text_delta). Relay it ONLY if we did not already
+        // stream deltas — otherwise this is the SDK's terminal consolidated
+        // block and relaying it would duplicate the whole response.
+        if (event.text && !sawTextDelta) {
           await sseWrite(res, sseData(makeStreamChunk(completionId, { content: event.text }, null, model)));
         }
       } else if (event.type === "result") {
