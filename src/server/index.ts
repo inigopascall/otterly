@@ -92,7 +92,7 @@ export interface ApiServerHandle {
 }
 
 export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiServerHandle> {
-  const port = opts.port ?? 11434;
+  const port = opts.port ?? 11435;
   const workingDir = opts.workingDir ?? process.cwd();
   const apiKey = process.env.OTTERLY_API_KEY || null;
   const requestTimeoutMs = opts.requestTimeoutMs ?? 5 * 60 * 1000;  // 5 min one-shot

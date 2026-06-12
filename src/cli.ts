@@ -9,7 +9,7 @@ import { startApiServer } from "./server/index.js";
 const { values, positionals } = parseArgs({
   allowPositionals: true,
   options: {
-    port: { type: "string", short: "p", default: "11434" },
+    port: { type: "string", short: "p", default: "11435" },
     dir: { type: "string", short: "d", default: process.cwd() },
     "max-concurrent": { type: "string", default: "5" },
     "max-queue": { type: "string", default: "50" },
@@ -36,7 +36,7 @@ if (values.help || command === "help") {
     otterly help                Show this help
 
   Options:
-    -p, --port <number>         Port to listen on (default: 11434)
+    -p, --port <number>         Port to listen on (default: 11435)
     -d, --dir <path>            Working directory for Claude (default: cwd)
     --max-concurrent <number>   Max concurrent requests (default: 5)
     --max-queue <number>        Max queued requests (default: 50)
