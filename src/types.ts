@@ -26,7 +26,7 @@ export interface EngineOptions {
   /** Session ID to resume a previous conversation */
   resume?: string;
   /** Reasoning effort level */
-  effort?: "low" | "medium" | "high";
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
 }
 
 // ── Permissions ──
