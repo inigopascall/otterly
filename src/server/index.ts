@@ -4,6 +4,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "http";
 import { WebSocketServer } from "ws";
+import { setBackend, type Backend } from "./models.js";
 import { handleChatCompletions } from "./routes-openai.js";
 import {
   handleOllamaChat,
@@ -81,6 +82,8 @@ export interface ApiServerOptions {
   requestsPerMinute?: number;
   requestTimeoutMs?: number;
   streamTimeoutMs?: number;
+  /** Which inference backend to use ("claude" or "cursor"). Defaults to "claude". */
+  backend?: Backend;
 }
 
 export interface ApiServerHandle {
@@ -94,6 +97,10 @@ export interface ApiServerHandle {
 export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiServerHandle> {
   const port = opts.port ?? 11435;
   const workingDir = opts.workingDir ?? process.cwd();
+
+  // Activate the chosen backend process-wide so all compat modules pick it up.
+  const backend = opts.backend ?? "claude";
+  setBackend(backend);
   const apiKey = process.env.OTTERLY_API_KEY || null;
   const requestTimeoutMs = opts.requestTimeoutMs ?? 5 * 60 * 1000;  // 5 min one-shot
   const streamTimeoutMs = opts.streamTimeoutMs ?? 10 * 60 * 1000;   // 10 min streaming
@@ -369,6 +376,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
       console.log(`  Health        : http://localhost:${port}/api/status`);
       console.log(`  Playground    : http://localhost:${port}/playground`);
       console.log(`  Dashboard     : http://localhost:${port}/dashboard`);
+      console.log(`  Backend       : ${backend}`);
       console.log(`  Working dir   : ${workingDir}`);
       if (apiKey) {
         console.log(`  Auth          : API key required (OTTERLY_API_KEY)`);

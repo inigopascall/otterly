@@ -4,7 +4,6 @@
 
 import type { ServerResponse } from "http";
 import crypto from "crypto";
-import { ClaudeEngine } from "../engine.js";
 import { AgentError } from "../errors.js";
 import type { EngineOptions } from "../types.js";
 import type { ParsedRequest, ServerContext } from "./routes-native.js";
@@ -12,6 +11,8 @@ import { apiSessions } from "./session-store.js";
 import type { CircuitBreaker } from "./circuit-breaker.js";
 import { logError } from "./logger.js";
 import { metrics } from "./metrics.js";
+import { getDefaultModel } from "./models.js";
+import { makeEngine } from "./engine-factory.js";
 import {
   openaiToClaudeInput,
   claudeResultToOpenai,
@@ -45,7 +46,7 @@ export async function handleChatCompletions(
   }
 
   const { prompt, systemPrompt, isMultimodal } = openaiToClaudeInput(body);
-  const model = body.model || "claude-sonnet-4-20250514";
+  const model = body.model || getDefaultModel();
   const stream = body.stream === true;
 
   const abortController = new AbortController();
@@ -166,7 +167,7 @@ async function handleFunctionCalling(
   stream: boolean,
   circuitBreaker?: CircuitBreaker,
 ): Promise<void> {
-  const engine = new ClaudeEngine();
+  const engine = makeEngine();
   const startedAt = Date.now();
 
   try {
@@ -315,7 +316,7 @@ async function handleNonStreaming(
   abortController: AbortController,
   circuitBreaker?: CircuitBreaker,
 ): Promise<void> {
-  const engine = new ClaudeEngine();
+  const engine = makeEngine();
   const startedAt = Date.now();
 
   try {
@@ -362,7 +363,7 @@ async function handleStreaming(
   abortController: AbortController,
   circuitBreaker?: CircuitBreaker,
 ): Promise<void> {
-  const engine = new ClaudeEngine();
+  const engine = makeEngine();
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",

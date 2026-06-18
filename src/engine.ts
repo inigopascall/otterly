@@ -405,6 +405,14 @@ export class ClaudeEngine {
       ? String(opts.systemPrompt)
       : "You are a helpful assistant.";
 
+    // Also forward under otterly's own `systemPrompt` name, but ONLY when the
+    // caller actually provided one — so a caller-supplied system prompt reaches
+    // consumers that read `systemPrompt`, while "no system message" leaves it
+    // unset (preserving the no-hidden-default contract).
+    if (opts.systemPrompt) {
+      queryOptions.systemPrompt = String(opts.systemPrompt);
+    }
+
     if (opts.onPermission) {
       queryOptions.permissionMode = "default";
       queryOptions.canUseTool = wrapPermissionHandler(opts.onPermission);
