@@ -176,7 +176,7 @@ export function ollamaChatResponse(model: string, content: string, stats: FinalS
 /** POST /api/chat (streaming) intermediate content chunk. */
 export function ollamaChatChunk(model: string, content: string): Record<string, unknown> {
   return {
-    model: model || "",
+    model: model || getDefaultModel(),
     created_at: nowIso(),
     message: { role: "assistant", content },
     done: false,
