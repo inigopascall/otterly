@@ -279,41 +279,41 @@ export function parseToolCalls(text: string): ParsedToolCall[] | null {
   if (fence) s = fence[1].trim();
 
   const calls: ParsedToolCall[] = [];
-
   const pushCall = (raw: unknown) => {
-    const entry = raw as { name?: string; arguments?: unknown; function?: { name?: string; arguments?: unknown } };
-    const name = entry?.name ?? entry?.function?.name;
+    const e = raw as { name?: string; arguments?: unknown; function?: { name?: string; arguments?: unknown } };
+    const name = e?.name ?? e?.function?.name;
     if (typeof name !== "string" || !name) return;
-    let args: unknown = entry.arguments ?? entry.function?.arguments ?? {};
-    if (typeof args === "string") {
-      try { args = JSON.parse(args); } catch { args = { value: args }; }
-    }
+    let args: unknown = e.arguments ?? e.function?.arguments ?? {};
+    if (typeof args === "string") { try { args = JSON.parse(args); } catch { args = { value: args }; } }
     if (typeof args !== "object" || args === null) args = {};
     calls.push({ name, arguments: args as Record<string, unknown> });
   };
-
-  // Format A (what we asked for): the whole reply is {"tool_calls": [...]}
-  try {
-    const obj = JSON.parse(s) as { tool_calls?: unknown };
-    if (Array.isArray(obj?.tool_calls)) {
-      for (const raw of obj.tool_calls) pushCall(raw);
-      if (calls.length > 0) return calls;
+  const ingest = (parsed: unknown) => {
+    if (Array.isArray(parsed)) { for (const r of parsed) pushCall(r); }
+    else if (parsed && typeof parsed === "object") {
+      const tc = (parsed as { tool_calls?: unknown }).tool_calls;
+      if (Array.isArray(tc)) { for (const r of tc) pushCall(r); }
+      else pushCall(parsed); // bare {name,arguments}
     }
-  } catch { /* not a bare JSON object — try format B */ }
+  };
 
-  // Format B (what Claude actually emits): <function_calls>[{...}]</function_calls>
-  // blocks embedded in prose, each containing a JSON array (or object) of calls.
+  // Format A: whole reply is JSON ({"tool_calls":[...]} | [..] | {name,arguments})
+  try { ingest(JSON.parse(s)); if (calls.length) return calls; } catch { /* fall through */ }
+
+  // Format B: <function_calls> ... </function_calls> blocks (Claude's leak),
+  // each containing a JSON array or object. Multiple blocks allowed.
   const blockRe = /<function_calls>\s*([\s\S]*?)\s*<\/function_calls>/gi;
   let m: RegExpExecArray | null;
   while ((m = blockRe.exec(s)) !== null) {
-    try {
-      const parsed = JSON.parse(m[1]);
-      const arr = Array.isArray(parsed) ? parsed : [parsed];
-      for (const raw of arr) pushCall(raw);
-    } catch { /* malformed block — skip */ }
+    try { ingest(JSON.parse(m[1].trim())); } catch { /* skip */ }
   }
+  if (calls.length) return calls;
 
-  return calls.length > 0 ? calls : null;
+  // Format C: any embedded balanced {...} or [...] regions containing calls.
+  for (const frag of extractJsonObjects(s)) {
+    try { ingest(JSON.parse(frag)); } catch { /* skip */ }
+  }
+  return calls.length ? calls : null;
 }
 
 /** Convert parsed calls into OpenAI `tool_calls` with generated ids. */
