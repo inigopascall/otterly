@@ -63,6 +63,7 @@ export const CURSOR_MODELS: ModelInfo[] = [
   { id: "gpt-5.5-extra-high",                 label: "GPT-5.5 Extra High",           contextWindow: 1000000 },
   { id: "gpt-5.4-medium",                     label: "GPT-5.4",                      contextWindow: 1000000 },
   { id: "gpt-5.4-high",                       label: "GPT-5.4 High",                 contextWindow: 1000000 },
+  { id: "gpt-5.4-nano-xhigh",                 label: "GPT-5.4 Nano XHigh",           contextWindow: 1000000 },
   { id: "gpt-5.3-codex",                      label: "Codex 5.3",                    contextWindow: 1000000 },
   { id: "gpt-5.2",                            label: "GPT-5.2",                      contextWindow: 1000000 },
   { id: "gpt-5.1",                            label: "GPT-5.1",                      contextWindow: 1000000 },
