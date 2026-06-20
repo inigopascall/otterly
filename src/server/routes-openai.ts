@@ -96,6 +96,7 @@ export async function handleChatCompletions(
     const instruction = buildToolInstruction(body.tools!, body.tool_choice);
     enginePrompt = `${instruction}\n\n=== USER REQUEST ===\n${prompt}`;
     options.disallowedTools = CLAUDE_BUILTIN_TOOLS;
+    options.clientToolCalls = true;
   } else {
     // No client tools: behave like a plain chat model. Disable Claude Code's
     // built-in tools so it cannot autonomously read/edit files or run commands

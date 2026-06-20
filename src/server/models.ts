@@ -46,18 +46,42 @@ export const DEFAULT_MODEL = "claude-sonnet-4-6";
 // ---------------------------------------------------------------------------
 
 /**
- * The Cursor model catalog.
- * Q3: Verify these IDs against `cursor-agent --list-models` output; the list
- * below is seeded from AGENTS.md §5 and may need updating once a live CLI
- * binary is available.
+ * The Cursor model catalog — curated from `cursor-agent --list-models` on the
+ * target machine. This is a representative subset (one entry per family plus
+ * the useful reasoning tiers); the full CLI list also exposes every `-fast`
+ * variant and finer tiers. Any valid CLI ID still works when typed directly in
+ * a client — this list only drives discovery (GET /v1/models, /api/tags).
  */
 export const CURSOR_MODELS: ModelInfo[] = [
-  { id: "composer-2.5",    label: "Cursor Composer 2.5",        contextWindow: 200000  },
-  { id: "gpt-5.5",         label: "GPT-5.5",                    contextWindow: 200000  },
-  { id: "gemini-2.5-pro",  label: "Gemini 2.5 Pro",             contextWindow: 1000000 },
-  { id: "grok-4",          label: "Grok 4",                     contextWindow: 256000  },
-  { id: "claude-sonnet-4-6", label: "Claude Sonnet 4 (Cursor)", contextWindow: 200000  },
-  { id: "claude-opus-4-7",   label: "Claude Opus 4 (Cursor)",   contextWindow: 200000  },
+  // Cursor Composer
+  { id: "composer-2.5",                       label: "Cursor Composer 2.5",          contextWindow: 200000  },
+  { id: "composer-2.5-fast",                  label: "Cursor Composer 2.5 Fast",     contextWindow: 200000  },
+  // OpenAI GPT / Codex
+  { id: "gpt-5.5-low",                        label: "GPT-5.5 Low",                  contextWindow: 1000000 },
+  { id: "gpt-5.5-medium",                     label: "GPT-5.5",                      contextWindow: 1000000 },
+  { id: "gpt-5.5-high",                       label: "GPT-5.5 High",                 contextWindow: 1000000 },
+  { id: "gpt-5.5-extra-high",                 label: "GPT-5.5 Extra High",           contextWindow: 1000000 },
+  { id: "gpt-5.4-medium",                     label: "GPT-5.4",                      contextWindow: 1000000 },
+  { id: "gpt-5.4-high",                       label: "GPT-5.4 High",                 contextWindow: 1000000 },
+  { id: "gpt-5.3-codex",                      label: "Codex 5.3",                    contextWindow: 1000000 },
+  { id: "gpt-5.2",                            label: "GPT-5.2",                      contextWindow: 1000000 },
+  { id: "gpt-5.1",                            label: "GPT-5.1",                      contextWindow: 1000000 },
+  // Anthropic Claude (via Cursor)
+  { id: "claude-opus-4-8-high",               label: "Claude Opus 4.8",              contextWindow: 1000000 },
+  { id: "claude-opus-4-8-max",                label: "Claude Opus 4.8 Max",          contextWindow: 1000000 },
+  { id: "claude-opus-4-8-thinking-high",      label: "Claude Opus 4.8 Thinking",     contextWindow: 1000000 },
+  { id: "claude-4.6-sonnet-medium",           label: "Claude Sonnet 4.6",            contextWindow: 1000000 },
+  { id: "claude-4.6-sonnet-medium-thinking",  label: "Claude Sonnet 4.6 Thinking",   contextWindow: 1000000 },
+  { id: "claude-4.5-sonnet",                  label: "Claude Sonnet 4.5",            contextWindow: 200000  },
+  { id: "claude-4-sonnet",                    label: "Claude Sonnet 4",              contextWindow: 200000  },
+  // Google Gemini
+  { id: "gemini-3.1-pro",                     label: "Gemini 3.1 Pro",               contextWindow: 1000000 },
+  { id: "gemini-3-flash",                     label: "Gemini 3 Flash",               contextWindow: 1000000 },
+  { id: "gemini-3.5-flash",                   label: "Gemini 3.5 Flash",             contextWindow: 1000000 },
+  // xAI Grok
+  { id: "grok-4.3",                           label: "Grok 4.3",                     contextWindow: 1000000 },
+  // Moonshot Kimi
+  { id: "kimi-k2.5",                          label: "Kimi K2.5",                    contextWindow: 256000  },
 ];
 
 /** Default model identifier for the Cursor backend. */

@@ -239,16 +239,34 @@ function buildCursorCommand(cliBin: string, opts: EngineOptions): string[] {
  *
  * Because cursor-agent has no dedicated `--system-prompt` flag, any system
  * prompt is injected as a prefix inside the user turn, followed by a
- * hard read-only directive, then the actual user request.
+ * posture-appropriate directive, then the actual user request.
  *
  * The directive is placed first so it is never buried by a long system prompt.
+ *
+ * Two postures are supported:
+ *  - Default (no client tools): hard read-only — reason over the message and
+ *    answer directly. Native file/shell use is forbidden (and bubblewrap makes
+ *    reads physically impossible regardless).
+ *  - clientToolCalls: still forbid touching the machine, but EXPLICITLY permit
+ *    emitting the tool_calls JSON object described later in the prompt — that is
+ *    output destined for an external client (AiderDesk), not a local action.
+ *    Without this carve-out the models over-apply "return your answer directly"
+ *    and refuse to emit the tool call.
  */
-function buildCursorPrompt(userPrompt: string, systemPrompt?: string): string {
-  // Instructional directive that enforces read-only reasoning (AGENTS.md §C).
-  const directive =
-    "You must NOT read, search, open, or edit any files, and must NOT run " +
-    "shell commands. Reason ONLY over the information provided in this " +
-    "message and return your answer directly.";
+function buildCursorPrompt(
+  userPrompt: string,
+  systemPrompt?: string,
+  clientToolCalls?: boolean,
+): string {
+  const directive = clientToolCalls
+    ? "You must NOT read, search, open, edit, or run anything on this machine, " +
+      "and must NOT run shell commands. However, you MAY — and should, when " +
+      "appropriate — output a JSON tool_calls object exactly as instructed below. " +
+      "Emitting that JSON is a request for an external system to act; it is NOT " +
+      "an action you are taking, so it does not violate the no-file-access rule."
+    : "You must NOT read, search, open, or edit any files, and must NOT run " +
+      "shell commands. Reason ONLY over the information provided in this " +
+      "message and return your answer directly.";
 
   const parts: string[] = [directive];
 
@@ -306,7 +324,7 @@ export class CursorEngine {
 
     const cwd   = opts.cwd ? String(opts.cwd) : process.cwd();
     const inner = buildCursorCommand(cliBin, opts);
-    const input = buildCursorPrompt(prompt, opts.systemPrompt);
+    const input = buildCursorPrompt(prompt, opts.systemPrompt, opts.clientToolCalls);
 
     // Wrap the cursor-agent spawn in a bubblewrap jail so it can only read
     // the workspace and Cursor's own state dirs. All other host paths are

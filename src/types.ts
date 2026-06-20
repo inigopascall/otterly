@@ -27,6 +27,11 @@ export interface EngineOptions {
   resume?: string;
   /** Reasoning effort level */
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  /** When true, the request carries client-side OpenAI tools, so the Cursor
+   *  read-only directive is relaxed to PERMIT emitting a tool_calls JSON object
+   *  (a request for the external client to act — not a local action). Read only
+   *  by the Cursor backend's buildCursorPrompt; ignored by the Claude path. */
+  clientToolCalls?: boolean;
 }
 
 // ── Permissions ──
