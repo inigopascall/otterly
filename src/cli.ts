@@ -10,7 +10,7 @@ const { values, positionals } = parseArgs({
   allowPositionals: true,
   options: {
     port:             { type: "string",  short: "p", default: "11435" },
-    dir:              { type: "string",  short: "d", default: process.cwd() },
+    dir:              { type: "string",  short: "d" },
     "max-concurrent": { type: "string",  default: "5" },
     "max-queue":      { type: "string",  default: "50" },
     "queue-timeout":  { type: "string",  default: "120" },
@@ -38,7 +38,7 @@ if (values.help || command === "help") {
 
   Options:
     -p, --port <number>         Port to listen on (default: 11435)
-    -d, --dir <path>            Working directory for Claude (default: cwd)
+    -d, --dir <path>            Working directory (default: a clean scratch dir)
     --max-concurrent <number>   Max concurrent requests (default: 5)
     --max-queue <number>        Max queued requests (default: 50)
     --queue-timeout <seconds>   Max time a request waits in queue before 408 (default: 120)

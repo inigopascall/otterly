@@ -4,6 +4,9 @@
 
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "http";
 import { WebSocketServer } from "ws";
+import { existsSync, mkdirSync, statSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { setBackend, type Backend } from "./models.js";
 import { handleChatCompletions } from "./routes-openai.js";
 import {
@@ -94,9 +97,35 @@ export interface ApiServerHandle {
   shutdown(timeoutMs?: number): Promise<void>;
 }
 
+/** Default working directory when no --dir is supplied. A dedicated, empty
+ *  folder keeps the agent's cwd free of project files and auto-loaded context
+ *  (cursor-agent reads AGENTS.md / CLAUDE.md from the workspace root with no
+ *  opt-out), so the model reasons over only what the request carries. */
+export const SCRATCH_DIR = join(tmpdir(), "otterly-scratch");
+
+/** Resolve the working directory, creating it on demand. Falls back to the
+ *  scratch dir when none is given. Never throws: an uncreatable explicit path
+ *  (e.g. a test placeholder) warns and proceeds rather than failing startup. */
+function resolveWorkingDir(requested?: string): string {
+  const dir = requested ?? SCRATCH_DIR;
+  try {
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    } else if (!statSync(dir).isDirectory()) {
+      console.warn(`  ⚠ Working directory path is not a directory: ${dir}`);
+    }
+  } catch (err) {
+    console.warn(
+      `  ⚠ Working directory ${dir} does not exist and could not be created: ` +
+      `${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  return dir;
+}
+
 export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiServerHandle> {
   const port = opts.port ?? 11435;
-  const workingDir = opts.workingDir ?? process.cwd();
+  const workingDir = resolveWorkingDir(opts.workingDir);
 
   // Activate the chosen backend process-wide so all compat modules pick it up.
   const backend = opts.backend ?? "claude";
