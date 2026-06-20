@@ -120,18 +120,26 @@ export interface SpawnWithAbortOptions {
   spawnFn?: typeof spawn;
 }
 
-export function spawnWithAbort(cmd: string, opts: SpawnWithAbortOptions): Promise<string> {
+export function spawnWithAbort(cmd: string | string[], opts: SpawnWithAbortOptions): Promise<string> {
   const killGraceMs = opts.killGraceMs ?? 5000;
   const doSpawn = opts.spawnFn ?? spawn;
 
   return new Promise<string>((resolve, reject) => {
-    const child = doSpawn(cmd, [], {
-      shell: true,
-      cwd: opts.cwd,
-      env: process.env,
-      detached: process.platform !== "win32",
-      stdio: [opts.input != null ? "pipe" : "ignore", "pipe", "pipe"],
-    });
+    // When cmd is an array, use the first element as the executable and the
+    // rest as argv — no shell involved, so no quoting is needed and there is
+    // no /bin/sh dependency.  When cmd is a plain string, preserve the legacy
+    // shell: true path (used by the Claude CLI backend).
+    const child = doSpawn(
+      Array.isArray(cmd) ? cmd[0] : cmd,
+      Array.isArray(cmd) ? cmd.slice(1) : [],
+      {
+        shell: !Array.isArray(cmd),  // shell only for string form
+        cwd: opts.cwd,
+        env: process.env,
+        detached: process.platform !== "win32",
+        stdio: [opts.input != null ? "pipe" : "ignore", "pipe", "pipe"],
+      }
+    );
 
     // Feed the prompt to the child via stdin. Guard against EPIPE in case the
     // child exits before consuming all input.

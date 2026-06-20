@@ -51,7 +51,13 @@ function findCursorCLI(): string | null {
 // ---------------------------------------------------------------------------
 
 /**
- * Builds the shell command string used to invoke cursor-agent.
+ * Builds the argv array used to invoke cursor-agent directly (no shell).
+ *
+ * Returning an array rather than a shell string means:
+ *  - No shell quoting is required — workspace paths with spaces or special
+ *    characters are passed verbatim as a single argv element.
+ *  - There is no /bin/sh dependency, so the command works in minimal
+ *    container environments where a shell may not be present.
  *
  * The user prompt is fed via stdin (not as an argv argument) to avoid
  * E2BIG errors on large inputs — the same approach used by ClaudeEngine.
@@ -68,11 +74,8 @@ function findCursorCLI(): string | null {
  * Q1: Consider adding "--sandbox enabled" once read-confinement semantics
  *     are verified against the cursor-agent sandboxing implementation.
  */
-function buildCursorCommand(cliBin: string, opts: EngineOptions): string {
-  // Shell-quote the workspace path, escaping any single quotes it may contain.
-  const rawCwd = opts.cwd ? String(opts.cwd) : process.cwd();
-  const quotedCwd = "'" + rawCwd.replace(/'/g, "'\\''" ) + "'";
-
+function buildCursorCommand(cliBin: string, opts: EngineOptions): string[] {
+  const cwd = opts.cwd ? String(opts.cwd) : process.cwd();
   const parts: string[] = [
     cliBin,
     "-p",
@@ -80,7 +83,7 @@ function buildCursorCommand(cliBin: string, opts: EngineOptions): string {
     "--stream-partial-output",
     "--mode", "ask",
     "--trust",
-    "--workspace", quotedCwd,
+    "--workspace", cwd,
   ];
 
   // Append optional model override.
@@ -88,7 +91,7 @@ function buildCursorCommand(cliBin: string, opts: EngineOptions): string {
     parts.push("--model", opts.model);
   }
 
-  return parts.join(" ");
+  return parts;
 }
 
 // ---------------------------------------------------------------------------
