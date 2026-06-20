@@ -16,6 +16,7 @@
  */
 
 import { execFileSync } from "child_process";
+import { realpathSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { spawnWithAbort } from "./engine.js";
@@ -39,8 +40,22 @@ let cachedCursorBin: string | null = null;
 function findCursorCLI(): string | null {
   if (cachedCursorBin !== null) return cachedCursorBin;
   try {
+    // Confirm the CLI is present and functional.
     execFileSync("cursor-agent", ["--version"], { timeout: 5000, stdio: "pipe" });
-    cachedCursorBin = "cursor-agent";
+
+    // Resolve to the REAL (symlink-followed) absolute path. The cursor-agent
+    // launcher is a bash script that locates its bundled `node` and `index.js`
+    // via SCRIPT_DIR=$(dirname "$(realpath "$0")"). Inside the bubblewrap jail,
+    // binding the ~/.local/bin/cursor-agent symlink flattens it to a plain file,
+    // so realpath("$0") would resolve to ~/.local/bin (no `node` there → exit
+    // 127). Invoking the resolved path under ~/.local/share/cursor-agent/
+    // versions/<v>/ (which buildBwrapPrefix already binds) makes SCRIPT_DIR
+    // point at the version dir where node + index.js live. Works identically
+    // unjailed, since an absolute path is valid everywhere.
+    const onPath = execFileSync("which", ["cursor-agent"], { timeout: 5000, stdio: "pipe" })
+      .toString()
+      .trim();
+    cachedCursorBin = realpathSync(onPath);
     return cachedCursorBin;
   } catch {
     cachedCursorBin = null;
