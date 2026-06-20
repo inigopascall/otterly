@@ -75,7 +75,7 @@ machine. **Do not re-assume these; they were observed directly.**
     --model <model>              e.g. gpt-5, sonnet-4, sonnet-4-thinking
     --list-models                List available models and exit
     -f, --force / --yolo         Allow all commands (writes/shell). OMIT THIS.
-    --sandbox <mode>             enabled | disabled (OS-level confinement; semantics unverified)
+    --sandbox <mode>             enabled | disabled (proven NO-OP for file reads (empirically verified); not used)
     --trust                      Trust workspace without prompting (needed in headless)
     --workspace <path>           Workspace dir (defaults to cwd)
     -H, --header <header>        Custom header (repeatable)
@@ -98,6 +98,10 @@ machine. **Do not re-assume these; they were observed directly.**
   read-only (no writes, no shell), but **silent reads can still happen**.
 - **Do NOT rely on `permissions.deny`** denylist — deprecated (Cursor ≥1.3) and
   was bypassable.
+- **Read-confinement on Cursor is enforced externally** by a mandatory bubblewrap
+  jail wrapping every `cursor-agent` spawn (binds workspace + Cursor's own dirs
+  only; all other paths invisible). Override for emergencies via
+  `OTTERLY_NO_SANDBOX=1`.
 
 ### 3.3 Auto-loaded context
 
@@ -135,11 +139,25 @@ Observed event stream (with `--stream-partial-output`):
 
 ## 4. Non-Goals / Accepted Limitations
 
-- **No total tool blackout on Cursor.** Silent reads are unpreventable. Accepted.
+- **No total tool blackout on Cursor.** Silent reads outside the workspace are
+  prevented by the bubblewrap jail (Cursor) and by tool-blackout
+  (`--tools ""` / `disallowedTools`) on Claude, including the WebSocket session
+  path.
 - **No system-prompt stripping flag.** Mitigated only by a prompt prefix (soft).
 - **No temperature control** (same as Claude path — CLI exposes none).
 - **History flattening** remains (Otterly collapses multi-turn into one prompt) —
   structural, out of scope.
+
+### Security posture (resolved)
+
+- **Claude** — tool-blackout (`disallowedTools: CLAUDE_BUILTIN_TOOLS`) applied on
+  **both** the `/v1` OpenAI-compat routes **and** the `/ws` WebSocket session
+  path. Claude has no file-read/Bash/Write tools available on either path.
+- **Cursor** — always-on bubblewrap jail wraps every `cursor-agent` spawn.
+  Workspace and Cursor's own state dirs are bound; all other host paths are
+  absent inside the jail (reads fail with ENOENT). Network is preserved
+  (`--share-net`) so the agent can reach `api2.cursor.sh`.
+- **`--sandbox` flag** — proven NO-OP for file reads; not used.
 
 ---
 
@@ -316,10 +334,12 @@ AiderDesk: two OpenAI-Compatible providers —
 
 ## 8. Open Questions (Resolve During Build)
 
-- **Q1 (security):** Does `--workspace` confine reads to that dir, or can the
-  agent read absolute paths outside it? Does `--sandbox enabled` provide a hard
-  jail, and what are its limits? *Resolve via Test §7.5 before trusting the
-  setup with sensitive directories.*
+- **Q1 (security) — RESOLVED:** `--workspace` does NOT confine reads; the agent
+  can read absolute paths outside it. `--sandbox enabled` is a proven NO-OP for
+  file reads (empirically verified). The mechanism is bubblewrap: every
+  `cursor-agent` spawn is wrapped in a `bwrap` jail that binds only the workspace
+  and Cursor's own state dirs — all other paths are invisible. Claude needs no
+  jail because its tools are disabled via `disallowedTools`.
 - **Q2 (tool events):** Capture a real `tool_call` started/completed event pair
   from `cursor-agent` (trigger a tool in a non-read-only run) to finalise the
   `ToolUseEvent`/`ToolResultEvent` field mapping in `cursor-events.ts`.

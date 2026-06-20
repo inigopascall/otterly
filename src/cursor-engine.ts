@@ -16,6 +16,8 @@
  */
 
 import { execFileSync } from "child_process";
+import { homedir } from "os";
+import { join } from "path";
 import { spawnWithAbort } from "./engine.js";
 import { normalizeCursorEvent, createCursorParseState } from "./cursor-events.js";
 import type { AgentEvent, AgentResult, EngineOptions, ToolExecution } from "./types.js";
@@ -47,6 +49,125 @@ function findCursorCLI(): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Bubblewrap discovery
+// ---------------------------------------------------------------------------
+
+/**
+ * Cached result of the bwrap probe: `"bwrap"` when found, `null` when absent,
+ * `undefined` before the first probe (triggers the probe on next call).
+ */
+let cachedBwrapBin: string | null | undefined = undefined;
+
+/**
+ * Checks whether `bwrap` (bubblewrap) is available on PATH by running
+ * `bwrap --version` with a 5 s timeout. Caches the result so the probe
+ * only runs once per process lifetime.
+ *
+ * Returns `"bwrap"` on success or `null` when unavailable.
+ */
+function findBwrap(): string | null {
+  if (cachedBwrapBin !== undefined) return cachedBwrapBin;
+  try {
+    execFileSync("bwrap", ["--version"], { timeout: 5000, stdio: "pipe" });
+    cachedBwrapBin = "bwrap";
+  } catch {
+    cachedBwrapBin = null;
+  }
+  return cachedBwrapBin;
+}
+
+// ---------------------------------------------------------------------------
+// Bubblewrap jail prefix builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds the full `bwrap` argv prefix (everything up to and including `--`)
+ * that wraps a `cursor-agent` invocation in a bubblewrap sandbox.
+ *
+ * The jail allows:
+ *  - Read-only access to system runtime dirs (/usr, /lib, /bin, /sbin, /etc
+ *    essentials for DNS, TLS, identity, and the dynamic linker).
+ *  - Kernel pseudo-filesystems (/dev, /proc) and a writable /tmp tmpfs.
+ *  - Read-write access to the workspace (the ONE directory the agent may
+ *    legitimately modify).
+ *  - Read-write access to Cursor's own state dirs (~/.cursor,
+ *    ~/.config/cursor) so the agent can refresh tokens and persist session
+ *    state.
+ *  - Read-only access to the cursor-agent binary and its bundled runtime
+ *    under ~/.local.
+ *  - Full network access (--share-net) so the agent can reach api2.cursor.sh.
+ *
+ * Everything not explicitly bound is absent inside the jail — reads of
+ * arbitrary host paths fail with ENOENT rather than returning data.
+ *
+ * Symlink resolution: the cursor-agent shell script at
+ * ~/.local/bin/cursor-agent is a symlink to an absolute path under
+ * ~/.local/share/cursor-agent/versions/…  Binding both dirs at their real
+ * host paths (with HOME set to the real home) keeps the symlink valid inside
+ * the jail without needing a fake-HOME skeleton.
+ *
+ * Compile-cache writes: XDG_CACHE_HOME and NODE_COMPILE_CACHE are redirected
+ * to /tmp (the writable tmpfs) so the bundled Node runtime never tries to
+ * write into the read-only runtime mount.
+ *
+ * @param workspace - Absolute path to the project working directory.
+ * @param bwrapBin  - Path or name of the bwrap executable (e.g. `"bwrap"`).
+ * @returns Full argv array from `bwrap` up to and including `--`.
+ */
+export function buildBwrapPrefix(workspace: string, bwrapBin: string): string[] {
+  const home = homedir();
+  return [
+    bwrapBin,
+    // ── system runtime (read-only) ──
+    "--ro-bind", "/usr", "/usr",
+    "--ro-bind-try", "/lib", "/lib",
+    "--ro-bind-try", "/lib64", "/lib64",
+    "--ro-bind-try", "/bin", "/bin",
+    "--ro-bind-try", "/sbin", "/sbin",
+    // ── /etc essentials: DNS, TLS, identity, dynamic linker ──
+    "--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
+    "--ro-bind-try", "/etc/hosts", "/etc/hosts",
+    "--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
+    "--ro-bind-try", "/etc/host.conf", "/etc/host.conf",
+    "--ro-bind-try", "/etc/passwd", "/etc/passwd",
+    "--ro-bind-try", "/etc/group", "/etc/group",
+    "--ro-bind-try", "/etc/ssl", "/etc/ssl",
+    "--ro-bind-try", "/etc/pki", "/etc/pki",
+    "--ro-bind-try", "/etc/ca-certificates", "/etc/ca-certificates",
+    "--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache",
+    "--ro-bind-try", "/etc/ld.so.conf", "/etc/ld.so.conf",
+    "--ro-bind-try", "/etc/ld.so.conf.d", "/etc/ld.so.conf.d",
+    "--ro-bind-try", "/etc/localtime", "/etc/localtime",
+    // ── kernel pseudo-filesystems ──
+    "--dev", "/dev",
+    "--proc", "/proc",
+    "--tmpfs", "/tmp",
+    // ── the ONE writable real directory: the workspace ──
+    "--bind", workspace, workspace,
+    "--chdir", workspace,
+    // ── Cursor's own state/creds (read-write: token refresh + session state) ──
+    "--bind-try", join(home, ".cursor"), join(home, ".cursor"),
+    "--bind-try", join(home, ".config", "cursor"), join(home, ".config", "cursor"),
+    // ── Cursor binary + bundled runtime (read-only, immutable) ──
+    "--ro-bind-try", join(home, ".local", "bin", "cursor-agent"), join(home, ".local", "bin", "cursor-agent"),
+    "--ro-bind-try", join(home, ".local", "share", "cursor-agent"), join(home, ".local", "share", "cursor-agent"),
+    // ── isolation flags ──
+    "--unshare-all",   // drop all namespace sharing (PID, mount, IPC, UTS, cgroup)
+    "--share-net",     // re-enable network (needed for api2.cursor.sh)
+    "--die-with-parent", // SIGKILL the inner agent if the otterly process dies
+    "--new-session",   // new session ID (prevents terminal hijacking)
+    // ── environment overrides ──
+    "--setenv", "HOME", home,
+    "--setenv", "USER", process.env.USER || "user",
+    "--setenv", "PATH", `/usr/local/bin:/usr/bin:/bin:${join(home, ".local", "bin")}`,
+    "--setenv", "XDG_CACHE_HOME", "/tmp",                        // redirect cache writes to tmpfs
+    "--setenv", "NODE_COMPILE_CACHE", "/tmp/cursor-compile-cache", // redirect Node compile cache to tmpfs
+    // ── separator: inner command follows ──
+    "--",
+  ];
+}
+
+// ---------------------------------------------------------------------------
 // Command builder
 // ---------------------------------------------------------------------------
 
@@ -71,8 +192,8 @@ function findCursorCLI(): string | null {
  *  --workspace <cwd>         working directory for the invocation
  *  --model <model>           (optional) model override
  *
- * Q1: Consider adding "--sandbox enabled" once read-confinement semantics
- *     are verified against the cursor-agent sandboxing implementation.
+ * Read-confinement is enforced externally by bubblewrap (see buildBwrapPrefix);
+ * --sandbox is a proven no-op for file reads (empirically verified); not used.
  */
 function buildCursorCommand(cliBin: string, opts: EngineOptions): string[] {
   const cwd = opts.cwd ? String(opts.cwd) : process.cwd();
@@ -168,8 +289,29 @@ export class CursorEngine {
       );
     }
 
-    const cmd   = buildCursorCommand(cliBin, opts);
+    const cwd   = opts.cwd ? String(opts.cwd) : process.cwd();
+    const inner = buildCursorCommand(cliBin, opts);
     const input = buildCursorPrompt(prompt, opts.systemPrompt);
+
+    // Wrap the cursor-agent spawn in a bubblewrap jail so it can only read
+    // the workspace and Cursor's own state dirs. All other host paths are
+    // invisible inside the sandbox (reads fail with ENOENT).
+    // OTTERLY_NO_SANDBOX=1 is an emergency escape hatch — see AGENTS.md.
+    let cmd: string[];
+    if (process.env.OTTERLY_NO_SANDBOX) {
+      // Running unconfined: operator has explicitly opted out of the jail.
+      cmd = inner;
+    } else {
+      const bwrap = findBwrap();
+      if (!bwrap) {
+        throw new AgentError(
+          "SDK_NOT_FOUND",
+          "bubblewrap (bwrap) is required to sandbox the Cursor backend but was not found. " +
+          "Install it (e.g. `sudo apt install bubblewrap`), or set OTTERLY_NO_SANDBOX=1 to run unconfined.",
+        );
+      }
+      cmd = [...buildBwrapPrefix(cwd, bwrap), ...inner];
+    }
 
     // Bridge an external AbortSignal into a local AbortController so we can
     // also trigger abort internally on timeout (mirrors ClaudeEngine pattern).
