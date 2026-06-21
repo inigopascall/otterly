@@ -150,8 +150,11 @@ Any valid `cursor-agent` ID also works when sent directly — run
 `cursor-agent --list-models` for the full catalog, including every `-fast` and
 finer reasoning-tier variant.
 
-The Cursor backend answers and reasons over your messages; for autonomous
-edit/apply flows, the Claude backend on port 11435 remains the workhorse.
+Both the Claude and Cursor backends run with their own built-in file and shell
+tools disabled, so they answer purely from each request and never read, edit, or
+execute anything on your machine on their own. When a request includes OpenAI
+`tools`, either backend emits structured `tool_calls` JSON for your client to
+execute and feed back — your client orchestrates every tool call.
 
 ---
 
@@ -486,9 +489,9 @@ Send OpenAI-format `tools` and otterly returns real `tool_calls` with
 `finish_reason: "tool_calls"` — so agentic clients (Cline, Aider, your own
 scripts) get the structured function calls they expect. **Your** code runs the
 function and sends the result back as a `role: "tool"` message, exactly like the
-OpenAI API. While a request carries `tools`, otterly disables Claude's own
-built-in tools, so it never touches your filesystem or shell — the functions are
-yours to execute.
+OpenAI API. Both backends run with their own built-in file and shell tools
+disabled, so a request never touches your filesystem or shell — every tool call
+is emitted as structured `tool_calls` JSON for your client to execute.
 
 ```typescript
 const res = await ai.chat.completions.create({
