@@ -43,6 +43,118 @@ Same OpenAI-compatible API. Zero per-token cost. No API keys.
 
 ---
 
+## Setup: running Claude and Cursor side by side
+
+This fork drives **two** subscriptions: your **Claude Code** subscription and your
+**Cursor** subscription. Each runs as its own `otterly serve` process on its own
+port, selected with `--backend`:
+
+- `--backend claude` (default) — Anthropic models via the `claude` CLI/SDK.
+- `--backend cursor` — the `cursor-agent` CLI, which exposes GPT-5.x, Gemini,
+  Grok, Kimi, Cursor's own Composer, and Anthropic models served through Cursor.
+
+### 1. Authenticate both CLIs (once)
+
+Otterly uses your already-signed-in CLIs; it never handles API keys.
+
+```bash
+# Claude Code
+npm i -g @anthropic-ai/claude-code
+claude          # browser login, persists afterwards
+
+# Cursor CLI
+cursor-agent login
+```
+
+### 2. Install bubblewrap (required for the Cursor backend)
+
+The Cursor backend runs every `cursor-agent` invocation inside a
+[bubblewrap](https://github.com/containers/bubblewrap) jail. The jail makes the
+agent see **only** your working directory plus Cursor's own login/runtime folders
+— every other path on your machine (home, SSH keys, other projects, system
+secrets) is invisible, so a read of anything outside the workspace simply fails.
+Network stays on so the Cursor subscription works.
+
+```bash
+sudo apt install bubblewrap     # Debian/Ubuntu
+sudo dnf install bubblewrap     # Fedora/RHEL
+sudo pacman -S bubblewrap       # Arch
+bwrap --version                 # verify
+```
+
+The Cursor backend refuses to start a request if `bwrap` is missing. To run a
+Cursor process **unconfined** (for debugging only), set `OTTERLY_NO_SANDBOX=1`.
+
+### 3. The working directory
+
+Each server runs the agent inside a working directory, set with `-d`:
+
+```bash
+otterly serve --backend cursor -d /path/to/project   # agent works in this dir
+otterly serve --backend cursor                       # uses a clean scratch dir
+```
+
+With no `-d`, otterly creates an empty **scratch directory** under your system
+temp folder and uses that. A clean scratch dir keeps the agent's context free of
+project files and the `AGENTS.md`/`CLAUDE.md` rules that `cursor-agent`
+auto-loads from a workspace root — so the model reasons only over what each
+request sends. For the Cursor backend, the working directory is also the **one
+writable path** inside the bubblewrap jail.
+
+### 4. Start both servers
+
+Run each backend on its own port:
+
+```bash
+otterly serve --backend claude -p 11435      # Claude
+otterly serve --backend cursor -p 11436      # Cursor
+```
+
+A small script keeps both up together:
+
+```bash
+#!/bin/bash
+# start-otterly.sh
+otterly serve --backend claude -p 11435 &
+otterly serve --backend cursor -p 11436 &
+wait
+```
+
+### 5. Add both as providers in your client
+
+In an OpenAI-compatible client (e.g. AiderDesk, Cherry Studio), add **two**
+OpenAI-Compatible providers, each with its own provider ID/prefix and base URL:
+
+| Provider | Base URL | API key |
+|---|---|---|
+| Otterly (Claude) | `http://localhost:11435/v1` | any non-empty string |
+| Otterly (Cursor) | `http://localhost:11436/v1` | any non-empty string |
+
+Start both servers before launching the client so model discovery
+(`GET /v1/models`) populates each provider's dropdown.
+
+### Choosing a Cursor model and reasoning tier
+
+`cursor-agent` encodes the reasoning tier in the model ID, so you pick it by
+name — there is no separate temperature or effort setting. Send the exact ID:
+
+```bash
+curl -X POST http://localhost:11436/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-5.5-high", "messages": [{"role": "user", "content": "Explain quicksort"}]}'
+```
+
+`GET /v1/models` lists a representative set (`composer-2.5`, `gpt-5.5-high`,
+`gpt-5.5-extra-high`, `claude-opus-4-8-max`, `gemini-3.1-pro`, `grok-4.3`, …).
+Any valid `cursor-agent` ID also works when sent directly — run
+`cursor-agent --list-models` for the full catalog, including every `-fast` and
+finer reasoning-tier variant.
+
+The Cursor backend answers and reasons over your messages; for autonomous
+edit/apply flows, the Claude backend on port 11435 remains the workhorse.
+
+---
+
 ## Three ways to use it
 
 | | **Library** | **CLI server** | **Embedded server** |
