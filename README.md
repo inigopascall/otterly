@@ -17,7 +17,7 @@
 <p align="center">
   <img src="docs/playground-light.png" alt="otterly playground — interactive API explorer with JSON syntax highlighting, line numbers, and indent guides" width="900">
 </p>
-<p align="center"><sub><code>otterly serve</code> → <a href="http://localhost:11434/playground"><code>localhost:11434/playground</code></a> to poke the API, or <a href="http://localhost:11434/dashboard"><code>/dashboard</code></a> for live spend, tokens, latency, and tool usage.</sub></p>
+<p align="center"><sub><code>otterly serve</code> → <a href="http://localhost:11435/playground"><code>localhost:11435/playground</code></a> to poke the API, or <a href="http://localhost:11435/dashboard"><code>/dashboard</code></a> for live spend, tokens, latency, and tool usage.</sub></p>
 
 ---
 
@@ -34,12 +34,127 @@ npx otterly serve
 ```
   otterly: local inference server
   ──────────────────────────────────────
-  OpenAI compat : http://localhost:11434/v1/chat/completions
-  Playground    : http://localhost:11434/playground
+  OpenAI compat : http://localhost:11435/v1/chat/completions
+  Playground    : http://localhost:11435/playground
   Ready. Point any OpenAI client at it.
 ```
 
-Same port as Ollama. Same OpenAI-compatible API. Zero per-token cost. No API keys.
+Same OpenAI-compatible API. Zero per-token cost. No API keys.
+
+---
+
+## Setup: running Claude and Cursor side by side
+
+This fork drives **two** subscriptions: your **Claude Code** subscription and your
+**Cursor** subscription. Each runs as its own `otterly serve` process on its own
+port, selected with `--backend`:
+
+- `--backend claude` (default) — Anthropic models via the `claude` CLI/SDK.
+- `--backend cursor` — the `cursor-agent` CLI, which exposes GPT-5.x, Gemini,
+  Grok, Kimi, Cursor's own Composer, and Anthropic models served through Cursor.
+
+### 1. Authenticate both CLIs (once)
+
+Otterly uses your already-signed-in CLIs; it never handles API keys.
+
+```bash
+# Claude Code
+npm i -g @anthropic-ai/claude-code
+claude          # browser login, persists afterwards
+
+# Cursor CLI
+cursor-agent login
+```
+
+### 2. Install bubblewrap (required for the Cursor backend)
+
+The Cursor backend runs every `cursor-agent` invocation inside a
+[bubblewrap](https://github.com/containers/bubblewrap) jail. The jail makes the
+agent see **only** your working directory plus Cursor's own login/runtime folders
+— every other path on your machine (home, SSH keys, other projects, system
+secrets) is invisible, so a read of anything outside the workspace simply fails.
+Network stays on so the Cursor subscription works.
+
+```bash
+sudo apt install bubblewrap     # Debian/Ubuntu
+sudo dnf install bubblewrap     # Fedora/RHEL
+sudo pacman -S bubblewrap       # Arch
+bwrap --version                 # verify
+```
+
+The Cursor backend refuses to start a request if `bwrap` is missing. To run a
+Cursor process **unconfined** (for debugging only), set `OTTERLY_NO_SANDBOX=1`.
+
+### 3. The working directory
+
+Each server runs the agent inside a working directory, set with `-d`:
+
+```bash
+otterly serve --backend cursor -d /path/to/project   # agent works in this dir
+otterly serve --backend cursor                       # uses a clean scratch dir
+```
+
+With no `-d`, otterly creates an empty **scratch directory** under your system
+temp folder and uses that. A clean scratch dir keeps the agent's context free of
+project files and the `AGENTS.md`/`CLAUDE.md` rules that `cursor-agent`
+auto-loads from a workspace root — so the model reasons only over what each
+request sends. For the Cursor backend, the working directory is also the **one
+writable path** inside the bubblewrap jail.
+
+### 4. Start both servers
+
+Run each backend on its own port:
+
+```bash
+otterly serve --backend claude -p 11435      # Claude
+otterly serve --backend cursor -p 11436      # Cursor
+```
+
+A small script keeps both up together:
+
+```bash
+#!/bin/bash
+# start-otterly.sh
+otterly serve --backend claude -p 11435 &
+otterly serve --backend cursor -p 11436 &
+wait
+```
+
+### 5. Add both as providers in your client
+
+In an OpenAI-compatible client (e.g. AiderDesk, Cherry Studio), add **two**
+OpenAI-Compatible providers, each with its own provider ID/prefix and base URL:
+
+| Provider | Base URL | API key |
+|---|---|---|
+| Otterly (Claude) | `http://localhost:11435/v1` | any non-empty string |
+| Otterly (Cursor) | `http://localhost:11436/v1` | any non-empty string |
+
+Start both servers before launching the client so model discovery
+(`GET /v1/models`) populates each provider's dropdown.
+
+### Choosing a Cursor model and reasoning tier
+
+`cursor-agent` encodes the reasoning tier in the model ID, so you pick it by
+name — there is no separate temperature or effort setting. Send the exact ID:
+
+```bash
+curl -X POST http://localhost:11436/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-5.5-high", "messages": [{"role": "user", "content": "Explain quicksort"}]}'
+```
+
+`GET /v1/models` lists a representative set (`composer-2.5`, `gpt-5.5-high`,
+`gpt-5.5-extra-high`, `claude-opus-4-8-max`, `gemini-3.1-pro`, `grok-4.3`, …).
+Any valid `cursor-agent` ID also works when sent directly — run
+`cursor-agent --list-models` for the full catalog, including every `-fast` and
+finer reasoning-tier variant.
+
+Both the Claude and Cursor backends run with their own built-in file and shell
+tools disabled, so they answer purely from each request and never read, edit, or
+execute anything on your machine on their own. When a request includes OpenAI
+`tools`, either backend emits structured `tool_calls` JSON for your client to
+execute and feed back — your client orchestrates every tool call.
 
 ---
 
@@ -78,9 +193,9 @@ console.log(result.text, result.cost);
 ```typescript
 // With otterly (server): your existing OpenAI SDK, any language, $0
 import OpenAI from "openai";
-const ai = new OpenAI({ baseURL: "http://localhost:11434/v1", apiKey: "unused" });
+const ai = new OpenAI({ baseURL: "http://localhost:11435/v1", apiKey: "unused" });
 const res = await ai.chat.completions.create({
-  model: "claude-sonnet-4-20250514",
+  model: "claude-sonnet-4-6",
   messages: [{ role: "user", content: "Fix the failing tests" }],
 });
 ```
@@ -124,7 +239,7 @@ claude   # browser-based login, persists after
 
 # 2. install + run otterly
 npm i -g otterly
-otterly serve   # listens on localhost:11434
+otterly serve   # listens on localhost:11435
 ```
 
 ```json5
@@ -136,12 +251,12 @@ otterly serve   # listens on localhost:11434
   models: {
     providers: {
       otterly: {
-        baseUrl: "http://localhost:11434/v1",
+        baseUrl: "http://localhost:11435/v1",
         apiKey: "unused",
         api: "openai-completions",
         timeoutSeconds: 600,
         models: [{
-          id: "claude-sonnet-4-20250514",
+          id: "claude-sonnet-4-6",
           name: "Claude Sonnet 4 (via subscription)",
           input: ["text"],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -180,7 +295,7 @@ Description=otterly local inference server
 After=network-online.target
 
 [Service]
-ExecStart=/usr/bin/node /home/youruser/.npm-global/bin/otterly serve --port 11434 --max-concurrent 2 --queue-timeout 300
+ExecStart=/usr/bin/node /home/youruser/.npm-global/bin/otterly serve --port 11435 --max-concurrent 2 --queue-timeout 300
 Restart=always
 RestartSec=5
 Environment=HOME=/home/youruser
@@ -200,10 +315,10 @@ loginctl enable-linger youruser     # survives reboot without a login
 **Sanity check before flipping the default model.** Once `openclaw.json` is patched, test the new provider before pointing all of OpenClaw at it:
 
 ```bash
-openclaw capability model run --model otterly/claude-sonnet-4-20250514 --prompt "ping"
+openclaw capability model run --model otterly/claude-sonnet-4-6 --prompt "ping"
 ```
 
-If that returns text in a few seconds, you are good: `openclaw models set otterly/claude-sonnet-4-20250514`. If it hangs, `curl http://localhost:11434/api/status` tells you exactly which queue slot is stuck.
+If that returns text in a few seconds, you are good: `openclaw models set otterly/claude-sonnet-4-6`. If it hangs, `curl http://localhost:11435/api/status` tells you exactly which queue slot is stuck.
 
 ---
 
@@ -310,9 +425,9 @@ That's it. Now you have an OpenAI-compatible API on `localhost:11434`. Point any
 ```typescript
 // TypeScript with the OpenAI SDK
 import OpenAI from "openai";
-const ai = new OpenAI({ baseURL: "http://localhost:11434/v1", apiKey: "unused" });
+const ai = new OpenAI({ baseURL: "http://localhost:11435/v1", apiKey: "unused" });
 const res = await ai.chat.completions.create({
-  model: "claude-sonnet-4-20250514",
+  model: "claude-sonnet-4-6",
   messages: [{ role: "user", content: "Write a haiku about otters" }],
 });
 ```
@@ -320,26 +435,26 @@ const res = await ai.chat.completions.create({
 ```python
 # Python with the OpenAI SDK
 from openai import OpenAI
-ai = OpenAI(base_url="http://localhost:11434/v1", api_key="unused")
+ai = OpenAI(base_url="http://localhost:11435/v1", api_key="unused")
 res = ai.chat.completions.create(
-  model="claude-sonnet-4-20250514",
+  model="claude-sonnet-4-6",
   messages=[{"role": "user", "content": "Write a haiku about otters"}],
 )
 ```
 
 ```bash
 # Anything that speaks HTTP. curl, your shell, your dog.
-curl -X POST http://localhost:11434/v1/chat/completions \
+curl -X POST http://localhost:11435/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4-20250514",
+    "model": "claude-sonnet-4-6",
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
 
 It works in Cursor, Continue, Aider, Open WebUI, LiteLLM, LangChain, llamafile UIs, your own clients. Anything with a `baseURL` field. If it talks to OpenAI, it talks to otterly.
 
-Open the **playground** at [http://localhost:11434/playground](http://localhost:11434/playground) to poke the API from your browser, or the **dashboard** at [http://localhost:11434/dashboard](http://localhost:11434/dashboard) to see live spend, latency, and tool usage.
+Open the **playground** at [http://localhost:11435/playground](http://localhost:11435/playground) to poke the API from your browser, or the **dashboard** at [http://localhost:11435/dashboard](http://localhost:11435/dashboard) to see live spend, latency, and tool usage.
 
 <p align="center">
   <img src="docs/dashboard-light.png" alt="otterly dashboard — today's spend, tokens, average latency, recent runs, top tools, and queue stats" width="900">
@@ -349,24 +464,24 @@ Open the **playground** at [http://localhost:11434/playground](http://localhost:
 
 ## Speak Ollama, not just OpenAI
 
-otterly listens on port `11434` *and* answers Ollama's own API — so Ollama-only
-tools (Open WebUI's native connection, Raycast, oterm, homelab dashboards) that
-auto-discover a local Ollama by polling `GET /api/tags` find otterly with **zero
-config** and list your Claude models in their picker.
+otterly answers Ollama's own API — so Ollama-only tools (Open WebUI's native
+connection, Raycast, oterm, homelab dashboards) that auto-discover a local Ollama
+by polling `GET /api/tags` find otterly and list your models in their picker. To
+match Ollama's default port exactly, start otterly with `--port 11434`.
 
 ```bash
 # Discovery — exactly what Ollama tools hit on startup
-curl http://localhost:11434/api/tags
+curl http://localhost:11435/api/tags
 
 # Ollama-native chat (NDJSON stream, like `ollama run`)
-curl http://localhost:11434/api/chat -d '{
-  "model": "claude-sonnet-4-20250514",
+curl http://localhost:11435/api/chat -d '{
+  "model": "claude-sonnet-4-6",
   "messages": [{ "role": "user", "content": "Write a haiku about otters" }]
 }'
 ```
 
-Point any tool that expects an Ollama endpoint at `http://localhost:11434` and it
-just works. `OLLAMA_HOST=http://localhost:11434` is all most of them need.
+Point any tool that expects an Ollama endpoint at `http://localhost:11435` and it
+just works. `OLLAMA_HOST=http://localhost:11435` is all most of them need.
 
 ## Function calling (OpenAI tools)
 
@@ -374,13 +489,13 @@ Send OpenAI-format `tools` and otterly returns real `tool_calls` with
 `finish_reason: "tool_calls"` — so agentic clients (Cline, Aider, your own
 scripts) get the structured function calls they expect. **Your** code runs the
 function and sends the result back as a `role: "tool"` message, exactly like the
-OpenAI API. While a request carries `tools`, otterly disables Claude's own
-built-in tools, so it never touches your filesystem or shell — the functions are
-yours to execute.
+OpenAI API. Both backends run with their own built-in file and shell tools
+disabled, so a request never touches your filesystem or shell — every tool call
+is emitted as structured `tool_calls` JSON for your client to execute.
 
 ```typescript
 const res = await ai.chat.completions.create({
-  model: "claude-sonnet-4-20250514",
+  model: "claude-sonnet-4-6",
   messages: [{ role: "user", content: "What's the weather in Paris?" }],
   tools: [{
     type: "function",
@@ -402,7 +517,7 @@ Run the full HTTP + WebSocket server **inside your own Node app**. Same endpoint
 import { startApiServer } from "otterly";
 
 const handle = await startApiServer({
-  port: 11434,
+  port: 11435,
   workingDir: "./my-project",
   maxConcurrent: 5,
 });
@@ -453,7 +568,7 @@ Plus all the boring-but-essential stuff:
 ## Server config
 
 ```bash
-npx otterly serve --port 11434 --dir ./project --max-concurrent 3
+npx otterly serve --port 11435 --dir ./project --max-concurrent 3
 ```
 
 | Flag | Default | |
@@ -489,7 +604,7 @@ await session.send(message);   // → AgentResult
 session.close();
 
 // Custom engine with defaults
-const engine = new ClaudeEngine({ model: "claude-sonnet-4-20250514", maxTurns: 10 });
+const engine = new ClaudeEngine({ model: "claude-sonnet-4-6", maxTurns: 10 });
 
 // Permission modes
 await claude.run(prompt, { permissionMode: READONLY });   // read-only
@@ -497,7 +612,7 @@ await claude.run(prompt, { permissionMode: AUTOPILOT });  // full auto
 
 // Embedded server
 import { startApiServer } from "otterly";
-const handle = await startApiServer({ port: 11434 });
+const handle = await startApiServer({ port: 11435 });
 ```
 
 ---

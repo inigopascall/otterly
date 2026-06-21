@@ -3,7 +3,7 @@
 
 import crypto from "crypto";
 import type { AgentResult } from "../types.js";
-import { MODELS, DEFAULT_MODEL } from "./models.js";
+import { getModels, getDefaultModel, getBackend } from "./models.js";
 
 // ── Types ──
 
@@ -347,7 +347,7 @@ export function claudeResultToOpenai(
     id,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
-    model: model || DEFAULT_MODEL,
+    model: model || getDefaultModel(),
     choices: [
       {
         index: 0,
@@ -371,9 +371,11 @@ export function buildModelsList(): {
   data: Array<{ id: string; object: "model"; created: number; owned_by: string }>;
 } {
   const created = Math.floor(Date.now() / 1000);
+  // Report ownership based on the active backend so clients see accurate provenance.
+  const owned_by = getBackend() === "cursor" ? "cursor" : "anthropic";
   return {
     object: "list",
-    data: MODELS.map((m) => ({ id: m.id, object: "model" as const, created, owned_by: "anthropic" })),
+    data: getModels().map((m) => ({ id: m.id, object: "model" as const, created, owned_by })),
   };
 }
 
@@ -390,7 +392,7 @@ export function makeStreamChunk(
     id,
     object: "chat.completion.chunk",
     created: Math.floor(Date.now() / 1000),
-    model: model || DEFAULT_MODEL,
+    model: model || getDefaultModel(),
     choices: [
       {
         index: 0,

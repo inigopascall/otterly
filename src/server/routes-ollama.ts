@@ -7,7 +7,6 @@
 // /api/pull are pure metadata and answered directly.
 
 import type { ServerResponse } from "http";
-import { ClaudeEngine } from "../engine.js";
 import { AgentError } from "../errors.js";
 import type { EngineOptions } from "../types.js";
 import type { ParsedRequest, ServerContext } from "./routes-native.js";
@@ -16,6 +15,7 @@ import { logError } from "./logger.js";
 import { metrics } from "./metrics.js";
 import { errorToHttpStatus } from "./openai-compat.js";
 import { DEFAULT_MODEL } from "./models.js";
+import { makeEngine } from "./engine-factory.js";
 import {
   ollamaMessagesToClaudeInput,
   buildOllamaShow,
@@ -114,7 +114,7 @@ async function runOllama(
   circuitBreaker: CircuitBreaker | undefined,
   spec: RunSpec,
 ): Promise<void> {
-  const engine = new ClaudeEngine();
+  const engine = makeEngine();
   const abortController = new AbortController();
   req.on("close", () => abortController.abort());
   if (req.timeoutSignal) {

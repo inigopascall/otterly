@@ -6,7 +6,7 @@
 // Reference: https://github.com/ollama/ollama/blob/main/docs/api.md
 
 import crypto from "crypto";
-import { MODELS, DEFAULT_MODEL, findModel } from "./models.js";
+import { getModels, findModel, getBackend, DEFAULT_MODEL, getDefaultModel } from "./models.js";
 
 // Version we report from GET /api/version. Some clients gate features on a
 // minimum Ollama version, so we advertise a recent one.
@@ -103,8 +103,10 @@ function msToNs(ms: number): number {
 export function buildOllamaTags(): {
   models: Array<Record<string, unknown>>;
 } {
+  // Report the family name based on the active backend.
+  const family = getBackend() === "cursor" ? "cursor" : "claude";
   return {
-    models: MODELS.map((m) => ({
+    models: getModels().map((m) => ({
       name: m.id,
       model: m.id,
       modified_at: MODELS_MODIFIED_AT,
@@ -113,8 +115,8 @@ export function buildOllamaTags(): {
       details: {
         parent_model: "",
         format: "api",
-        family: "claude",
-        families: ["claude"],
+        family,
+        families: [family],
         parameter_size: "",
         quantization_level: "",
       },
@@ -124,7 +126,8 @@ export function buildOllamaTags(): {
 
 /** POST /api/show — model metadata (context length, capabilities). */
 export function buildOllamaShow(modelId: string | undefined): Record<string, unknown> {
-  const m = findModel(modelId);
+  const family = getBackend() === "cursor" ? "cursor" : "claude";
+  const m = findModel(modelId ?? "");
   return {
     license: "",
     modelfile: "",
@@ -133,15 +136,15 @@ export function buildOllamaShow(modelId: string | undefined): Record<string, unk
     details: {
       parent_model: "",
       format: "api",
-      family: "claude",
-      families: ["claude"],
+      family,
+      families: [family],
       parameter_size: "",
       quantization_level: "",
     },
     model_info: {
-      "general.architecture": "claude",
+      "general.architecture": family,
       "general.parameter_count": 0,
-      "claude.context_length": m.contextWindow,
+      [`${family}.context_length`]: m.contextWindow,
     },
     capabilities: ["completion", "tools"],
   };
@@ -156,7 +159,7 @@ interface FinalStats {
 /** POST /api/chat (non-streaming) terminal response. */
 export function ollamaChatResponse(model: string, content: string, stats: FinalStats = {}): Record<string, unknown> {
   return {
-    model: model || DEFAULT_MODEL,
+    model: model || "",
     created_at: nowIso(),
     message: { role: "assistant", content },
     done: true,
@@ -173,7 +176,7 @@ export function ollamaChatResponse(model: string, content: string, stats: FinalS
 /** POST /api/chat (streaming) intermediate content chunk. */
 export function ollamaChatChunk(model: string, content: string): Record<string, unknown> {
   return {
-    model: model || DEFAULT_MODEL,
+    model: model || getDefaultModel(),
     created_at: nowIso(),
     message: { role: "assistant", content },
     done: false,
@@ -183,7 +186,7 @@ export function ollamaChatChunk(model: string, content: string): Record<string, 
 /** POST /api/chat (streaming) terminal chunk with stats. */
 export function ollamaChatFinal(model: string, stats: FinalStats = {}): Record<string, unknown> {
   return {
-    model: model || DEFAULT_MODEL,
+    model: model || getDefaultModel(),
     created_at: nowIso(),
     message: { role: "assistant", content: "" },
     done: true,
@@ -200,7 +203,7 @@ export function ollamaChatFinal(model: string, stats: FinalStats = {}): Record<s
 /** POST /api/generate (non-streaming) terminal response. */
 export function ollamaGenerateResponse(model: string, response: string, stats: FinalStats = {}): Record<string, unknown> {
   return {
-    model: model || DEFAULT_MODEL,
+    model: model || getDefaultModel(),
     created_at: nowIso(),
     response,
     done: true,
@@ -218,7 +221,7 @@ export function ollamaGenerateResponse(model: string, response: string, stats: F
 /** POST /api/generate (streaming) intermediate chunk. */
 export function ollamaGenerateChunk(model: string, response: string): Record<string, unknown> {
   return {
-    model: model || DEFAULT_MODEL,
+    model: model || getDefaultModel(),
     created_at: nowIso(),
     response,
     done: false,
@@ -228,7 +231,7 @@ export function ollamaGenerateChunk(model: string, response: string): Record<str
 /** POST /api/generate (streaming) terminal chunk. */
 export function ollamaGenerateFinal(model: string, stats: FinalStats = {}): Record<string, unknown> {
   return {
-    model: model || DEFAULT_MODEL,
+    model: model || getDefaultModel(),
     created_at: nowIso(),
     response: "",
     done: true,

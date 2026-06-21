@@ -5,7 +5,6 @@ import type { IncomingMessage, ServerResponse } from "http";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
-import { ClaudeEngine } from "../engine.js";
 import type { AgentResult, AgentEvent, EngineOptions } from "../types.js";
 import { AgentError } from "../errors.js";
 import { apiSessions } from "./session-store.js";
@@ -14,6 +13,7 @@ import type { RequestQueue } from "./request-queue.js";
 import type { CircuitBreaker } from "./circuit-breaker.js";
 import { logError } from "./logger.js";
 import { metrics } from "./metrics.js";
+import { makeEngine } from "./engine-factory.js";
 
 function loadPkgVersion(): string {
   try {
@@ -123,7 +123,7 @@ export async function handleRun(
     // Session not found — fall through to one-shot
   }
 
-  const engine = new ClaudeEngine();
+  const engine = makeEngine();
   const abortController = new AbortController();
   req.on("close", () => abortController.abort());
   if (req.timeoutSignal) {
@@ -275,7 +275,7 @@ export async function handleStream(
     }
   }
 
-  const engine = new ClaudeEngine();
+  const engine = makeEngine();
   const abortController = new AbortController();
   req.on("close", () => abortController.abort());
   if (req.timeoutSignal) {

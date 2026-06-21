@@ -103,7 +103,7 @@ describe("buildToolInstruction", () => {
     const text = buildToolInstruction([WEATHER_TOOL]);
     expect(text).toContain("get_weather");
     expect(text).toContain('"tool_calls"');
-    expect(text).toMatch(/function-call router/i);
+    expect(text).toMatch(/call the following functions/i);
   });
 
   it("forces a specific function when tool_choice names one", () => {

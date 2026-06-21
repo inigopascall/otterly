@@ -9,14 +9,15 @@ import { startApiServer } from "./server/index.js";
 const { values, positionals } = parseArgs({
   allowPositionals: true,
   options: {
-    port: { type: "string", short: "p", default: "11435" },
-    dir: { type: "string", short: "d", default: process.cwd() },
-    "max-concurrent": { type: "string", default: "5" },
-    "max-queue": { type: "string", default: "50" },
-    "queue-timeout": { type: "string", default: "120" },
-    "rate-limit": { type: "string", default: "60" },
-    help: { type: "boolean", short: "h", default: false },
-    version: { type: "boolean", short: "v", default: false },
+    port:             { type: "string",  short: "p", default: "11435" },
+    dir:              { type: "string",  short: "d" },
+    "max-concurrent": { type: "string",  default: "5" },
+    "max-queue":      { type: "string",  default: "50" },
+    "queue-timeout":  { type: "string",  default: "120" },
+    "rate-limit":     { type: "string",  default: "60" },
+    backend:          { type: "string",  default: "claude" },
+    help:             { type: "boolean", short: "h", default: false },
+    version:          { type: "boolean", short: "v", default: false },
   },
 });
 
@@ -37,16 +38,18 @@ if (values.help || command === "help") {
 
   Options:
     -p, --port <number>         Port to listen on (default: 11435)
-    -d, --dir <path>            Working directory for Claude (default: cwd)
+    -d, --dir <path>            Working directory (default: a clean scratch dir)
     --max-concurrent <number>   Max concurrent requests (default: 5)
     --max-queue <number>        Max queued requests (default: 50)
     --queue-timeout <seconds>   Max time a request waits in queue before 408 (default: 120)
     --rate-limit <number>       Requests per minute per client (default: 60)
+    --backend <name>            Inference backend: claude (default) | cursor
     -v, --version               Print version
     -h, --help                  Show this help
 
   Environment:
     OTTERLY_API_KEY       Set to require Bearer auth on all requests
+    OTTERLY_BACKEND       Override the backend (claude | cursor)
 
   Endpoints:
     POST /v1/chat/completions   OpenAI-compatible (use any OpenAI client)
@@ -60,6 +63,14 @@ if (values.help || command === "help") {
 }
 
 if (command === "serve") {
+  // Resolve the active backend: env var takes precedence over the CLI flag.
+  const rawBackend = (process.env.OTTERLY_BACKEND || values.backend || "claude").toLowerCase();
+  if (rawBackend !== "claude" && rawBackend !== "cursor") {
+    console.error(`Invalid backend "${rawBackend}". Must be one of: claude, cursor.`);
+    process.exit(1);
+  }
+  const backend = rawBackend as "claude" | "cursor";
+
   startApiServer({
     port: parseInt(values.port!, 10),
     workingDir: values.dir,
@@ -67,6 +78,7 @@ if (command === "serve") {
     maxQueueSize: parseInt(values["max-queue"]!, 10),
     queueTimeoutMs: parseInt(values["queue-timeout"]!, 10) * 1000,
     requestsPerMinute: parseInt(values["rate-limit"]!, 10),
+    backend,
   }).then((handle) => {
     // Graceful shutdown on SIGTERM/SIGINT
     let shutdownInitiated = false;
