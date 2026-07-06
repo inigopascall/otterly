@@ -276,7 +276,18 @@ function createCLIQueryFn(cliBin: string): QueryFn {
 async function resolveSDK(): Promise<QueryFn> {
   if (cachedQueryFn) return cachedQueryFn;
 
-  // 1. Try the npm SDK packages
+  // 1. Prefer the on-PATH `claude` CLI binary. It is the user's installed
+  //    version (e.g. 2.1.201) and matches what they run in their shell,
+  //    whereas the bundled npm SDK may ship a stale cli.js (e.g. 1.0.128)
+  //    that rejects flag combinations newer models require.
+  const cliBin = findClaudeCLI();
+  if (cliBin) {
+    cachedQueryFn = createCLIQueryFn(cliBin);
+    resolvedMode = "cli";
+    return cachedQueryFn;
+  }
+
+  // 2. Fall back to the npm SDK packages if no CLI is on PATH.
   for (const pkg of ["@anthropic-ai/claude-code", "@anthropic-ai/claude-agent-sdk"]) {
     try {
       const mod = await import(pkg);
@@ -289,14 +300,6 @@ async function resolveSDK(): Promise<QueryFn> {
     } catch {
       // Try next
     }
-  }
-
-  // 2. Fall back to the CLI binary (works regardless of install method)
-  const cliBin = await findClaudeCLI();
-  if (cliBin) {
-    cachedQueryFn = createCLIQueryFn(cliBin);
-    resolvedMode = "cli";
-    return cachedQueryFn;
   }
 
   throw new AgentError(
