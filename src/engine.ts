@@ -393,6 +393,10 @@ export class ClaudeEngine {
       cwd: opts.cwd || process.cwd(),
       permissionMode: opts.permissionMode || "bypassPermissions",
       includePartialMessages: true,
+      // Surface the underlying `claude` subprocess's stderr. The SDK otherwise
+      // swallows it and only throws a bare "process exited with code 1". This
+      // prints the real cause (auth/policy/model error) to the server terminal.
+      stderr: (data: string) => process.stderr.write(`[claude stderr] ${data}`),
     };
 
     if (opts.model) queryOptions.model = opts.model;
