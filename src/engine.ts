@@ -205,13 +205,15 @@ export function spawnWithAbort(cmd: string | string[], opts: SpawnWithAbortOptio
 
     // Resolve/reject only after the child has truly exited. This is the
     // contract that prevents queue-slot leaks.
-    child.on("exit", () => {
+    child.on("exit", (code) => {
       cleanup();
+      const stderr = Buffer.concat(stderrChunks).toString("utf-8").trim();
       if (aborted) {
         reject(new Error("Aborted"));
       } else if (timedOut) {
-        const stderr = Buffer.concat(stderrChunks).toString("utf-8").trim();
         reject(new Error(`CLI timed out after ${opts.timeoutMs}ms${stderr ? `: ${stderr.slice(-500)}` : ""}`));
+      } else if (code !== null && code !== 0) {
+        reject(new Error(`claude exited ${code}${stderr ? `: ${stderr.slice(-1000)}` : ""}`));
       } else {
         resolve(Buffer.concat(stdoutChunks).toString("utf-8"));
       }
