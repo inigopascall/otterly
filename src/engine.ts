@@ -213,7 +213,9 @@ export function spawnWithAbort(cmd: string | string[], opts: SpawnWithAbortOptio
       } else if (timedOut) {
         reject(new Error(`CLI timed out after ${opts.timeoutMs}ms${stderr ? `: ${stderr.slice(-500)}` : ""}`));
       } else if (code !== null && code !== 0) {
-        reject(new Error(`claude exited ${code}${stderr ? `: ${stderr.slice(-1000)}` : ""}`));
+        const stdout = Buffer.concat(stdoutChunks).toString("utf-8").trim();
+        const detail = stderr || stdout;
+        reject(new Error(`claude exited ${code}${detail ? `: ${detail.slice(-1000)}` : ""}`));
       } else {
         resolve(Buffer.concat(stdoutChunks).toString("utf-8"));
       }
