@@ -96,12 +96,18 @@ export interface OpenAIStreamChunk {
 
 /** Claude Code's built-in tool names. When a client supplies its own OpenAI
  *  `tools`, OpenAI semantics say the *client* executes them — so we disable all
- *  of Claude's built-ins to stop it running Bash/Write/etc. on the server. */
+ *  of Claude's built-ins to stop it running Bash/Write/etc. on the server.
+ *
+ *  This list must stay in sync with the tool names the installed `claude` CLI
+ *  actually recognises. Unrecognised names cause `claude` to exit 1 with a
+ *  "Permission deny rule … matches no known tool" error. The SDK path
+ *  (queryOptions.disallowedTools) is more lenient — it silently ignores
+ *  unknown names — but the CLI path is strict. */
 export const CLAUDE_BUILTIN_TOOLS = [
-  "Read", "Write", "Edit", "MultiEdit", "Bash", "BashOutput", "KillShell",
+  "Read", "Write", "Edit", "Bash", "BashOutput", "KillShell",
   "Glob", "Grep", "WebFetch", "WebSearch", "Task", "NotebookEdit",
-  "NotebookRead", "TodoWrite", "ExitPlanMode", "AskUserQuestion",
-  "SlashCommand", "Skill", "LS",
+  "TodoWrite", "ExitPlanMode", "AskUserQuestion",
+  "Skill", "Monitor", "ToolSearch", "Agent", "TaskCreate", "TaskUpdate",
 ];
 
 // ── Conversion Functions ──

@@ -582,6 +582,21 @@ npx otterly serve --port 11435 --dir ./project --max-concurrent 3
 
 Programmatic options on `startApiServer()` mirror the flags, plus `requestTimeoutMs`, `streamTimeoutMs`, and `queueTimeoutMs`. Set `OTTERLY_API_KEY` in the environment to require Bearer auth.
 
+## Rebuild & restart
+
+Rebuild and restart
+
+```bash
+cd /home/inigo/code/otterly
+pnpm run build
+pnpm i -g .
+```
+
+Then stop otterly serve (Ctrl+C) and start it again:
+
+`otterly serve --backend claude -p 11435`
+`otterly serve --backend cursor -p 11436`
+
 ---
 
 ## Library API at a glance
