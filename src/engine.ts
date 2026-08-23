@@ -312,9 +312,11 @@ async function resolveSDK(): Promise<QueryFn> {
 
 export class ClaudeEngine {
   private defaults: Partial<EngineOptions>;
+  private queryFnOverride?: QueryFn;
 
-  constructor(defaults?: Partial<EngineOptions>) {
+  constructor(defaults?: Partial<EngineOptions>, queryFn?: QueryFn) {
     this.defaults = defaults || {};
+    this.queryFnOverride = queryFn;
   }
 
   private mergeOptions(options?: EngineOptions): EngineOptions {
@@ -332,6 +334,8 @@ export class ClaudeEngine {
   async run(prompt: string, options?: EngineOptions): Promise<AgentResult> {
     const tools: ToolExecution[] = [];
     let resultText = "";
+    let textFromBlocks = "";
+    let textFromDeltas = "";
     let cost = 0;
     let duration = 0;
     let sessionId = "";
@@ -341,7 +345,10 @@ export class ClaudeEngine {
     for await (const event of this.stream(prompt, options)) {
       switch (event.type) {
         case "text":
-          resultText = event.text;
+          textFromBlocks += event.text;
+          break;
+        case "text_delta":
+          textFromDeltas += event.delta;
           break;
         case "tool_use":
           pendingToolUses.set(event.id, { tool: event.tool, input: event.input });
@@ -371,6 +378,10 @@ export class ClaudeEngine {
       }
     }
 
+    if (!resultText) {
+      resultText = textFromDeltas || textFromBlocks || "";
+    }
+
     return { text: resultText, cost, duration, sessionId, usage, tools };
   }
 
@@ -386,7 +397,7 @@ export class ClaudeEngine {
    */
   async *stream(prompt: string, options?: EngineOptions): AsyncGenerator<AgentEvent> {
     const opts = this.mergeOptions(options);
-    const queryFn = await resolveSDK();
+    const queryFn = this.queryFnOverride || await resolveSDK();
 
     const abortController = new AbortController();
     if (opts.signal) {

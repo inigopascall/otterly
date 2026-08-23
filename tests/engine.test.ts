@@ -17,6 +17,40 @@ function createMockQuery(messages: Record<string, unknown>[]) {
 import { Session } from "../src/session.js";
 
 describe("ClaudeEngine", () => {
+  describe("run() result collection", () => {
+    it("concatenates multiple assistant text blocks when terminal result is empty", async () => {
+      const mockQuery = vi.fn(() =>
+        (async function* () {
+          yield {
+            type: "assistant",
+            message: {
+              content: [
+                { type: "text", text: "# Title\n\n" },
+                { type: "text", text: "Opening paragraph. " },
+                { type: "text", text: "Continuation and conclusion.\n" },
+              ],
+            },
+          };
+          yield {
+            type: "result",
+            subtype: "success",
+            result: "",
+            total_cost_usd: 0,
+            duration_ms: 0,
+            usage: { input_tokens: 0, output_tokens: 0 },
+          };
+        })()
+      );
+
+      const engine = new ClaudeEngine({ cwd: "/" }, mockQuery);
+      const result = await engine.run("write a document");
+
+      expect(result.text).toBe(
+        "# Title\n\nOpening paragraph. Continuation and conclusion.\n"
+      );
+    });
+  });
+
   describe("run() via Session internals", () => {
     it("collects text and result into AgentResult", async () => {
       const mockQuery = vi.fn((args: any) =>

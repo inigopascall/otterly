@@ -1008,6 +1008,78 @@ describe("session: multi-turn deep tests", () => {
 // ═══════════════════════════════════════════════════════
 
 describe("session: result collection", () => {
+  it("concatenates multiple assistant text blocks when terminal result is empty", async () => {
+    const qfn = vi.fn(() =>
+      (async function* () {
+        yield {
+          type: "assistant",
+          message: {
+            content: [
+              { type: "text", text: "# Title\n\n" },
+              { type: "text", text: "Opening paragraph. " },
+              { type: "text", text: "Continuation and conclusion.\n" },
+            ],
+          },
+        };
+        yield {
+          type: "result",
+          subtype: "success",
+          result: "",
+          total_cost_usd: 0,
+          duration_ms: 0,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        };
+      })()
+    );
+
+    const session = new Session(qfn, { cwd: "/" });
+    const result = await session.send("write a document");
+
+    expect(result.text).toBe(
+      "# Title\n\nOpening paragraph. Continuation and conclusion.\n"
+    );
+  });
+
+  it("prefers text deltas over a consolidated text block when terminal result is empty", async () => {
+    const qfn = vi.fn(() =>
+      (async function* () {
+        yield {
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            delta: { type: "text_delta", text: " streamed answer" },
+          },
+        };
+        yield {
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            delta: { type: "text_delta", text: " exactly once" },
+          },
+        };
+        yield {
+          type: "assistant",
+          message: {
+            content: [{ type: "text", text: " streamed answer exactly once" }],
+          },
+        };
+        yield {
+          type: "result",
+          subtype: "success",
+          result: "",
+          total_cost_usd: 0,
+          duration_ms: 0,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        };
+      })()
+    );
+
+    const session = new Session(qfn, { cwd: "/" });
+    const result = await session.send("answer");
+
+    expect(result.text).toBe(" streamed answer exactly once");
+  });
+
   it("uses last text event as result text when result.text is empty", async () => {
     const qfn = vi.fn(() =>
       (async function* () {

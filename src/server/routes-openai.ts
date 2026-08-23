@@ -287,10 +287,16 @@ async function handleSessionStreaming(
   const completionId = `chatcmpl-otterly-${crypto.randomUUID().slice(0, 12)}`;
   await sseWrite(res, sseData(makeStreamChunk(completionId, { role: "assistant" }, null, model)));
 
+  let sawTextDelta = false;
   try {
     for await (const event of session.sendStream(prompt)) {
       if (event.type === "text_delta") {
+        sawTextDelta = true;
         await sseWrite(res, sseData(makeStreamChunk(completionId, { content: event.delta }, null, model)));
+      } else if (event.type === "text") {
+        if (event.text && !sawTextDelta) {
+          await sseWrite(res, sseData(makeStreamChunk(completionId, { content: event.text }, null, model)));
+        }
       } else if (event.type === "result") {
         apiSessions.recordRequest(sessionId, event.cost);
         await sseWrite(res, sseData(makeStreamChunk(completionId, {}, "stop", model)));

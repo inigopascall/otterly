@@ -57,6 +57,8 @@ export class Session {
   async send(prompt: string): Promise<AgentResult> {
     const tools: ToolExecution[] = [];
     let resultText = "";
+    let textFromBlocks = "";
+    let textFromDeltas = "";
     let cost = 0;
     let duration = 0;
     let sessionId = "";
@@ -66,7 +68,10 @@ export class Session {
     for await (const event of this.sendStream(prompt)) {
       switch (event.type) {
         case "text":
-          resultText = event.text;
+          textFromBlocks += event.text;
+          break;
+        case "text_delta":
+          textFromDeltas += event.delta;
           break;
         case "tool_use":
           pendingToolUses.set(event.id, { tool: event.tool, input: event.input });
@@ -94,6 +99,10 @@ export class Session {
             ? event.error
             : classifyError(event.error);
       }
+    }
+
+    if (!resultText) {
+      resultText = textFromDeltas || textFromBlocks;
     }
 
     return { text: resultText, cost, duration, sessionId, usage, tools };
