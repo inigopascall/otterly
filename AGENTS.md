@@ -270,3 +270,20 @@ The Cursor backend requires `bwrap` installed (`sudo apt install bubblewrap`).
   `run()`/`stream()` and apply to both backends.
 - **The Claude CLI fallback** (`createCLIQueryFn` in `engine.ts`) is used only
   when the SDK package is absent; the SDK path is preferred.
+
+## 10. Building and re-deploying the global install
+
+```
+cd /home/inigo/code/otterly
+pnpm run build
+pnpm i -g .
+```
+
+## 11. Running tests
+
+Run Vitest through pnpm dlx, which downloads a temporary executable and runs it without changing the repo:
+
+```
+pnpm dlx vitest run
+```
+
