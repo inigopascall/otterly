@@ -9,7 +9,7 @@ import type { EngineOptions } from "../types.js";
 import type { ParsedRequest, ServerContext } from "./routes-native.js";
 import { apiSessions } from "./session-store.js";
 import type { CircuitBreaker } from "./circuit-breaker.js";
-import { logError } from "./logger.js";
+import { log, logError } from "./logger.js";
 import { metrics } from "./metrics.js";
 import { getDefaultModel } from "./models.js";
 import { makeEngine } from "./engine-factory.js";
@@ -26,6 +26,7 @@ import {
   CLAUDE_BUILTIN_TOOLS,
   type OpenAIChatRequest,
 } from "./openai-compat.js";
+import { repairToolCalls, looksLikeToolCallEnvelope } from "./tool-call-repair.js";
 
 /**
  * Handle POST /v1/chat/completions
@@ -177,7 +178,62 @@ async function handleFunctionCalling(
     circuitBreaker?.onSuccess();
 
     const parsed = parseToolCalls(result.text);
-    const toolCalls = parsed ? toOpenAIToolCalls(parsed) : null;
+    let toolCalls = parsed ? toOpenAIToolCalls(parsed) : null;
+    let notice: string | undefined;
+
+    if (!toolCalls) {
+      // The parser found nothing. Before treating the reply as prose, try a
+      // strictly structural repair (see repairToolCalls): in practice the only
+      // observed defect is a single missing closing bracket.
+      const repaired = repairToolCalls(result.text);
+      if (repaired) {
+        toolCalls = toOpenAIToolCalls(repaired.calls);
+        notice =
+          `⚠️ Otterly repaired a malformed tool call: ${repaired.repairs.join("; ")}. ` +
+          "Arguments preserved byte-for-byte.";
+        log("warn", {
+          requestId: req.requestId || "",
+          message: "tool_call_repaired",
+          repairs: repaired.repairs,
+          charsAltered: repaired.charsAltered,
+          tools: repaired.calls.map((c) => c.name),
+        });
+      } else if (looksLikeToolCallEnvelope(result.text)) {
+        // The model set out to call a tool and produced something we can neither
+        // parse nor safely repair. Returning the raw envelope as assistant text
+        // would end the client's agent loop silently, so fail loudly instead and
+        // let the client's own bounded retry re-sample the model.
+        // Deliberately NOT circuitBreaker.onFailure(): the service is healthy;
+        // the model output was not.
+        const status = 502;
+        log("error", {
+          requestId: req.requestId || "",
+          message: "tool_call_unparseable",
+          status,
+          textLength: result.text.length,
+          rawText: result.text.slice(0, 4000),
+        });
+        metrics.record({
+          ts: Date.now(), endpoint: "chat", status,
+          durationMs: Date.now() - startedAt,
+          cost: result.cost || 0,
+          inputTokens: result.usage?.input_tokens || 0,
+          outputTokens: result.usage?.output_tokens || 0,
+          toolCalls: 0,
+          error: "unparseable tool call",
+        });
+        if (!res.headersSent) {
+          res.writeHead(status, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(openaiErrorBody(
+            status,
+            "The model emitted a tool call that could not be parsed or safely repaired. Nothing was executed.",
+          )));
+        } else if (!res.writableEnded) {
+          res.end();
+        }
+        return;
+      }
+    }
 
     metrics.record({
       ts: Date.now(), endpoint: "chat", status: 200,
@@ -197,6 +253,9 @@ async function handleFunctionCalling(
       const completionId = `chatcmpl-otterly-${crypto.randomUUID().slice(0, 12)}`;
       await sseWrite(res, sseData(makeStreamChunk(completionId, { role: "assistant" }, null, model)));
       if (toolCalls) {
+        if (notice) {
+          await sseWrite(res, sseData(makeStreamChunk(completionId, { content: notice }, null, model)));
+        }
         await sseWrite(res, sseData(makeStreamChunk(completionId, {
           tool_calls: toolCalls.map((tc, index) => ({
             index, id: tc.id, type: tc.type, function: tc.function,
@@ -212,7 +271,7 @@ async function handleFunctionCalling(
       await sseWrite(res, "data: [DONE]\n\n");
       if (!res.writableEnded) res.end();
     } else {
-      const response = claudeResultToOpenai(result.text, model, result.usage, toolCalls || undefined);
+      const response = claudeResultToOpenai(result.text, model, result.usage, toolCalls || undefined, notice);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(response));
     }

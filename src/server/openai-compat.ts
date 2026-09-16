@@ -217,14 +217,16 @@ export function buildToolInstruction(
     "You can call the following functions when they would help fulfil the user's request. A separate system executes them and returns the result to you:",
     JSON.stringify(defs, null, 2),
     "",
-    "To call one or more functions, output ONLY this JSON object and nothing else — no prose, no markdown fences:",
-    '{"tool_calls": [{"name": "<function name>", "arguments": {<arguments as a JSON object>}}]}',
+    "To call one or more functions, output ONLY a single JSON object and nothing else — no prose, no markdown fences. It must have exactly this shape:",
+    '{"tool_calls": [{"name": "example_function", "arguments": {"some_text": "a value", "some_number": 42}}]}',
     "",
     "Rules:",
     "- When you emit a function call, do not also answer the request yourself; the function result will be returned to you.",
     "- Never claim you lack access to data, the internet, or tools when a listed function provides it — emit the call instead.",
     "- Fill arguments from the user request, matching each function's JSON Schema.",
     "- Do not invent functions that are not listed above.",
+    "- Emit the object on one line. Inside string values, encode newlines as \\n and quotes as \\\" — a raw line break inside a string is invalid JSON.",
+    "- Close every bracket. The object ends with a closing brace for the arguments object, a closing brace for the call object, a closing square bracket for the array, then a final closing brace for the outer object.",
     forcedName
       ? `- You MUST call the function "${forcedName}".`
       : required
@@ -343,6 +345,7 @@ export function claudeResultToOpenai(
   model: string,
   usage?: AgentResult["usage"],
   toolCalls?: OpenAIToolCall[],
+  notice?: string,
 ): OpenAIChatResponse {
   const id = `chatcmpl-otterly-${crypto.randomUUID().slice(0, 12)}`;
   const inputTokens = usage?.input_tokens || 0;
@@ -358,7 +361,7 @@ export function claudeResultToOpenai(
       {
         index: 0,
         message: hasTools
-          ? { role: "assistant", content: null, tool_calls: toolCalls }
+          ? { role: "assistant", content: notice ?? null, tool_calls: toolCalls }
           : { role: "assistant", content: text || "" },
         finish_reason: hasTools ? "tool_calls" : "stop",
       },
