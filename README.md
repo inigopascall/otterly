@@ -4,13 +4,13 @@
 </p>
 
 <p align="center">
-  <a href="https://otterly.josharsh.com">otterly.josharsh.com</a> · <a href="https://www.npmjs.com/package/otterly">npm</a> · <a href="https://github.com/josharsh/otterly">github</a>
+  <a href="https://www.reallyartificial.org">A Really Artificial project</a> · <a href="https://otterly.josharsh.com">Website</a> · <a href="https://www.npmjs.com/package/otterly">npm</a> · <a href="https://github.com/ReallyArtificial/otterly">github</a>
 </p>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/otterly"><img src="https://img.shields.io/npm/v/otterly.svg" alt="npm version"></a>
   <a href="https://www.npmjs.com/package/otterly"><img src="https://img.shields.io/npm/dm/otterly.svg" alt="npm downloads"></a>
-  <a href="https://github.com/josharsh/otterly/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/otterly.svg" alt="license"></a>
+  <a href="https://github.com/ReallyArtificial/otterly/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/otterly.svg" alt="license"></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/node/v/otterly.svg" alt="node version"></a>
 </p>
 
@@ -522,7 +522,7 @@ Why is it called "otterly"? Because otters carry their tools with them, and your
 
 ## Contributing
 
-PRs and issues welcome at [github.com/josharsh/otterly](https://github.com/josharsh/otterly). Especially interested in:
+PRs and issues welcome at [github.com/ReallyArtificial/otterly](https://github.com/ReallyArtificial/otterly). Especially interested in:
 
 - More language SDK examples (Go, Rust, Elixir)
 - Integration recipes for Cursor / Continue / Aider / Open WebUI

@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 and uses [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) formatting.
 
+## [Unreleased]
+
+### Changed
+
+- Moved the source repository to ReallyArtificial/otterly and the companion website to ReallyArtificial/otterly-website. The npm package remains `otterly`.
+
 ## [0.8.0] - 2026-06-03
 
 ### Added
