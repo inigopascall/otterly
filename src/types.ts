@@ -27,11 +27,19 @@ export interface EngineOptions {
   resume?: string;
   /** Reasoning effort level */
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
-  /** When true, the request carries client-side OpenAI tools, so the Cursor
-   *  read-only directive is relaxed to PERMIT emitting a tool_calls JSON object
-   *  (a request for the external client to act — not a local action). Read only
-   *  by the Cursor backend's buildCursorPrompt; ignored by the Claude path. */
+  /** When true, client tools are external OpenAI tools: Cursor may emit JSON
+   *  tool intent, while Claude rejects native tool inventory/activity on this
+   *  path. */
   clientToolCalls?: boolean;
+  /** Correlation id for logging and file tracing. Set from the HTTP request id
+   *  so engine-level log lines line up with the request that produced them. */
+  traceId?: string;
+  /** Server-side deadline for the run, in ms. The Claude CLI's own hard timer
+   *  is set CLI_BACKSTOP_MS beyond it. Defaults to DEFAULT_TIMEOUT_MS. */
+  timeoutMs?: number;
+  /** Stop the run after this long with no output from the Claude CLI, in ms.
+   *  Defaults to the server's --idle-timeout (DEFAULT_IDLE_TIMEOUT_MS). */
+  idleTimeoutMs?: number;
 }
 
 // ── Permissions ──

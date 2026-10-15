@@ -39,6 +39,42 @@ export function looksLikeToolCallEnvelope(text: string): boolean {
   return /^\{\s*"tool_calls"\s*:/.test(stripWholeReplyFence(text));
 }
 
+/** Blank out fenced blocks and inline code spans. A reply that quotes tool-call
+ *  markup in order to discuss it keeps that markup inside code, so removing code
+ *  first stops a written explanation being mistaken for an attempted call. */
+function stripCode(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/~~~[\s\S]*?~~~/g, " ")
+    .replace(/`[^`\n]*`/g, " ");
+}
+
+/**
+ * True when a reply we could not parse nonetheless shows tool-call intent.
+ *
+ * Two shapes qualify:
+ *  - the JSON envelope this bridge asks for (looksLikeToolCallEnvelope), and
+ *  - Claude's own native markup, <invoke name="X"> ... , where X is a tool the
+ *    request actually offered. That form arrives as ordinary text: nothing was
+ *    executed, and the parser cannot turn it into OpenAI tool_calls.
+ *
+ * Requiring X to be an offered tool, and ignoring markup inside code, keeps
+ * prose that merely mentions the syntax out of the rejection path.
+ */
+export function looksLikeToolCallIntent(text: string, knownTools: string[] = []): boolean {
+  if (!text) return false;
+  if (looksLikeToolCallEnvelope(text)) return true;
+  if (knownTools.length === 0) return false;
+
+  const bare = stripCode(text);
+  const re = /<\s*(?:antml:)?invoke\b[^>]*\bname\s*=\s*["']([^"']+)["']/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(bare)) !== null) {
+    if (knownTools.includes(m[1])) return true;
+  }
+  return false;
+}
+
 /**
  * Repair a tool-call envelope that is complete except for ONE missing closing
  * bracket. Returns null when the text is not a repairable envelope.

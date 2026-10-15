@@ -23,7 +23,10 @@ import { attachWsHandler } from "./ws-handler.js";
 import { apiSessions } from "./session-store.js";
 import { RequestQueue, QueueFullError, QueueTimeoutError } from "./request-queue.js";
 import { checkAuth, RateLimiter, sendAuthError, sendRateLimitError } from "./middleware.js";
-import { generateRequestId, logRequest, logResponse, logError } from "./logger.js";
+import { generateRequestId, logRequest, logResponse, logError, log } from "./logger.js";
+import { settleResponse } from "./settle.js";
+import { AgentError } from "../errors.js";
+import { DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, setIdleTimeoutMs } from "../engine.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import { openApiSpec } from "./swagger.js";
 import { getPlaygroundHtml } from "./playground.js";
@@ -85,6 +88,8 @@ export interface ApiServerOptions {
   requestsPerMinute?: number;
   requestTimeoutMs?: number;
   streamTimeoutMs?: number;
+  /** Stop a Claude run after this long with no CLI output, in ms. */
+  idleTimeoutMs?: number;
   /** Which inference backend to use ("claude" or "cursor"). Defaults to "claude". */
   backend?: Backend;
 }
@@ -131,8 +136,10 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
   const backend = opts.backend ?? "claude";
   setBackend(backend);
   const apiKey = process.env.OTTERLY_API_KEY || null;
-  const requestTimeoutMs = opts.requestTimeoutMs ?? 5 * 60 * 1000;  // 5 min one-shot
-  const streamTimeoutMs = opts.streamTimeoutMs ?? 10 * 60 * 1000;   // 10 min streaming
+  const requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const streamTimeoutMs = opts.streamTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+  setIdleTimeoutMs(idleTimeoutMs);
 
   const ctx: ServerContext = { workingDir, apiKey };
   const queue = new RequestQueue({
@@ -324,8 +331,14 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
           });
         } finally {
           inFlight--;
-          const status = res.statusCode || 200;
-          logResponse(requestId, req.method!, path, status, Date.now() - startTime);
+          const timedOut = parsed.timeoutSignal?.aborted === true;
+          if (!res.writableEnded && !res.destroyed) {
+            log("error", { requestId, message: "response_unsettled", timedOut, headersSent: res.headersSent });
+          }
+          const outcome = settleResponse(res, timedOut, isOpenai, isOpenai && isStream);
+          // A client that hung up never received a status; 499 says so.
+          const endStatus = outcome === "client_disconnected" ? 499 : res.statusCode || 200;
+          logResponse(requestId, req.method!, path, endStatus, Date.now() - startTime, outcome);
           if (inFlight === 0 && drainResolve) drainResolve();
         }
       });
@@ -407,6 +420,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
       console.log(`  Dashboard     : http://localhost:${port}/dashboard`);
       console.log(`  Backend       : ${backend}`);
       console.log(`  Working dir   : ${workingDir}`);
+      console.log(`  Timeouts      : ${Math.round(requestTimeoutMs / 1000)} s request · ${Math.round(streamTimeoutMs / 1000)} s stream · ${Math.round(idleTimeoutMs / 1000)} s idle`);
       if (apiKey) {
         console.log(`  Auth          : API key required (OTTERLY_API_KEY)`);
       } else {
@@ -438,8 +452,11 @@ async function withTimeout(
 ): Promise<void> {
   // Attach a timeout abort controller that route handlers can pick up
   const timeoutController = new AbortController();
-  const timer = setTimeout(() => timeoutController.abort(), timeoutMs);
+  const timer = setTimeout(() => timeoutController.abort(
+    new AgentError("TIMEOUT", `No response from the model within ${Math.round(timeoutMs / 1000)} s.`),
+  ), timeoutMs);
   req.timeoutSignal = timeoutController.signal;
+  req.timeoutMs = timeoutMs;
 
   try {
     await fn();

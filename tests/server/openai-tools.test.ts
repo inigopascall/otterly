@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { repairToolCalls, looksLikeToolCallEnvelope } from "../../src/server/tool-call-repair.js";
+import { repairToolCalls, looksLikeToolCallEnvelope, looksLikeToolCallIntent } from "../../src/server/tool-call-repair.js";
 import {
   parseToolCalls,
   toOpenAIToolCalls,
@@ -260,5 +260,65 @@ describe("openaiToClaudeInput with function-call history", () => {
     expect(prompt).toContain("get_weather");
     expect(prompt).toContain("Result of function get_weather");
     expect(prompt).toContain('{"temp":"20C"}');
+  });
+});
+
+describe("looksLikeToolCallIntent", () => {
+  const TOOLS = ["subagents---run_task", "power---file_read"];
+
+  // The shape of a real leak captured in a request trace: prose, then Claude's
+  // native invoke markup, unfenced, naming a tool the request offered.
+  const LEAK = [
+    "Full suite green: **289 passed (2401 assertions)**, up from 278.",
+    "",
+    "Before handing over the click-through, one hazard I need to remove first.",
+    "",
+    '<invoke name="subagents---run_task">',
+    '<parameter name="subagentId">editor-1</parameter>',
+    '<parameter name="prompt">Make two small, precise edits.</parameter>',
+    "</invoke>",
+  ].join("\n");
+
+  it("detects the JSON envelope", () => {
+    expect(looksLikeToolCallIntent('{"tool_calls":[{"name":"x","arguments":{}}]}', TOOLS)).toBe(true);
+  });
+
+  it("detects native invoke markup naming an offered tool", () => {
+    expect(looksLikeToolCallIntent(LEAK, TOOLS)).toBe(true);
+  });
+
+  it("detects the antml-prefixed form", () => {
+    expect(looksLikeToolCallIntent('<invoke name="power---file_read">', TOOLS)).toBe(true);
+  });
+
+  it("ignores invoke markup naming a tool that was not offered", () => {
+    expect(looksLikeToolCallIntent('<invoke name="something---else">x</invoke>', TOOLS)).toBe(false);
+  });
+
+  it("ignores markup inside a fenced code block", () => {
+    const quoted = [
+      "Here is what the leak looks like:",
+      "",
+      "```",
+      '<invoke name="subagents---run_task">',
+      "```",
+      "",
+      "That is the shape to watch for.",
+    ].join("\n");
+    expect(looksLikeToolCallIntent(quoted, TOOLS)).toBe(false);
+  });
+
+  it("ignores markup inside an inline code span", () => {
+    expect(
+      looksLikeToolCallIntent('The model emitted `<invoke name="subagents---run_task">` as text.', TOOLS)
+    ).toBe(false);
+  });
+
+  it("leaves ordinary prose alone", () => {
+    expect(looksLikeToolCallIntent("I ran the tests and they all passed.", TOOLS)).toBe(false);
+  });
+
+  it("returns false when no tools were offered", () => {
+    expect(looksLikeToolCallIntent('<invoke name="subagents---run_task">', [])).toBe(false);
   });
 });

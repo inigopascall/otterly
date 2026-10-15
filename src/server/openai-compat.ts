@@ -3,6 +3,7 @@
 
 import crypto from "crypto";
 import type { AgentResult } from "../types.js";
+import { AgentError } from "../errors.js";
 import { getModels, getDefaultModel, getBackend } from "./models.js";
 
 // ── Types ──
@@ -45,6 +46,7 @@ export interface OpenAIChatRequest {
   model?: string;
   messages: OpenAIChatMessage[];
   stream?: boolean;
+  reasoning_effort?: string;
   temperature?: number;
   max_tokens?: number;
   response_format?: { type: "text" | "json_object" };
@@ -190,6 +192,14 @@ export interface ParsedToolCall {
   arguments: Record<string, unknown>;
 }
 
+/** Filled in by parseToolCalls to record HOW the calls were recovered. */
+export interface ToolCallParseDiag {
+  /** "whole-json" | "function_calls-block" | "embedded-object" */
+  format?: string;
+  /** How many balanced {...} regions the scanner found. */
+  objectsScanned?: number;
+}
+
 /**
  * Build the system-prompt addendum that teaches Claude how to request a
  * caller-executed function. `toolChoice` may force a specific function.
@@ -226,6 +236,7 @@ export function buildToolInstruction(
     "- Fill arguments from the user request, matching each function's JSON Schema.",
     "- Do not invent functions that are not listed above.",
     "- Emit the object on one line. Inside string values, encode newlines as \\n and quotes as \\\" — a raw line break inside a string is invalid JSON.",
+    "- Emit the JSON object itself. An XML-style <invoke> / <parameter> block is not a function call here: it is returned to the user as plain text and nothing runs.",
     "- Close every bracket. The object ends with a closing brace for the arguments object, a closing brace for the call object, a closing square bracket for the array, then a final closing brace for the outer object.",
     forcedName
       ? `- You MUST call the function "${forcedName}".`
@@ -234,6 +245,20 @@ export function buildToolInstruction(
         : "- If no listed function is needed, ignore everything above and answer the user's request fully, completely, and normally.",
   ].join("\n");
 }
+
+/**
+ * Repeated after the user request. buildToolInstruction sits at the very top of
+ * a prompt that routinely runs to hundreds of thousands of characters, so by the
+ * point generation begins the format rule is a long way behind; this puts it
+ * back within reach.
+ */
+export const TOOL_CALL_REMINDER = [
+  "=== REMINDER ===",
+  "If you are calling a function, your entire reply must be one JSON object of the form",
+  '{"tool_calls": [{"name": "...", "arguments": {...}}]}.',
+  "Any other form of call, including <invoke> / <parameter> tags, is not executed.",
+  "If you are not calling a function, answer normally and ignore this.",
+].join("\n");
 
 /**
  * Scan a string for every top-level balanced `{...}` region, ignoring braces
@@ -279,7 +304,7 @@ function extractJsonObjects(s: string): string[] {
  * calls, or null when the output is an ordinary text answer. Tolerates stray
  * code fences and surrounding prose / thinking blocks around the JSON.
  */
-export function parseToolCalls(text: string): ParsedToolCall[] | null {
+export function parseToolCalls(text: string, diag?: ToolCallParseDiag): ParsedToolCall[] | null {
   if (!text) return null;
   let s = text.trim();
 
@@ -306,7 +331,10 @@ export function parseToolCalls(text: string): ParsedToolCall[] | null {
   };
 
   // Format A: whole reply is JSON ({"tool_calls":[...]} | [..] | {name,arguments})
-  try { ingest(JSON.parse(s)); if (calls.length) return calls; } catch { /* fall through */ }
+  try {
+    ingest(JSON.parse(s));
+    if (calls.length) { if (diag) diag.format = "whole-json"; return calls; }
+  } catch { /* fall through */ }
 
   // Format B: <function_calls> ... </function_calls> blocks (Claude's leak),
   // each containing a JSON array or object. Multiple blocks allowed.
@@ -315,12 +343,15 @@ export function parseToolCalls(text: string): ParsedToolCall[] | null {
   while ((m = blockRe.exec(s)) !== null) {
     try { ingest(JSON.parse(m[1].trim())); } catch { /* skip */ }
   }
-  if (calls.length) return calls;
+  if (calls.length) { if (diag) diag.format = "function_calls-block"; return calls; }
 
   // Format C: any embedded balanced {...} or [...] regions containing calls.
-  for (const frag of extractJsonObjects(s)) {
+  const frags = extractJsonObjects(s);
+  if (diag) diag.objectsScanned = frags.length;
+  for (const frag of frags) {
     try { ingest(JSON.parse(frag)); } catch { /* skip */ }
   }
+  if (calls.length && diag) diag.format = "embedded-object";
   return calls.length ? calls : null;
 }
 
@@ -331,6 +362,51 @@ export function toOpenAIToolCalls(parsed: ParsedToolCall[]): OpenAIToolCall[] {
     type: "function" as const,
     function: { name: c.name, arguments: JSON.stringify(c.arguments) },
   }));
+}
+
+/**
+ * Fingerprint a reply that could NOT be parsed into tool calls. Returns a small,
+ * loggable object naming every tool-call marker present in the text, so a leak
+ * can be diagnosed from the log alone instead of by guessing at its shape.
+ */
+export function describeToolCallIntent(
+  text: string,
+  knownTools: string[] = [],
+): Record<string, unknown> {
+  const s = (text || "").trim();
+  const objects = extractJsonObjects(s);
+
+  let firstObjectKeys: string[] = [];
+  if (objects.length > 0) {
+    try {
+      const o = JSON.parse(objects[0]);
+      if (o && typeof o === "object" && !Array.isArray(o)) {
+        firstObjectKeys = Object.keys(o as Record<string, unknown>).slice(0, 12);
+      }
+    } catch { /* leave empty */ }
+  }
+
+  let toolNameOnOwnLine: string | null = null;
+  for (const name of knownTools) {
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`^\\s*${esc}\\s*$`, "m").test(s)) {
+      toolNameOnOwnLine = name;
+      break;
+    }
+  }
+
+  return {
+    startsWithEnvelope: /^\{\s*"tool_calls"\s*:/.test(s),
+    containsToolCallsKey: s.includes('"tool_calls"'),
+    containsInvokeOpen: /<\s*(antml:)?invoke\b/i.test(s),
+    containsInvokeClose: /<\/\s*(antml:)?invoke\s*>/i.test(s),
+    containsFunctionCallsTag: /<\s*\/?\s*(antml:)?function_calls\b/i.test(s),
+    containsParameterTag: /<\s*(antml:)?parameter\b/i.test(s),
+    startsWithBrace: s.startsWith("{"),
+    balancedObjectCount: objects.length,
+    firstObjectKeys,
+    toolNameOnOwnLine,
+  };
 }
 
 // ── Response Builders ──
@@ -423,6 +499,8 @@ export function sseData(obj: unknown): string {
  * Map error to HTTP status code.
  */
 export function errorToHttpStatus(err: unknown): number {
+  if (err instanceof AgentError && err.code === "NATIVE_TOOL_CALL") return 502;
+  if (err instanceof AgentError && err.code === "TIMEOUT") return 504;
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   if (msg.includes("anthropic_api_key") || msg.includes("authentication") || msg.includes("not_authenticated") || msg.includes("not logged in")) {
     return 401;
@@ -443,6 +521,7 @@ export function openaiErrorBody(status: number, message: string): { error: { mes
     429: "rate_limit_error",
     402: "billing_error",
     502: "network_error",
+    504: "timeout_error",
   };
   return {
     error: {

@@ -5,11 +5,12 @@
 import type { ServerResponse } from "http";
 import crypto from "crypto";
 import { AgentError } from "../errors.js";
+import { EFFORT_LEVELS } from "../engine.js";
 import type { EngineOptions } from "../types.js";
 import type { ParsedRequest, ServerContext } from "./routes-native.js";
 import { apiSessions } from "./session-store.js";
 import type { CircuitBreaker } from "./circuit-breaker.js";
-import { log, logError } from "./logger.js";
+import { log, logError, logDiag } from "./logger.js";
 import { metrics } from "./metrics.js";
 import { getDefaultModel } from "./models.js";
 import { makeEngine } from "./engine-factory.js";
@@ -22,11 +23,65 @@ import {
   openaiErrorBody,
   buildToolInstruction,
   parseToolCalls,
+  describeToolCallIntent,
   toOpenAIToolCalls,
   CLAUDE_BUILTIN_TOOLS,
+  TOOL_CALL_REMINDER,
   type OpenAIChatRequest,
+  type ToolCallParseDiag,
 } from "./openai-compat.js";
-import { repairToolCalls, looksLikeToolCallEnvelope } from "./tool-call-repair.js";
+import { repairToolCalls, looksLikeToolCallIntent } from "./tool-call-repair.js";
+import { traceEnabled, traceWrite, traceDir } from "./trace.js";
+
+/** Abort reason used when the client hangs up before the response is complete. */
+const CLIENT_DISCONNECTED = "client_disconnected";
+
+/** OpenAI reasoning_effort values the Claude CLI has no level for, mapped to its lowest level. */
+const EFFORT_ALIASES = new Map<string, string>([["none", "low"], ["minimal", "low"]]);
+
+/**
+ * The TIMEOUT error behind a failure, if the failure was a timeout: either the
+ * engine threw one, or the request's signal was aborted with one as its reason.
+ */
+function timeoutOf(err: unknown, signal: AbortSignal): AgentError | null {
+  if (err instanceof AgentError && err.code === "TIMEOUT") return err;
+  const reason = signal.aborted ? signal.reason : undefined;
+  if (reason instanceof AgentError && reason.code === "TIMEOUT") return reason;
+  return null;
+}
+
+/**
+ * Answer a timed-out request: a 504 JSON error when nothing has been sent yet,
+ * otherwise an SSE error chunk (the caller then writes `[DONE]` and ends).
+ * Timeouts do not count against the circuit breaker: one oversized prompt must
+ * not block every other request.
+ */
+async function respondTimeout(
+  req: ParsedRequest,
+  res: ServerResponse,
+  startedAt: number,
+  timeout: AgentError,
+): Promise<void> {
+  const status = 504;
+  log("error", {
+    requestId: req.requestId || "",
+    message: "request_timeout",
+    status,
+    durationMs: Date.now() - startedAt,
+  });
+  metrics.record({
+    ts: Date.now(), endpoint: "chat", status,
+    durationMs: Date.now() - startedAt,
+    cost: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0,
+    error: "timeout",
+  });
+  if (!res.headersSent) {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(openaiErrorBody(status, timeout.message)));
+  } else {
+    await sseWrite(res, sseData({ error: { message: timeout.message, type: "timeout_error", code: status } }));
+  }
+}
 
 /**
  * Handle POST /v1/chat/completions
@@ -45,15 +100,34 @@ export async function handleChatCompletions(
     res.end(JSON.stringify(openaiErrorBody(400, "messages array is required")));
     return;
   }
+  let effort: string | undefined;
+  if (body.reasoning_effort !== undefined) {
+    const raw: unknown = body.reasoning_effort;
+    const mapped = typeof raw === "string" ? (EFFORT_ALIASES.get(raw) ?? raw) : undefined;
+    if (mapped === undefined || !EFFORT_LEVELS.includes(mapped)) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(openaiErrorBody(400, "reasoning_effort must be one of: " + [...EFFORT_ALIASES.keys(), ...EFFORT_LEVELS].join(", "))));
+      return;
+    }
+    effort = mapped;
+  }
 
   const { prompt, systemPrompt, isMultimodal } = openaiToClaudeInput(body);
   const model = body.model || getDefaultModel();
   const stream = body.stream === true;
 
   const abortController = new AbortController();
-  req.on("close", () => abortController.abort());
+  // A client that hangs up and a server deadline both cancel the run, and the
+  // abort reason tells them apart downstream. The response's "close" event,
+  // before the response has ended, is the reliable sign that the client left.
+  res.on("close", () => {
+    if (!res.writableEnded) abortController.abort(CLIENT_DISCONNECTED);
+  });
   if (req.timeoutSignal) {
-    req.timeoutSignal.addEventListener("abort", () => abortController.abort());
+    const deadline = req.timeoutSignal;
+    const onDeadline = () => abortController.abort(deadline.reason);
+    if (deadline.aborted) onDeadline();
+    else deadline.addEventListener("abort", onDeadline, { once: true });
   }
 
   const options: EngineOptions = {
@@ -61,19 +135,21 @@ export async function handleChatCompletions(
     permissionMode: "bypassPermissions",
     signal: abortController.signal,
     maxTurns: 1,        // a pure chat completion is one turn; even a leaked tool can't loop
+    traceId: req.requestId || "",
+    timeoutMs: req.timeoutMs,
   };
 
-  // Reasoning effort: honour an OpenAI-style `reasoning_effort` field if the
-  // client sends one; otherwise crank to maximum for the big reasoning models
-  // (Fable, Opus, Mythos), else default to medium.
-  const reqEffort = (body as unknown as Record<string, unknown>).reasoning_effort;
-  if (typeof reqEffort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(reqEffort)) {
-    options.effort = reqEffort as EngineOptions["effort"];
-  } else if (/fable|opus|mythos/i.test(model)) {
-    options.effort = "max";
-  } else {
-    options.effort = "medium";
+  if (traceEnabled()) {
+    traceWrite(req.requestId || "", "request.json", JSON.stringify(body, null, 2));
+    logDiag("info", {
+      requestId: req.requestId || "",
+      message: "trace_dir",
+      dir: traceDir(req.requestId || ""),
+    });
   }
+
+  // Default to medium effort when the client omits reasoning_effort.
+  options.effort = (effort ?? "medium") as EngineOptions["effort"];
 
   // Build system prompt: original + JSON mode injection
   let finalSystemPrompt = systemPrompt || "";
@@ -95,7 +171,10 @@ export async function handleChatCompletions(
   let enginePrompt = prompt;
   if (wantsTools) {
     const instruction = buildToolInstruction(body.tools!, body.tool_choice);
-    enginePrompt = `${instruction}\n\n=== USER REQUEST ===\n${prompt}`;
+    // The reminder is repeated after the user request because the instruction
+    // above it sits at the top of a prompt that can run to hundreds of thousands
+    // of characters, far from where the model actually starts generating.
+    enginePrompt = `${instruction}\n\n=== USER REQUEST ===\n${prompt}\n\n${TOOL_CALL_REMINDER}`;
     options.disallowedTools = CLAUDE_BUILTIN_TOOLS;
     options.clientToolCalls = true;
   } else {
@@ -137,7 +216,10 @@ export async function handleChatCompletions(
   }
 
   if (wantsTools) {
-    await handleFunctionCalling(req, res, enginePrompt, options, model, abortController, stream, circuitBreaker);
+    const toolNames = (body.tools || [])
+      .map((t) => t.function?.name)
+      .filter((n): n is string => typeof n === "string");
+    await handleFunctionCalling(req, res, enginePrompt, options, model, abortController, stream, toolNames, circuitBreaker);
     return;
   }
 
@@ -167,19 +249,37 @@ async function handleFunctionCalling(
   model: string,
   abortController: AbortController,
   stream: boolean,
+  toolNames: string[],
   circuitBreaker?: CircuitBreaker,
 ): Promise<void> {
   const engine = makeEngine();
   const startedAt = Date.now();
+  const requestId = req.requestId || "";
 
   try {
     const result = await engine.run(prompt, options);
-    if (abortController.signal.aborted) return;
+    // An aborted run may still return (with whatever it had). Hand it to the
+    // catch below, which answers a timeout and stays silent for a disconnect.
+    if (abortController.signal.aborted) throw new Error("Aborted");
     circuitBreaker?.onSuccess();
 
-    const parsed = parseToolCalls(result.text);
+    traceWrite(requestId, "engine-text.txt", result.text);
+
+    const diag: ToolCallParseDiag = {};
+    const parsed = parseToolCalls(result.text, diag);
     let toolCalls = parsed ? toOpenAIToolCalls(parsed) : null;
     let notice: string | undefined;
+
+    if (toolCalls) {
+      logDiag("info", {
+        requestId,
+        message: "tool_call_parsed",
+        format: diag.format || "",
+        objectsScanned: diag.objectsScanned ?? 0,
+        tools: toolCalls.map((tc) => tc.function.name),
+        textChars: result.text.length,
+      });
+    }
 
     if (!toolCalls) {
       // The parser found nothing. Before treating the reply as prose, try a
@@ -198,20 +298,35 @@ async function handleFunctionCalling(
           charsAltered: repaired.charsAltered,
           tools: repaired.calls.map((c) => c.name),
         });
-      } else if (looksLikeToolCallEnvelope(result.text)) {
-        // The model set out to call a tool and produced something we can neither
-        // parse nor safely repair. Returning the raw envelope as assistant text
-        // would end the client's agent loop silently, so fail loudly instead and
-        // let the client's own bounded retry re-sample the model.
+      } else if (looksLikeToolCallIntent(result.text, toolNames)) {
+        // The model set out to call a tool — either the JSON envelope this bridge
+        // asks for, or its own native <invoke name="..."> markup naming a tool the
+        // request offered — and produced something we can neither parse nor safely
+        // repair. Returning that as assistant text would end the client's agent
+        // loop silently, so fail loudly instead and let the client's own bounded
+        // retry re-sample the model.
         // Deliberately NOT circuitBreaker.onFailure(): the service is healthy;
         // the model output was not.
         const status = 502;
+        traceWrite(requestId, "unparseable-tool-call.txt", result.text);
+        // Terse line on the console: this is a genuine failure and should be
+        // visible without tracing turned on.
         log("error", {
-          requestId: req.requestId || "",
+          requestId,
           message: "tool_call_unparseable",
           status,
           textLength: result.text.length,
-          rawText: result.text.slice(0, 4000),
+        });
+        // The bytes themselves go to the trace file only.
+        logDiag("error", {
+          requestId,
+          message: "tool_call_unparseable_detail",
+          status,
+          textLength: result.text.length,
+          rawHead: result.text.slice(0, 4000),
+          rawTail: result.text.length > 4000 ? result.text.slice(-1000) : "",
+          intent: describeToolCallIntent(result.text, toolNames),
+          parseDiag: diag,
         });
         metrics.record({
           ts: Date.now(), endpoint: "chat", status,
@@ -226,14 +341,40 @@ async function handleFunctionCalling(
           res.writeHead(status, { "Content-Type": "application/json" });
           res.end(JSON.stringify(openaiErrorBody(
             status,
-            "The model emitted a tool call that could not be parsed or safely repaired. Nothing was executed.",
+            "The model requested a tool in a form Otterly could not parse into OpenAI tool_calls. Nothing was executed; re-send the request.",
           )));
         } else if (!res.writableEnded) {
           res.end();
         }
         return;
+      } else {
+        // No tool call was found and nothing looked like an envelope, so this
+        // reply is about to be returned to the client as ordinary prose. That is
+        // correct for a genuine text answer and catastrophic for a leaked tool
+        // call, and the two were previously indistinguishable in the log.
+        traceWrite(requestId, "unparsed-prose.txt", result.text);
+        logDiag("warn", {
+          requestId,
+          message: "tool_call_none_parsed",
+          textChars: result.text.length,
+          rawHead: result.text.slice(0, 4000),
+          rawTail: result.text.length > 4000 ? result.text.slice(-1000) : "",
+          intent: describeToolCallIntent(result.text, toolNames),
+          parseDiag: diag,
+          offeredTools: toolNames,
+        });
       }
     }
+
+    logDiag("info", {
+      requestId,
+      message: "fc_response",
+      stream,
+      toolCallCount: toolCalls?.length || 0,
+      textChars: result.text.length,
+      textHead: result.text.slice(0, 160),
+      textTail: result.text.slice(-160),
+    });
 
     metrics.record({
       ts: Date.now(), endpoint: "chat", status: 200,
@@ -276,6 +417,15 @@ async function handleFunctionCalling(
       res.end(JSON.stringify(response));
     }
   } catch (err) {
+    const timeout = timeoutOf(err, abortController.signal);
+    if (timeout) {
+      await respondTimeout(req, res, startedAt, timeout);
+      if (!res.writableEnded) {
+        await sseWrite(res, "data: [DONE]\n\n");
+        res.end();
+      }
+      return;
+    }
     const e = err instanceof Error ? err : new Error(String(err));
     if (e.name === "AbortError" || abortController.signal.aborted) return;
     const code = err instanceof AgentError ? err.code : undefined;
@@ -387,6 +537,7 @@ async function handleNonStreaming(
 
   try {
     const result = await engine.run(prompt, options);
+    if (abortController.signal.aborted) throw new Error("Aborted");
     circuitBreaker?.onSuccess();
     metrics.record({
       ts: Date.now(), endpoint: "chat", status: 200,
@@ -397,10 +548,23 @@ async function handleNonStreaming(
       toolCalls: result.tools?.length || 0,
     });
     if (result.tools) for (const t of result.tools) metrics.recordToolUse(t.tool);
+    traceWrite(req.requestId || "", "response-text.txt", result.text);
+    logDiag("info", {
+      requestId: req.requestId || "",
+      message: "response_text",
+      textChars: result.text.length,
+      textHead: result.text.slice(0, 160),
+      textTail: result.text.slice(-160),
+    });
     const response = claudeResultToOpenai(result.text, model, result.usage);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(response));
   } catch (err) {
+    const timeout = timeoutOf(err, abortController.signal);
+    if (timeout) {
+      await respondTimeout(req, res, startedAt, timeout);
+      return;
+    }
     const e = err instanceof Error ? err : new Error(String(err));
     if (e.name === "AbortError" || abortController.signal.aborted) return;
     const code = err instanceof AgentError ? err.code : undefined;
@@ -459,6 +623,11 @@ async function handleStreaming(
 
   const startedAt = Date.now();
   let toolCount = 0;
+  let textEventCount = 0;
+  let deltaEventCount = 0;
+  let suppressedTextChars = 0;
+  let resultEventChars = 0;
+  let sentContent = "";
   let lastResult: { cost: number; usage?: { input_tokens?: number; output_tokens?: number } } | null = null;
   try {
     for await (const event of engine.stream(prompt, options)) {
@@ -473,22 +642,43 @@ async function handleStreaming(
         metrics.recordToolUse(event.tool);
       } else if (event.type === "text_delta") {
         sawTextDelta = true;
+        deltaEventCount++;
+        sentContent += event.delta;
         await sseWrite(res, sseData(makeStreamChunk(completionId, { content: event.delta }, null, model)));
       } else if (event.type === "text") {
         // CLI mode emits a single `text` event with the full answer (vs SDK
         // streaming which emits text_delta). Relay it ONLY if we did not already
         // stream deltas — otherwise this is the SDK's terminal consolidated
         // block and relaying it would duplicate the whole response.
+        textEventCount++;
         if (event.text && !sawTextDelta) {
+          sentContent += event.text;
           await sseWrite(res, sseData(makeStreamChunk(completionId, { content: event.text }, null, model)));
+        } else if (event.text) {
+          suppressedTextChars += event.text.length;
         }
       } else if (event.type === "result") {
+        resultEventChars = event.text ? event.text.length : 0;
         lastResult = { cost: event.cost, usage: event.usage };
         // Don't re-emit result.text — text/text_delta already covered it for both paths.
         await sseWrite(res, sseData(makeStreamChunk(completionId, {}, "stop", model)));
       }
     }
+    if (abortController.signal.aborted) throw new Error("Aborted");
     circuitBreaker?.onSuccess();
+    traceWrite(req.requestId || "", "stream-sent.txt", sentContent);
+    logDiag("info", {
+      requestId: req.requestId || "",
+      message: "stream_summary",
+      sawTextDelta,
+      textEventCount,
+      deltaEventCount,
+      suppressedTextChars,
+      resultEventChars,
+      sentChars: sentContent.length,
+      sentHead: sentContent.slice(0, 160),
+      sentTail: sentContent.slice(-160),
+    });
     metrics.record({
       ts: Date.now(), endpoint: "chat", status: 200,
       durationMs: Date.now() - startedAt,
@@ -500,7 +690,10 @@ async function handleStreaming(
   } catch (err) {
     clearInterval(heartbeat);
     const e = err instanceof Error ? err : new Error(String(err));
-    if (e.name !== "AbortError" && !abortController.signal.aborted) {
+    const timeout = timeoutOf(err, abortController.signal);
+    if (timeout) {
+      await respondTimeout(req, res, startedAt, timeout);
+    } else if (e.name !== "AbortError" && !abortController.signal.aborted) {
       const code = err instanceof AgentError ? err.code : undefined;
       circuitBreaker?.onFailure(code);
       logError(req.requestId || "", e.message);
@@ -523,9 +716,19 @@ async function handleStreaming(
 
 /** Write to SSE response with backpressure support. */
 async function sseWrite(res: ServerResponse, data: string): Promise<void> {
-  if (res.writableEnded) return;
+  if (res.writableEnded || res.destroyed) return;
   const ok = res.write(data);
   if (!ok) {
-    await new Promise<void>((resolve) => res.once("drain", resolve));
+    // Wait for the socket to drain, but stop waiting if it closes first: a
+    // client that has gone away never drains, and the request would hang.
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        res.off("drain", done);
+        res.off("close", done);
+        resolve();
+      };
+      res.once("drain", done);
+      res.once("close", done);
+    });
   }
 }

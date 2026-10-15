@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { ClaudeEngine } from "../src/engine.js";
+import { ClaudeEngine, buildCLICommand } from "../src/engine.js";
 import { AgentError } from "../src/errors.js";
 
 // Mock the SDK resolution by mocking the dynamic import
@@ -379,5 +379,39 @@ describe("ClaudeEngine", () => {
       // Session was created with merged options — verified implicitly
       expect(session).toBeDefined();
     });
+  });
+});
+
+describe("Claude client-tool isolation", () => {
+  const result = { type: "result", subtype: "success", result: "OK" };
+  const native = { type: "assistant", message: { content: [{ type: "tool_use", id: "n1", name: "subagents---run_task", input: {} }] } };
+  function engine(messages: Record<string, unknown>[]) {
+    return new ClaudeEngine({}, async function* () { for (const message of messages) yield message; });
+  }
+  it("builds an isolated command with a turn limit", () => {
+    const cmd = buildCLICommand("claude", "hello", { maxTurns: 1 });
+    expect(cmd).toContain("--safe-mode");
+    expect(cmd).toContain("--strict-mcp-config");
+    expect(cmd).toContain(`--mcp-config '{"mcpServers":{}}'`);
+    expect(cmd).toContain("--tools ''");
+    expect(cmd).toContain("--max-turns 1");
+  });
+  it.each([0, -1, 1.5, "1"])("rejects invalid maxTurns %s", (maxTurns) => {
+    expect(() => buildCLICommand("claude", "", { maxTurns })).toThrow("maxTurns must be a positive safe integer");
+  });
+  it("rejects native calls even without tool results", async () => {
+    await expect(engine([native, result]).run("hello", { clientToolCalls: true })).rejects.toMatchObject({ code: "NATIVE_TOOL_CALL" });
+  });
+  it("rejects a nonempty native inventory", async () => {
+    await expect(engine([{ type: "system", subtype: "init", tools: ["mcp__claude_ai_Claude_Docs__read"] }, result]).run("hello", { clientToolCalls: true })).rejects.toMatchObject({ code: "NATIVE_TOOL_CALL" });
+  });
+  it("preserves the external JSON bridge", async () => {
+    const text = '{"tool_calls":[{"name":"example","arguments":{}}]}';
+    const value = await engine([{ type: "system", subtype: "init", tools: [] }, { ...result, result: text }]).run("hello", { clientToolCalls: true });
+    expect(value.text).toBe(text);
+  });
+  it("preserves non-client native event handling", async () => {
+    const value = await engine([native, result]).run("hello", { clientToolCalls: false });
+    expect(value.text).toBe("OK");
   });
 });

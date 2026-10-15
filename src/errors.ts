@@ -5,6 +5,8 @@ export type ErrorCode =
   | "NETWORK"
   | "ABORTED"
   | "SDK_NOT_FOUND"
+  | "NATIVE_TOOL_CALL"
+  | "TIMEOUT"
   | "UNKNOWN";
 
 export class AgentError extends Error {

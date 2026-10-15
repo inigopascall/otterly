@@ -46,6 +46,8 @@ export interface ParsedRequest extends IncomingMessage {
   requestId?: string;
   startTime?: number;
   timeoutSignal?: AbortSignal;
+  /** The deadline behind timeoutSignal, in ms. */
+  timeoutMs?: number;
 }
 
 /**

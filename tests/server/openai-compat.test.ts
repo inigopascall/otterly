@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { AgentError } from "../../src/errors.js";
 import {
   openaiToClaudeInput,
   claudeResultToOpenai,
@@ -124,6 +125,10 @@ describe("openai-compat", () => {
   });
 
   describe("errorToHttpStatus", () => {
+    it("maps native Claude tool calls to 502", () => {
+      expect(errorToHttpStatus(new AgentError("NATIVE_TOOL_CALL", "native tool call"))).toBe(502);
+    });
+
     it("maps auth errors to 401", () => {
       expect(errorToHttpStatus(new Error("ANTHROPIC_API_KEY not set"))).toBe(401);
       expect(errorToHttpStatus(new Error("authentication failed"))).toBe(401);

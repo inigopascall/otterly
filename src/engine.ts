@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from "child_process";
+import { execFileSync, spawn, type ChildProcess } from "child_process";
 import type {
   AgentEvent,
   AgentResult,
@@ -9,6 +9,8 @@ import { normalizeEvents, createEventContext } from "./events.js";
 import { classifyError, AgentError } from "./errors.js";
 import { wrapPermissionHandler } from "./permissions.js";
 import { Session } from "./session.js";
+import { log, logDiag } from "./server/logger.js";
+import { traceWrite, traceAppend, traceAppendRaw } from "./server/trace.js";
 
 type QueryFn = (args: { prompt: unknown; options: Record<string, unknown> }) => AsyncIterable<Record<string, unknown>>;
 
@@ -38,12 +40,18 @@ function findClaudeCLI(): string | null {
  * prompts such as those produced by IDEs/agents that include repo maps and
  * file context.
  */
-function buildCLICommand(cliBin: string, prompt: string, opts: Record<string, unknown>): string {
+export function buildCLICommand(cliBin: string, prompt: string, opts: Record<string, unknown>): string {
   // Prompt is fed via stdin; do not place it on the command line.
   void prompt;
   const parts = [cliBin, "-p", "--output-format", "stream-json", "--verbose"];
 
   if (opts.model) parts.push("--model", String(opts.model));
+  if (opts.effort !== undefined) {
+    if (!EFFORT_LEVELS.includes(String(opts.effort))) {
+      throw new Error(`effort must be one of ${EFFORT_LEVELS.join(", ")}`);
+    }
+    parts.push("--effort", String(opts.effort));
+  }
 
   // Always override Claude Code's default system prompt. Per `claude --help`,
   // the auto-injected "dynamic" sections (cwd, env info, memory paths, git
@@ -67,6 +75,13 @@ function buildCLICommand(cliBin: string, prompt: string, opts: Record<string, un
   // every tool call is visible to and controlled by that client rather than
   // happening invisibly inside the `claude` process.
   parts.push("--tools", "''");
+  parts.push("--safe-mode", "--strict-mcp-config", "--mcp-config", `'${JSON.stringify({ mcpServers: {} })}'`);
+  if (opts.maxTurns !== undefined) {
+    if (typeof opts.maxTurns !== "number" || !Number.isSafeInteger(opts.maxTurns) || opts.maxTurns <= 0) {
+      throw new Error("maxTurns must be a positive safe integer");
+    }
+    parts.push("--max-turns", String(opts.maxTurns));
+  }
   if (opts.resume) parts.push("--resume", String(opts.resume));
   if (opts.permissionMode) parts.push("--permission-mode", String(opts.permissionMode));
   if (opts.allowedTools) {
@@ -77,6 +92,84 @@ function buildCLICommand(cliBin: string, prompt: string, opts: Record<string, un
   }
 
   return parts.join(" ");
+}
+
+/** Default server-side hard cap for one Claude run, in ms. A backstop: a run
+ *  that has stopped producing output is caught much sooner by the idle limit. */
+export const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
+
+/** Default limit on silence from the Claude CLI, in ms. While the model thinks,
+ *  the CLI prints a thinking_tokens line about once a second, so two minutes
+ *  with no stdout at all means the run has stopped making progress. */
+export const DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 1000;
+
+/** How often a running Claude request reports its progress on the console. */
+export const PROGRESS_INTERVAL_MS = 30 * 1000;
+
+/** Effort levels the Claude CLI accepts for --effort. */
+export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+
+let configuredIdleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS;
+
+/** Set the silence limit for every Claude CLI run in this process. */
+export function setIdleTimeoutMs(ms: number | undefined): void {
+  configuredIdleTimeoutMs = typeof ms === "number" && ms > 0 ? ms : DEFAULT_IDLE_TIMEOUT_MS;
+}
+
+/** How far past the server deadline the CLI's own hard timer is set. The
+ * server's timer must fire first so the client is told about the timeout;
+ * this one only stops a child that nothing is waiting for. */
+export const CLI_BACKSTOP_MS = 60 * 1000;
+
+/** Why a CLI child was stopped before it finished on its own. */
+export type CliTerminationReason = "aborted" | "timeout" | "idle" | "killed";
+
+/**
+ * Rejection from spawnWithAbort when the child did not exit by itself. Carries
+ * whatever the child had printed, so the evidence survives the kill.
+ */
+export class CliTerminatedError extends Error {
+  reason: CliTerminationReason;
+  stdout: string;
+  stderr: string;
+  elapsedMs: number;
+
+  constructor(
+    reason: CliTerminationReason,
+    message: string,
+    detail: { stdout: string; stderr: string; elapsedMs: number },
+  ) {
+    super(message);
+    this.name = "CliTerminatedError";
+    this.reason = reason;
+    this.stdout = detail.stdout;
+    this.stderr = detail.stderr;
+    this.elapsedMs = detail.elapsedMs;
+  }
+}
+
+/** Every child spawned by spawnWithAbort that has not exited yet. */
+const liveChildren = new Set<ChildProcess>();
+
+/**
+ * Signal every live child's process group. Children are spawned detached, so a
+ * Ctrl+C in the server's terminal never reaches them; the server calls this on
+ * shutdown so they do not outlive it. Returns how many were signalled.
+ */
+export function killAllChildren(signal: NodeJS.Signals = "SIGTERM"): number {
+  let n = 0;
+  for (const child of liveChildren) {
+    const pid = child.pid;
+    if (!pid) continue;
+    try {
+      if (process.platform === "win32") child.kill(signal);
+      else process.kill(-pid, signal);
+      n++;
+    } catch {
+      // Already gone.
+    }
+  }
+  return n;
 }
 
 /**
@@ -112,10 +205,16 @@ export interface SpawnWithAbortOptions {
   abortController?: AbortController;
   /** Hard timeout in ms. Triggers the same kill ladder as abort. */
   timeoutMs: number;
+  /** Stop the child after this long with no stdout, in ms. Unset: no limit. */
+  idleTimeoutMs?: number;
   /** Grace period between SIGTERM and SIGKILL. Default 5s. */
   killGraceMs?: number;
   /** Data to write to the child's stdin (e.g. the prompt). */
   input?: string;
+  /** Called with each stdout chunk as it arrives. */
+  onStdout?: (chunk: Buffer) => void;
+  /** Called with each stderr chunk as it arrives. */
+  onStderr?: (chunk: Buffer) => void;
   /** Test-only injection hook. */
   spawnFn?: typeof spawn;
 }
@@ -151,14 +250,27 @@ export function spawnWithAbort(cmd: string | string[], opts: SpawnWithAbortOptio
       child.stdin.end();
     }
 
+    const startedAt = Date.now();
+    liveChildren.add(child);
+
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
-    child.stdout?.on("data", (c: Buffer) => stdoutChunks.push(c));
-    child.stderr?.on("data", (c: Buffer) => stderrChunks.push(c));
+    child.stdout?.on("data", (c: Buffer) => {
+      armIdle();
+      stdoutChunks.push(c);
+      try { opts.onStdout?.(c); } catch { /* observers must not break the run */ }
+    });
+    child.stderr?.on("data", (c: Buffer) => {
+      stderrChunks.push(c);
+      try { opts.onStderr?.(c); } catch { /* observers must not break the run */ }
+    });
 
     let aborted = false;
     let timedOut = false;
+    let idledOut = false;
+    let killing = false;
     let sigkillTimer: NodeJS.Timeout | null = null;
+    let idleTimer: NodeJS.Timeout | null = null;
 
     const killGroup = (signal: NodeJS.Signals) => {
       const pid = child.pid;
@@ -176,26 +288,47 @@ export function spawnWithAbort(cmd: string | string[], opts: SpawnWithAbortOptio
       }
     };
 
+    // The first reason to stop the child wins; later ones change nothing.
     const beginKillLadder = () => {
+      if (killing) return;
+      killing = true;
       killGroup("SIGTERM");
       sigkillTimer = setTimeout(() => killGroup("SIGKILL"), killGraceMs);
     };
 
     const hardTimer = setTimeout(() => {
+      if (killing) return;
       timedOut = true;
       beginKillLadder();
     }, opts.timeoutMs);
 
+    // Restarted by every stdout chunk: the child is stopped only after
+    // idleTimeoutMs with no output at all.
+    const armIdle = () => {
+      if (!opts.idleTimeoutMs || killing) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (killing) return;
+        idledOut = true;
+        beginKillLadder();
+      }, opts.idleTimeoutMs);
+    };
+    armIdle();
+
     const onAbort = () => {
+      if (killing) return;
       aborted = true;
       beginKillLadder();
     };
     opts.abortController?.signal.addEventListener("abort", onAbort, { once: true });
+    if (opts.abortController?.signal.aborted) onAbort();
 
     const cleanup = () => {
       clearTimeout(hardTimer);
+      if (idleTimer) clearTimeout(idleTimer);
       if (sigkillTimer) clearTimeout(sigkillTimer);
       opts.abortController?.signal.removeEventListener("abort", onAbort);
+      liveChildren.delete(child);
     };
 
     child.on("error", (err) => {
@@ -205,19 +338,35 @@ export function spawnWithAbort(cmd: string | string[], opts: SpawnWithAbortOptio
 
     // Resolve/reject only after the child has truly exited. This is the
     // contract that prevents queue-slot leaks.
-    child.on("exit", (code) => {
+    child.on("exit", (code, signal) => {
       cleanup();
-      const stderr = Buffer.concat(stderrChunks).toString("utf-8").trim();
+      const stdoutAll = Buffer.concat(stdoutChunks).toString("utf-8");
+      const stderrAll = Buffer.concat(stderrChunks).toString("utf-8");
+      const stderr = stderrAll.trim();
+      const detail = { stdout: stdoutAll, stderr: stderrAll, elapsedMs: Date.now() - startedAt };
       if (aborted) {
-        reject(new Error("Aborted"));
+        reject(new CliTerminatedError("aborted", "Aborted", detail));
       } else if (timedOut) {
-        reject(new Error(`CLI timed out after ${opts.timeoutMs}ms${stderr ? `: ${stderr.slice(-500)}` : ""}`));
+        reject(new CliTerminatedError(
+          "timeout",
+          `CLI timed out after ${opts.timeoutMs}ms${stderr ? `: ${stderr.slice(-500)}` : ""}`,
+          detail,
+        ));
+      } else if (idledOut) {
+        reject(new CliTerminatedError(
+          "idle",
+          `No output from the model for ${Math.round((opts.idleTimeoutMs || 0) / 1000)} s; the run was stopped.`,
+          detail,
+        ));
+      } else if (code === null && signal) {
+        // Killed from outside (e.g. server shutdown). Its output is incomplete,
+        // so it must not be passed off as a finished run.
+        reject(new CliTerminatedError("killed", `claude was killed by ${signal}`, detail));
       } else if (code !== null && code !== 0) {
-        const stdout = Buffer.concat(stdoutChunks).toString("utf-8").trim();
-        const detail = stderr || stdout;
-        reject(new Error(`claude exited ${code}${detail ? `: ${detail.slice(-1000)}` : ""}`));
+        const tail = stderr || stdoutAll.trim();
+        reject(new Error(`claude exited ${code}${tail ? `: ${tail.slice(-1000)}` : ""}`));
       } else {
-        resolve(Buffer.concat(stdoutChunks).toString("utf-8"));
+        resolve(stdoutAll);
       }
     });
   });
@@ -246,29 +395,192 @@ function createCLIQueryFn(cliBin: string): QueryFn {
     const prompt = typeof args.prompt === "string" ? args.prompt : JSON.stringify(args.prompt);
     const cmd = buildCLICommand(cliBin, prompt, opts);
 
+    const traceId = typeof opts.traceId === "string" ? opts.traceId : "";
+
     return {
       async *[Symbol.asyncIterator]() {
         const ac = opts.abortController as AbortController | undefined;
-        const timeoutMs = ac
-          ? 10 * 60 * 1000   // 10 min for streaming
-          : 5 * 60 * 1000;   // 5 min for one-shot
+        // The server's deadline (opts.timeoutMs) decides when a run is given up
+        // on. The CLI's own timer sits CLI_BACKSTOP_MS beyond it, so the server
+        // always reports the timeout first.
+        const serverTimeoutMs = typeof opts.timeoutMs === "number" && opts.timeoutMs > 0
+          ? opts.timeoutMs
+          : DEFAULT_TIMEOUT_MS;
+        const timeoutMs = serverTimeoutMs + CLI_BACKSTOP_MS;
 
-        const stdout = await spawnWithAbort(cmd, {
-          cwd: opts.cwd ? String(opts.cwd) : undefined,
-          abortController: ac,
-          timeoutMs,
-          input: prompt,
+        logDiag("info", {
+          requestId: traceId,
+          message: "cli_spawn",
+          model: opts.model ? String(opts.model) : "",
+          cwd: opts.cwd ? String(opts.cwd) : "",
+          promptChars: prompt.length,
+          systemPromptChars: opts.systemPrompt ? String(opts.systemPrompt).length : 0,
+          commandHead: cmd.slice(0, 2000),
         });
+        traceWrite(traceId, "prompt.txt", prompt);
+        traceWrite(traceId, "command.txt", cmd);
 
-        // Parse the NDJSON output line by line and yield each event
-        const lines = stdout.trim().split("\n");
+        // Record the CLI's output as it arrives, not only once it exits, so a
+        // run that is killed still leaves evidence of how far it got. Each line
+        // is timed: the longest silence between lines is what separates a
+        // stalled run from one that is merely slow.
+        const timing = { spawnedAt: Date.now(), lastAt: Date.now(), lines: 0, firstLineMs: -1, maxGapMs: 0, partial: "", thinkingTokens: 0 };
+        const onStdout = (chunk: Buffer) => {
+          timing.partial += chunk.toString("utf-8");
+          let nl: number;
+          while ((nl = timing.partial.indexOf("\n")) !== -1) {
+            const line = timing.partial.slice(0, nl);
+            timing.partial = timing.partial.slice(nl + 1);
+            if (!line.trim()) continue;
+            const now = Date.now();
+            const gap = now - timing.lastAt;
+            if (gap > timing.maxGapMs) timing.maxGapMs = gap;
+            if (timing.firstLineMs < 0) timing.firstLineMs = now - timing.spawnedAt;
+            timing.lastAt = now;
+            timing.lines++;
+            if (line.includes('"thinking_tokens"')) {
+              const t = /"estimated_tokens"\s*:\s*(\d+)/.exec(line);
+              if (t) timing.thinkingTokens = Math.max(timing.thinkingTokens, Number(t[1]));
+            }
+            const m = /"type"\s*:\s*"([^"]*)"/.exec(line.slice(0, 200));
+            traceAppend(traceId, "cli-stdout.live.ndjson", line);
+            traceAppend(traceId, "cli-timing.tsv", `${now - timing.spawnedAt}\t${gap}\t${line.length}\t${m ? m[1] : ""}`);
+          }
+        };
+        const onStderr = (chunk: Buffer) => traceAppendRaw(traceId, "cli-stderr.txt", chunk.toString("utf-8"));
+        const logTiming = (outcome: string) => {
+          const now = Date.now();
+          logDiag("info", {
+            requestId: traceId,
+            message: "cli_timing",
+            outcome,
+            totalMs: now - timing.spawnedAt,
+            lines: timing.lines,
+            peakThinkingTokens: timing.thinkingTokens,
+            firstLineMs: timing.firstLineMs,
+            maxGapMs: Math.max(timing.maxGapMs, now - timing.lastAt),
+            trailingSilenceMs: now - timing.lastAt,
+          });
+        };
+
+        const idleMs = typeof opts.idleTimeoutMs === "number" && opts.idleTimeoutMs > 0
+          ? opts.idleTimeoutMs
+          : configuredIdleTimeoutMs;
+
+        // One console line every PROGRESS_INTERVAL_MS while the run is going,
+        // so a long thinking turn is visibly alive.
+        const progress = setInterval(() => {
+          const now = Date.now();
+          log("info", {
+            requestId: traceId,
+            message: "cli_progress",
+            model: opts.model ? String(opts.model) : "",
+            elapsedS: Math.round((now - timing.spawnedAt) / 1000),
+            lines: timing.lines,
+            thinkingTokens: timing.thinkingTokens,
+            silentS: Math.round((now - timing.lastAt) / 1000),
+          });
+        }, PROGRESS_INTERVAL_MS);
+        progress.unref?.();
+
+        let stdout: string;
+        try {
+          stdout = await spawnWithAbort(cmd, {
+            cwd: opts.cwd ? String(opts.cwd) : undefined,
+            abortController: ac,
+            timeoutMs,
+            idleTimeoutMs: idleMs,
+            input: prompt,
+            onStdout,
+            onStderr,
+          });
+        } catch (err) {
+          if (err instanceof CliTerminatedError) {
+            logTiming(err.reason);
+            const types: Record<string, number> = {};
+            for (const line of err.stdout.split("\n")) {
+              const m = /"type"\s*:\s*"([^"]*)"/.exec(line.slice(0, 200));
+              if (m) types[m[1]] = (types[m[1]] || 0) + 1;
+            }
+            logDiag("warn", {
+              requestId: traceId,
+              message: "cli_terminated",
+              reason: err.reason,
+              elapsedMs: err.elapsedMs,
+              stdoutBytes: Buffer.byteLength(err.stdout),
+              stderrBytes: Buffer.byteLength(err.stderr),
+              typeCounts: types,
+              peakThinkingTokens: timing.thinkingTokens,
+              stderrTail: err.stderr.slice(-500),
+            });
+          } else {
+            logTiming("error");
+          }
+          throw err;
+        } finally {
+          clearInterval(progress);
+        }
+        logTiming("exited");
+
+        traceWrite(traceId, "cli-stdout.ndjson", stdout);
+
+        // Parse the whole NDJSON output up front so the summary below is always
+        // recorded, even when the consumer stops iterating early.
+        const lines = stdout.split("\n");
+        const parsed: Record<string, unknown>[] = [];
+        const typeCounts: Record<string, number> = {};
+        let skipped = 0;
+
         for (const line of lines) {
           if (!line.trim()) continue;
+          let obj: Record<string, unknown>;
           try {
-            yield JSON.parse(line);
+            obj = JSON.parse(line) as Record<string, unknown>;
           } catch {
-            // Skip non-JSON lines
+            // A line the CLI printed that is not JSON. Discarding it in silence
+            // is exactly how a missing chunk of an answer would vanish without
+            // trace, so record it.
+            skipped++;
+            logDiag("warn", {
+              requestId: traceId,
+              message: "cli_line_unparsed",
+              lineChars: line.length,
+              head: line.slice(0, 300),
+              tail: line.length > 300 ? line.slice(-300) : "",
+            });
+            continue;
           }
+
+          const t = typeof obj.type === "string" ? obj.type : "(no type)";
+          typeCounts[t] = (typeCounts[t] || 0) + 1;
+
+          if (t === "result") {
+            const r = obj.result;
+            logDiag("info", {
+              requestId: traceId,
+              message: "cli_result_line",
+              subtype: typeof obj.subtype === "string" ? obj.subtype : "",
+              resultChars: typeof r === "string" ? r.length : -1,
+              resultHead: typeof r === "string" ? r.slice(0, 200) : "",
+              resultTail: typeof r === "string" ? r.slice(-200) : "",
+            });
+          }
+
+          parsed.push(obj);
+        }
+
+        logDiag("info", {
+          requestId: traceId,
+          message: "cli_stdout",
+          bytes: Buffer.byteLength(stdout),
+          lines: lines.length,
+          parsedLines: parsed.length,
+          skippedLines: skipped,
+          typeCounts,
+        });
+
+        for (const obj of parsed) {
+          yield obj;
         }
       },
     };
@@ -332,10 +644,14 @@ export class ClaudeEngine {
    * ```
    */
   async run(prompt: string, options?: EngineOptions): Promise<AgentResult> {
+    const traceId = this.mergeOptions(options).traceId || "";
     const tools: ToolExecution[] = [];
     let resultText = "";
+    let resultEventText = "";
     let textFromBlocks = "";
     let textFromDeltas = "";
+    let blockCount = 0;
+    let deltaCount = 0;
     let cost = 0;
     let duration = 0;
     let sessionId = "";
@@ -345,9 +661,11 @@ export class ClaudeEngine {
     for await (const event of this.stream(prompt, options)) {
       switch (event.type) {
         case "text":
+          blockCount++;
           textFromBlocks += event.text;
           break;
         case "text_delta":
+          deltaCount++;
           textFromDeltas += event.delta;
           break;
         case "tool_use":
@@ -365,6 +683,7 @@ export class ClaudeEngine {
           break;
         }
         case "result":
+          resultEventText = event.text || resultEventText;
           resultText = event.text || resultText;
           cost = event.cost;
           duration = event.duration;
@@ -378,9 +697,39 @@ export class ClaudeEngine {
       }
     }
 
+    const chosenSource = resultText
+      ? "result-event"
+      : textFromDeltas
+        ? "text-deltas"
+        : textFromBlocks
+          ? "text-blocks"
+          : "empty";
+
     if (!resultText) {
       resultText = textFromDeltas || textFromBlocks || "";
     }
+
+    // Shows what each candidate source held, which one was used, and how each
+    // one began — so a truncated answer can be attributed to a stage.
+    logDiag("info", {
+      requestId: traceId,
+      message: "run_text_sources",
+      chosenSource,
+      resultEventChars: resultEventText.length,
+      blocksChars: textFromBlocks.length,
+      deltasChars: textFromDeltas.length,
+      blockCount,
+      deltaCount,
+      finalChars: resultText.length,
+      resultEventHead: resultEventText.slice(0, 160),
+      blocksHead: textFromBlocks.slice(0, 160),
+      deltasHead: textFromDeltas.slice(0, 160),
+      finalTail: resultText.slice(-160),
+    });
+    traceWrite(traceId, "run-result-event.txt", resultEventText);
+    traceWrite(traceId, "run-text-blocks.txt", textFromBlocks);
+    traceWrite(traceId, "run-text-deltas.txt", textFromDeltas);
+    traceWrite(traceId, "run-final.txt", resultText);
 
     return { text: resultText, cost, duration, sessionId, usage, tools };
   }
@@ -401,7 +750,11 @@ export class ClaudeEngine {
 
     const abortController = new AbortController();
     if (opts.signal) {
-      opts.signal.addEventListener("abort", () => abortController.abort());
+      // Carry the caller's reason through: a TIMEOUT AgentError must surface as
+      // an error, while a client disconnect ends the stream quietly.
+      const signal = opts.signal;
+      if (signal.aborted) abortController.abort(signal.reason);
+      else signal.addEventListener("abort", () => abortController.abort(signal.reason), { once: true });
     }
 
     const queryOptions: Record<string, unknown> = {
@@ -416,12 +769,14 @@ export class ClaudeEngine {
     };
 
     if (opts.model) queryOptions.model = opts.model;
-    if (opts.maxTurns) queryOptions.maxTurns = opts.maxTurns;
+    if (opts.maxTurns !== undefined) queryOptions.maxTurns = opts.maxTurns;
     if (opts.allowedTools) queryOptions.allowedTools = opts.allowedTools;
     if (opts.disallowedTools) queryOptions.disallowedTools = opts.disallowedTools;
     if (opts.mcpServers) queryOptions.mcpServers = opts.mcpServers;
     if (opts.effort) queryOptions.effort = opts.effort;
     if (opts.resume) queryOptions.resume = opts.resume;
+    if (opts.traceId) queryOptions.traceId = opts.traceId;
+    if (opts.timeoutMs !== undefined) queryOptions.timeoutMs = opts.timeoutMs;
 
     // The SDK option is `customSystemPrompt` (see @anthropic-ai/claude-code
     // sdk.d.ts), NOT `systemPrompt` — passing the latter is silently ignored,
@@ -454,7 +809,46 @@ export class ClaudeEngine {
       const queryInstance = queryFn({ prompt, options: queryOptions });
 
       for await (const raw of queryInstance) {
-        if (abortController.signal.aborted) break;
+        const rawType = raw.type;
+        if (opts.clientToolCalls && rawType === "system" && raw.subtype === "init") {
+          const tools = Array.isArray(raw.tools) ? raw.tools : [];
+          if (tools.length > 0) {
+            logDiag("error", {
+              requestId: opts.traceId || "",
+              message: "native_tool_inventory_detected",
+              tools: tools.filter((tool): tool is string => typeof tool === "string"),
+            });
+            abortController.abort();
+            throw new AgentError(
+              "NATIVE_TOOL_CALL",
+              "Claude emitted a native tool call instead of an external-client tool request. The response was rejected; execution status must be checked in the trace."
+            );
+          }
+        }
+        if (opts.clientToolCalls && rawType === "assistant") {
+          const content = raw.message && typeof raw.message === "object" && Array.isArray((raw.message as Record<string, unknown>).content)
+            ? (raw.message as Record<string, unknown>).content as unknown[]
+            : [];
+          const toolUses = content.filter((item): item is Record<string, unknown> =>
+            !!item && typeof item === "object" && (item as Record<string, unknown>).type === "tool_use"
+          );
+          if (toolUses.length > 0) {
+            logDiag("error", {
+              requestId: opts.traceId || "",
+              message: "native_tool_call_blocked",
+              tools: toolUses.map((tool) => typeof tool.name === "string" ? tool.name : ""),
+            });
+            abortController.abort();
+            throw new AgentError(
+              "NATIVE_TOOL_CALL",
+              "Claude emitted a native tool call instead of an external-client tool request. The response was rejected; execution status must be checked in the trace."
+            );
+          }
+        }
+        if (abortController.signal.aborted) {
+          // The catch below rethrows a timeout and ends quietly for a disconnect.
+          throw new Error("Aborted");
+        }
 
         const events = normalizeEvents(raw as Record<string, unknown>, ctx);
         for (const event of events) {
@@ -462,6 +856,16 @@ export class ClaudeEngine {
         }
       }
     } catch (err) {
+      if (err instanceof AgentError && err.code === "NATIVE_TOOL_CALL") {
+        throw err;
+      }
+      const reason = abortController.signal.reason;
+      if (abortController.signal.aborted && reason instanceof AgentError && reason.code === "TIMEOUT") {
+        throw reason;
+      }
+      if (err instanceof CliTerminatedError && (err.reason === "timeout" || err.reason === "idle")) {
+        throw new AgentError("TIMEOUT", err.message, err);
+      }
       if (
         err instanceof Error &&
         (err.name === "AbortError" || abortController.signal.aborted)
