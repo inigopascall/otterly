@@ -659,7 +659,7 @@ function createCLIQueryFn(cliBin: string): QueryFn {
         } finally {
           clearInterval(progress);
           logTiming(outcome);
-          traceWrite(traceId, "cli-stdout.ndjson", received.length ? received.join("\n") + "\n" : "");
+
           logDiag("info", {
             requestId: traceId,
             message: "cli_stdout",
@@ -952,6 +952,22 @@ export class ClaudeEngine {
               "Claude emitted a native tool call instead of an external-client tool request. The response was rejected; execution status must be checked in the trace."
             );
           }
+        }
+        // An API failure (overload, rate limit, safeguard refusal) arrives as a
+        // result line with is_error set, before the CLI exits non-zero. Its
+        // `result` text is the clean explanation; surface that, not the exit.
+        if (rawType === "result" && raw.is_error === true) {
+          const apiStatus = typeof raw.api_error_status === "number" ? raw.api_error_status : null;
+          const text = typeof raw.result === "string" && raw.result ? raw.result : `Claude stopped: ${String(raw.subtype)}`;
+          log("error", {
+            requestId: opts.traceId || "",
+            message: "cli_api_error",
+            apiErrorStatus: apiStatus,
+            terminalReason: typeof raw.terminal_reason === "string" ? raw.terminal_reason : "",
+            text: text.slice(0, 500),
+          });
+          abortController.abort();
+          throw classifyError(new Error(apiStatus ? `Claude API error ${apiStatus}: ${text}` : text));
         }
         if (abortController.signal.aborted) {
           // The catch below rethrows a timeout and ends quietly for a disconnect.

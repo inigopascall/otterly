@@ -6,6 +6,7 @@
 import type { ServerResponse } from "http";
 import crypto from "crypto";
 import { makeStreamChunk, sseData, type OpenAIStreamDelta, type OpenAIUsage } from "./openai-compat.js";
+import { traceAppend } from "./trace.js";
 
 /** A keepalive comment is sent after this long without any other write. */
 export const KEEPALIVE_MS = 5000;
@@ -36,10 +37,11 @@ export class SseStream {
   /** Reasoning text sent so far. */
   sentReasoning = "";
   private lastWriteAt = Date.now();
+  private readonly openedAt = Date.now();
   private readonly keepalive: NodeJS.Timeout;
 
-  /** Sends the response headers at once. */
-  constructor(readonly response: ServerResponse, private readonly model: string) {
+  /** Sends the response headers at once. `traceId` names the request's trace directory, for sse-out.tsv. */
+  constructor(readonly response: ServerResponse, private readonly model: string, private readonly traceId = "") {
     response.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
@@ -56,9 +58,22 @@ export class SseStream {
     this.keepalive.unref?.();
   }
 
+  /** One row in sse-out.tsv: ms since the stream opened, kind, bytes. */
+  private record(kind: string, bytes: number): void {
+    traceAppend(this.traceId, "sse-out.tsv", `${Date.now() - this.openedAt}\t${kind}\t${bytes}`);
+  }
+
   private async send(delta: OpenAIStreamDelta, finishReason: string | null = null, usage?: OpenAIUsage): Promise<void> {
     this.lastWriteAt = Date.now();
-    await sseWrite(this.response, sseData(makeStreamChunk(this.id, delta, finishReason, this.model, usage)));
+    const data = sseData(makeStreamChunk(this.id, delta, finishReason, this.model, usage));
+    const kind = finishReason ? `finish:${finishReason}`
+      : delta.reasoning_content !== undefined ? "reasoning"
+      : delta.content !== undefined ? "content"
+      : delta.tool_calls ? (delta.tool_calls[0]?.function?.name ? "tool_start" : "tool_args")
+      : delta.role ? "start"
+      : "other";
+    this.record(kind, Buffer.byteLength(data));
+    await sseWrite(this.response, data);
   }
 
   /** The opening chunk, carrying the role. */
@@ -97,7 +112,9 @@ export class SseStream {
 
   /** An in-stream error, then `[DONE]`. Clients stop on it; they do not retry. */
   async fail(message: string, type: string, code: number): Promise<void> {
-    await sseWrite(this.response, sseData({ error: { message, type, code } }));
+    const data = sseData({ error: { message, type, code } });
+    this.record(`error:${code}`, Buffer.byteLength(data));
+    await sseWrite(this.response, data);
     await this.done();
   }
 
@@ -115,6 +132,8 @@ export class SseStream {
    */
   drop(): void {
     this.close();
+    this.record("drop", 0);
+    (this.response as ServerResponse & { otterlyDropped?: boolean }).otterlyDropped = true;
     this.response.destroy();
   }
 

@@ -336,7 +336,7 @@ containing:
 | `request.json` | The OpenAI request body as received |
 | `command.txt` | The exact `claude` command line |
 | `prompt.txt` | The exact bytes written to the CLI's stdin |
-| `cli-stdout.ndjson` | The CLI's raw stdout, unmodified |
+
 | `run-result-event.txt` | Text carried by the `result` line |
 | `run-text-blocks.txt` | Concatenation of every assistant text block |
 | `run-text-deltas.txt` | Concatenation of every streamed delta |
@@ -346,6 +346,7 @@ containing:
 | `unparseable-tool-call.txt` | A reply that failed with 502, or whose stream was dropped |
 | `stream-sent.txt` | The reply text written to the SSE stream |
 | `stream-reasoning.txt` | The reasoning text written to the SSE stream |
+| `sse-out.tsv` | One row per SSE chunk sent: ms since the stream opened, kind (`start`, `reasoning`, `content`, `tool_start`, `tool_args`, `finish:<reason>`, `error:<code>`, `drop`), bytes |
 | `response-text.txt` | Exactly what was returned non-streamed |
 | `cli-stdout.live.ndjson` | The CLI's stdout lines as they arrived; present even when the run was killed |
 | `cli-stderr.txt` | The CLI's stderr as it arrived |
@@ -370,13 +371,22 @@ Log messages worth grepping: `run_text_sources`, `cli_spawn`, `cli_stdout`,
 `native_tool_inventory_detected`, `stream_summary`, `fc_response`,
 `response_text`, `cli_timing`, `cli_terminated`, `request_timeout`,
 `response_unsettled`, `cli_progress`, `stream_dropped_for_retry`,
-`tool_call_repaired`.
+`tool_call_repaired`, `request_fingerprint`, `cli_api_error`.
+
+`request_fingerprint` and `stream_dropped_for_retry` carry the same 12-character
+`fingerprint` for a request and its retries; `request_fingerprint` also carries
+the `attempt` number. `cli_api_error` records an API failure reported by the
+CLI (overload, rate limit, safeguard refusal) with its `apiErrorStatus` and the
+CLI's own explanation, which is also what the client receives.
 
 `tool_call_unparseable` is the terse console line for a 502; the bytes that
 caused it are in `tool_call_unparseable_detail` and in
 `unparseable-tool-call.txt`.
 
-Traces are never pruned. Delete the directory when you are done with it.
+At startup and then hourly, trace directories older than 7 days are deleted;
+`OTTERLY_TRACE_RETENTION_DAYS` overrides the number of days. `otterly.log` is
+rotated to `otterly.log.1` when it reaches 50 MB, keeping three old files
+(`pruneTraces` and `rotateLogIfNeeded` in `server/trace.ts`).
 
 ## 13. Timeouts and progress
 
@@ -411,8 +421,9 @@ console: `elapsedS`, `lines`, `thinkingTokens`, and `silentS` (seconds since the
 CLI last printed anything).
 
 `request_end` always carries an `outcome`: `ok`, `timeout`,
-`client_disconnected` or `error`. A request whose client hung up is logged with
-status 499. If a handler returns without answering, `settleResponse` in
+`client_disconnected`, `dropped_for_retry` or `error`. A request whose client
+hung up is logged with status 499; a stream Otterly dropped so the client
+retries (§15) is logged as `dropped_for_retry` with status 502. If a handler returns without answering, `settleResponse` in
 `server/settle.ts` answers for it (504 after a timeout, otherwise 500) and the
 console shows `response_unsettled`.
 
@@ -512,4 +523,13 @@ grep -F -c 'export const RETRY_NOTICE_TTL_MS = 10 * 60 * 1000;' src/server/retry
 grep -F -c 'the previous attempt' src/server/retry-notice.ts                     # 1
 grep -F -c '"stream_dropped_for_retry"' src/server/routes-openai.ts              # 1
 grep -F -c 'err.code === "NATIVE_TOOL_CALL"' src/server/routes-openai.ts         # 1
+grep -F -c 'export const DEFAULT_TRACE_RETENTION_DAYS = 7;' src/server/trace.ts   # 1
+grep -F -c 'export const LOG_ROTATE_BYTES = 50 * 1024 * 1024;' src/server/trace.ts # 1
+grep -F -c 'OTTERLY_TRACE_RETENTION_DAYS' src/server/trace.ts                     # 2
+grep -F -c 'startTraceRetention();' src/server/index.ts                          # 1
+grep -F -c 'cli-stdout.ndjson' src/engine.ts                                     # 0
+grep -F -c '"sse-out.tsv"' src/server/sse-stream.ts                              # 1
+grep -F -c '"dropped_for_retry"' src/server/settle.ts                            # 2
+grep -F -c '"request_fingerprint"' src/server/routes-openai.ts                   # 1
+grep -F -c '"cli_api_error"' src/engine.ts                                       # 1
 ```

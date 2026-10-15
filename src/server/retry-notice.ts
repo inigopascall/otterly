@@ -57,6 +57,11 @@ export function retryNotice(fingerprint: string, now = Date.now()): string | nul
   return `⚠️ Otterly: the previous attempt ${record.reason}, so the request was retried (attempt ${record.drops + 1}).\n\n`;
 }
 
+/** How many times this request has been dropped recently (0 if never). */
+export function dropCount(fingerprint: string, now = Date.now()): number {
+  return fresh(fingerprint, now)?.drops ?? 0;
+}
+
 /** Forget a request once a response to it has completed. */
 export function clearDrop(fingerprint: string): void {
   records.delete(fingerprint);

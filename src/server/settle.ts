@@ -7,7 +7,7 @@
 import type { ServerResponse } from "http";
 import { openaiErrorBody, sseData } from "./openai-compat.js";
 
-export type RequestOutcome = "ok" | "timeout" | "client_disconnected" | "error";
+export type RequestOutcome = "ok" | "timeout" | "client_disconnected" | "dropped_for_retry" | "error";
 
 /**
  * End `res` if the handler left it open, and classify how the request ended.
@@ -22,7 +22,12 @@ export type RequestOutcome = "ok" | "timeout" | "client_disconnected" | "error";
  */
 export function settleResponse(res: ServerResponse, timedOut: boolean, isOpenai: boolean, sse = false): RequestOutcome {
   if (!res.writableEnded) {
-    if (res.destroyed) return "client_disconnected";
+    // SseStream.drop() marks a connection Otterly cut on purpose so the client retries.
+    if (res.destroyed) {
+      return (res as ServerResponse & { otterlyDropped?: boolean }).otterlyDropped
+        ? "dropped_for_retry"
+        : "client_disconnected";
+    }
     const status = timedOut ? 504 : 500;
     const message = timedOut
       ? "No response from the model within the time limit."

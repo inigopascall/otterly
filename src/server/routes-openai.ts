@@ -35,7 +35,7 @@ import { repairToolCalls, looksLikeToolCallIntent } from "./tool-call-repair.js"
 import { traceEnabled, traceWrite, traceDir } from "./trace.js";
 import { SseStream, sseWrite } from "./sse-stream.js";
 import { ToolCallStreamer, reconcileStreamedCalls, type StreamAction } from "./tool-call-stream.js";
-import { requestFingerprint, recordDrop, retryNotice, clearDrop } from "./retry-notice.js";
+import { requestFingerprint, recordDrop, retryNotice, clearDrop, dropCount } from "./retry-notice.js";
 
 /** Abort reason used when the client hangs up before the response is complete. */
 const CLIENT_DISCONNECTED = "client_disconnected";
@@ -154,6 +154,7 @@ function dropForRetry(
     requestId: req.requestId || "",
     message: "stream_dropped_for_retry",
     reason,
+    fingerprint: fingerprint.slice(0, 12),
     durationMs: Date.now() - startedAt,
     ...detail,
   });
@@ -237,6 +238,13 @@ export async function handleChatCompletions(
   const model = body.model || getDefaultModel();
   const stream = body.stream === true;
   const fingerprint = requestFingerprint(body);
+  // Links a retry to the attempt it repeats: both carry the same fingerprint.
+  log("info", {
+    requestId: req.requestId || "",
+    message: "request_fingerprint",
+    fingerprint: fingerprint.slice(0, 12),
+    attempt: dropCount(fingerprint) + 1,
+  });
 
   const abortController = new AbortController();
   // A client that hangs up and a server deadline both cancel the run, and the
@@ -568,7 +576,7 @@ async function handleFunctionCallingStream(
   const engine = makeEngine();
   const requestId = req.requestId || "";
   const startedAt = Date.now();
-  const out = new SseStream(res, model);
+  const out = new SseStream(res, model, requestId);
   await out.start();
   await out.thinking(retryNotice(fingerprint) ?? "");
 
@@ -876,7 +884,7 @@ async function handleStreaming(
   const engine = makeEngine();
   const requestId = req.requestId || "";
   const startedAt = Date.now();
-  const out = new SseStream(res, model);
+  const out = new SseStream(res, model, requestId);
   await out.start();
   await out.thinking(retryNotice(fingerprint) ?? "");
 

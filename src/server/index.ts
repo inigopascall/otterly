@@ -25,6 +25,7 @@ import { RequestQueue, QueueFullError, QueueTimeoutError } from "./request-queue
 import { checkAuth, RateLimiter, sendAuthError, sendRateLimitError } from "./middleware.js";
 import { generateRequestId, logRequest, logResponse, logError, log } from "./logger.js";
 import { settleResponse } from "./settle.js";
+import { startTraceRetention } from "./trace.js";
 import { AgentError } from "../errors.js";
 import { DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, setIdleTimeoutMs } from "../engine.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
@@ -140,6 +141,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
   const streamTimeoutMs = opts.streamTimeoutMs ?? DEFAULT_TIMEOUT_MS;
   const idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
   setIdleTimeoutMs(idleTimeoutMs);
+  startTraceRetention();
 
   const ctx: ServerContext = { workingDir, apiKey };
   const queue = new RequestQueue({
@@ -337,7 +339,9 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
           }
           const outcome = settleResponse(res, timedOut, isOpenai, isOpenai && isStream);
           // A client that hung up never received a status; 499 says so.
-          const endStatus = outcome === "client_disconnected" ? 499 : res.statusCode || 200;
+          const endStatus = outcome === "client_disconnected" ? 499
+            : outcome === "dropped_for_retry" ? 502
+            : res.statusCode || 200;
           logResponse(requestId, req.method!, path, endStatus, Date.now() - startTime, outcome);
           if (inFlight === 0 && drainResolve) drainResolve();
         }
