@@ -1,4 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from "child_process";
+import { StringDecoder } from "string_decoder";
 import type {
   AgentEvent,
   AgentResult,
@@ -21,6 +22,9 @@ let resolvedMode: "sdk" | "cli" | null = null;
  * Find the `claude` CLI binary. Returns the name or null.
  */
 function findClaudeCLI(): string | null {
+  // Set by the test configuration so that no test ever spawns a real `claude`
+  // binary, whatever is on PATH; the npm SDK (mocked in tests) is used instead.
+  if (process.env.OTTERLY_DISABLE_CLAUDE_CLI === "1") return null;
   for (const bin of ["claude", "claude-code"]) {
     try {
       execFileSync("which", [bin], { stdio: "pipe" });
@@ -44,6 +48,12 @@ export function buildCLICommand(cliBin: string, prompt: string, opts: Record<str
   // Prompt is fed via stdin; do not place it on the command line.
   void prompt;
   const parts = [cliBin, "-p", "--output-format", "stream-json", "--verbose"];
+
+  // Stream the run as it happens: the model's thinking (as readable summaries)
+  // and its reply arrive as stream_event lines while they are generated, not
+  // in one block at the end. A healthy run therefore never goes quiet for
+  // long, which the idle limit relies on.
+  parts.push("--include-partial-messages", "--thinking-display", "summarized");
 
   if (opts.model) parts.push("--model", String(opts.model));
   if (opts.effort !== undefined) {
@@ -98,9 +108,9 @@ export function buildCLICommand(cliBin: string, prompt: string, opts: Record<str
  *  that has stopped producing output is caught much sooner by the idle limit. */
 export const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
 
-/** Default limit on silence from the Claude CLI, in ms. While the model thinks,
- *  the CLI prints a thinking_tokens line about once a second, so two minutes
- *  with no stdout at all means the run has stopped making progress. */
+/** Default limit on silence from the Claude CLI, in ms. The CLI prints the
+ *  model's thinking and its reply as they are generated, so two minutes with
+ *  no stdout at all means the run has stopped making progress. */
 export const DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 1000;
 
 /** How often a running Claude request reports its progress on the console. */
@@ -114,6 +124,11 @@ let configuredIdleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS;
 /** Set the silence limit for every Claude CLI run in this process. */
 export function setIdleTimeoutMs(ms: number | undefined): void {
   configuredIdleTimeoutMs = typeof ms === "number" && ms > 0 ? ms : DEFAULT_IDLE_TIMEOUT_MS;
+}
+
+/** The silence limit in force for Claude CLI runs, in ms. */
+export function getIdleTimeoutMs(): number {
+  return configuredIdleTimeoutMs;
 }
 
 /** How far past the server deadline the CLI's own hard timer is set. The
@@ -373,18 +388,108 @@ export function spawnWithAbort(cmd: string | string[], opts: SpawnWithAbortOptio
 }
 
 /**
- * Build a QueryFn that runs `claude -p` via a cancellable subprocess.
+ * Spawn a command and yield its stdout one line at a time, as each line
+ * arrives. Blank lines are skipped. The generator ends when the child exits;
+ * if spawnWithAbort would have rejected, it throws the same error after
+ * yielding every line read before the failure.
  *
- * Historical context: an earlier version of this file ran `execSync` inside a
- * worker thread because the Bun-compiled `claude` binary appeared not to pipe
- * stdout to async `spawn`/`exec`. That implementation leaked worker slots —
- * calling `worker.terminate()` on abort killed the worker but orphaned the
- * underlying `claude` subprocess, which kept holding the request queue slot
- * until it exited on its own (sometimes never, for hung interactive prompts).
- *
- * This implementation uses `spawn` through `sh -c '<cmd>'`, which preserves
- * the shell-piping path that worked for execSync while making the child
- * killable on abort. See `spawnWithAbort` for the signal handling.
+ * `onLine` sees each line the moment it is read, before the consumer does, so
+ * timing measured there is arrival time. If the consumer stops early, the
+ * child is stopped, and the generator returns only once it has exited.
+ */
+export async function* streamLines(
+  cmd: string | string[],
+  opts: SpawnWithAbortOptions & { onLine?: (line: string) => void },
+): AsyncGenerator<string> {
+  const { onLine, onStdout, abortController: outer, ...spawnOpts } = opts;
+  const decoder = new StringDecoder("utf8");
+  let queue: string[] = [];
+  let head = 0;
+  let partial = "";
+  let finished = false;
+  let failed = false;
+  let failure: unknown = null;
+  let wake: (() => void) | null = null;
+
+  const notify = () => {
+    const w = wake;
+    wake = null;
+    if (w) w();
+  };
+  const accept = (line: string) => {
+    if (!line.trim()) return;
+    try { onLine?.(line); } catch { /* observers must not break the run */ }
+    queue.push(line);
+  };
+  const take = (text: string) => {
+    partial += text;
+    let nl: number;
+    while ((nl = partial.indexOf("\n")) !== -1) {
+      accept(partial.slice(0, nl));
+      partial = partial.slice(nl + 1);
+    }
+  };
+
+  // The child gets its own controller, which follows the caller's, so that a
+  // consumer that stops early can stop the child as well.
+  const ac = new AbortController();
+  const follow = () => ac.abort();
+  if (outer) {
+    if (outer.signal.aborted) follow();
+    else outer.signal.addEventListener("abort", follow, { once: true });
+  }
+
+  const exited = spawnWithAbort(cmd, {
+    ...spawnOpts,
+    abortController: ac,
+    onStdout: (chunk: Buffer) => {
+      try { onStdout?.(chunk); } catch { /* observers must not break the run */ }
+      take(decoder.write(chunk));
+      notify();
+    },
+  }).then(
+    () => {
+      take(decoder.end());
+      accept(partial);
+      partial = "";
+      finished = true;
+      notify();
+    },
+    (err: unknown) => {
+      failed = true;
+      failure = err;
+      finished = true;
+      notify();
+    },
+  );
+
+  try {
+    while (true) {
+      if (head < queue.length) {
+        const line = queue[head++];
+        if (head > 1024 && head * 2 > queue.length) {
+          queue = queue.slice(head);
+          head = 0;
+        }
+        yield line;
+        continue;
+      }
+      if (finished) break;
+      await new Promise<void>((resolve) => { wake = () => resolve(); });
+    }
+    if (failed) throw failure;
+  } finally {
+    outer?.signal.removeEventListener("abort", follow);
+    if (!finished) {
+      ac.abort();
+      await exited;
+    }
+  }
+}
+
+/**
+ * Build a QueryFn that runs `claude -p` as a cancellable subprocess and yields
+ * each NDJSON line of its output, parsed, as soon as the CLI prints it.
  *
  * The prompt is fed to claude via stdin (not argv) so that large prompts do
  * not exceed the OS ARG_MAX limit (E2BIG).
@@ -420,32 +525,25 @@ function createCLIQueryFn(cliBin: string): QueryFn {
         traceWrite(traceId, "prompt.txt", prompt);
         traceWrite(traceId, "command.txt", cmd);
 
-        // Record the CLI's output as it arrives, not only once it exits, so a
-        // run that is killed still leaves evidence of how far it got. Each line
-        // is timed: the longest silence between lines is what separates a
-        // stalled run from one that is merely slow.
-        const timing = { spawnedAt: Date.now(), lastAt: Date.now(), lines: 0, firstLineMs: -1, maxGapMs: 0, partial: "", thinkingTokens: 0 };
-        const onStdout = (chunk: Buffer) => {
-          timing.partial += chunk.toString("utf-8");
-          let nl: number;
-          while ((nl = timing.partial.indexOf("\n")) !== -1) {
-            const line = timing.partial.slice(0, nl);
-            timing.partial = timing.partial.slice(nl + 1);
-            if (!line.trim()) continue;
-            const now = Date.now();
-            const gap = now - timing.lastAt;
-            if (gap > timing.maxGapMs) timing.maxGapMs = gap;
-            if (timing.firstLineMs < 0) timing.firstLineMs = now - timing.spawnedAt;
-            timing.lastAt = now;
-            timing.lines++;
-            if (line.includes('"thinking_tokens"')) {
-              const t = /"estimated_tokens"\s*:\s*(\d+)/.exec(line);
-              if (t) timing.thinkingTokens = Math.max(timing.thinkingTokens, Number(t[1]));
-            }
-            const m = /"type"\s*:\s*"([^"]*)"/.exec(line.slice(0, 200));
-            traceAppend(traceId, "cli-stdout.live.ndjson", line);
-            traceAppend(traceId, "cli-timing.tsv", `${now - timing.spawnedAt}\t${gap}\t${line.length}\t${m ? m[1] : ""}`);
+        // Each line is recorded and timed as it arrives, so a run that is
+        // killed still leaves evidence of how far it got. The longest silence
+        // between lines is what separates a stalled run from one that is
+        // merely slow.
+        const timing = { spawnedAt: Date.now(), lastAt: Date.now(), lines: 0, firstLineMs: -1, maxGapMs: 0, thinkingTokens: 0 };
+        const onLine = (line: string) => {
+          const now = Date.now();
+          const gap = now - timing.lastAt;
+          if (gap > timing.maxGapMs) timing.maxGapMs = gap;
+          if (timing.firstLineMs < 0) timing.firstLineMs = now - timing.spawnedAt;
+          timing.lastAt = now;
+          timing.lines++;
+          if (line.includes('"thinking_tokens"')) {
+            const t = /"estimated_tokens"\s*:\s*(\d+)/.exec(line);
+            if (t) timing.thinkingTokens = Math.max(timing.thinkingTokens, Number(t[1]));
           }
+          const m = /"type"\s*:\s*"([^"]*)"/.exec(line.slice(0, 200));
+          traceAppend(traceId, "cli-stdout.live.ndjson", line);
+          traceAppend(traceId, "cli-timing.tsv", `${now - timing.spawnedAt}\t${gap}\t${line.length}\t${m ? m[1] : ""}`);
         };
         const onStderr = (chunk: Buffer) => traceAppendRaw(traceId, "cli-stderr.txt", chunk.toString("utf-8"));
         const logTiming = (outcome: string) => {
@@ -483,20 +581,61 @@ function createCLIQueryFn(cliBin: string): QueryFn {
         }, PROGRESS_INTERVAL_MS);
         progress.unref?.();
 
-        let stdout: string;
+        const received: string[] = [];
+        const typeCounts: Record<string, number> = {};
+        let skipped = 0;
+        // Stays "stopped" when the consumer stops reading before the CLI exits.
+        let outcome = "stopped";
         try {
-          stdout = await spawnWithAbort(cmd, {
+          for await (const line of streamLines(cmd, {
             cwd: opts.cwd ? String(opts.cwd) : undefined,
             abortController: ac,
             timeoutMs,
             idleTimeoutMs: idleMs,
             input: prompt,
-            onStdout,
+            onLine,
             onStderr,
-          });
+          })) {
+            received.push(line);
+            let obj: Record<string, unknown>;
+            try {
+              obj = JSON.parse(line) as Record<string, unknown>;
+            } catch {
+              // A line the CLI printed that is not JSON. Discarding it in silence
+              // is exactly how a missing chunk of an answer would vanish without
+              // trace, so record it.
+              skipped++;
+              logDiag("warn", {
+                requestId: traceId,
+                message: "cli_line_unparsed",
+                lineChars: line.length,
+                head: line.slice(0, 300),
+                tail: line.length > 300 ? line.slice(-300) : "",
+              });
+              continue;
+            }
+
+            const t = typeof obj.type === "string" ? obj.type : "(no type)";
+            typeCounts[t] = (typeCounts[t] || 0) + 1;
+
+            if (t === "result") {
+              const r = obj.result;
+              logDiag("info", {
+                requestId: traceId,
+                message: "cli_result_line",
+                subtype: typeof obj.subtype === "string" ? obj.subtype : "",
+                resultChars: typeof r === "string" ? r.length : -1,
+                resultHead: typeof r === "string" ? r.slice(0, 200) : "",
+                resultTail: typeof r === "string" ? r.slice(-200) : "",
+              });
+            }
+
+            yield obj;
+          }
+          outcome = "exited";
         } catch (err) {
           if (err instanceof CliTerminatedError) {
-            logTiming(err.reason);
+            outcome = err.reason;
             const types: Record<string, number> = {};
             for (const line of err.stdout.split("\n")) {
               const m = /"type"\s*:\s*"([^"]*)"/.exec(line.slice(0, 200));
@@ -514,73 +653,22 @@ function createCLIQueryFn(cliBin: string): QueryFn {
               stderrTail: err.stderr.slice(-500),
             });
           } else {
-            logTiming("error");
+            outcome = "error";
           }
           throw err;
         } finally {
           clearInterval(progress);
-        }
-        logTiming("exited");
-
-        traceWrite(traceId, "cli-stdout.ndjson", stdout);
-
-        // Parse the whole NDJSON output up front so the summary below is always
-        // recorded, even when the consumer stops iterating early.
-        const lines = stdout.split("\n");
-        const parsed: Record<string, unknown>[] = [];
-        const typeCounts: Record<string, number> = {};
-        let skipped = 0;
-
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          let obj: Record<string, unknown>;
-          try {
-            obj = JSON.parse(line) as Record<string, unknown>;
-          } catch {
-            // A line the CLI printed that is not JSON. Discarding it in silence
-            // is exactly how a missing chunk of an answer would vanish without
-            // trace, so record it.
-            skipped++;
-            logDiag("warn", {
-              requestId: traceId,
-              message: "cli_line_unparsed",
-              lineChars: line.length,
-              head: line.slice(0, 300),
-              tail: line.length > 300 ? line.slice(-300) : "",
-            });
-            continue;
-          }
-
-          const t = typeof obj.type === "string" ? obj.type : "(no type)";
-          typeCounts[t] = (typeCounts[t] || 0) + 1;
-
-          if (t === "result") {
-            const r = obj.result;
-            logDiag("info", {
-              requestId: traceId,
-              message: "cli_result_line",
-              subtype: typeof obj.subtype === "string" ? obj.subtype : "",
-              resultChars: typeof r === "string" ? r.length : -1,
-              resultHead: typeof r === "string" ? r.slice(0, 200) : "",
-              resultTail: typeof r === "string" ? r.slice(-200) : "",
-            });
-          }
-
-          parsed.push(obj);
-        }
-
-        logDiag("info", {
-          requestId: traceId,
-          message: "cli_stdout",
-          bytes: Buffer.byteLength(stdout),
-          lines: lines.length,
-          parsedLines: parsed.length,
-          skippedLines: skipped,
-          typeCounts,
-        });
-
-        for (const obj of parsed) {
-          yield obj;
+          logTiming(outcome);
+          traceWrite(traceId, "cli-stdout.ndjson", received.length ? received.join("\n") + "\n" : "");
+          logDiag("info", {
+            requestId: traceId,
+            message: "cli_stdout",
+            bytes: received.reduce((n, l) => n + Buffer.byteLength(l) + 1, 0),
+            lines: received.length,
+            parsedLines: received.length - skipped,
+            skippedLines: skipped,
+            typeCounts,
+          });
         }
       },
     };
@@ -837,6 +925,26 @@ export class ClaudeEngine {
               requestId: opts.traceId || "",
               message: "native_tool_call_blocked",
               tools: toolUses.map((tool) => typeof tool.name === "string" ? tool.name : ""),
+            });
+            abortController.abort();
+            throw new AgentError(
+              "NATIVE_TOOL_CALL",
+              "Claude emitted a native tool call instead of an external-client tool request. The response was rejected; execution status must be checked in the trace."
+            );
+          }
+        }
+        // With partial messages, a native tool call first shows as the start
+        // of a tool_use block; reject it there, before the block is written.
+        if (opts.clientToolCalls && rawType === "stream_event") {
+          const ev = raw.event && typeof raw.event === "object" ? raw.event as Record<string, unknown> : null;
+          const block = ev && ev.type === "content_block_start" && ev.content_block && typeof ev.content_block === "object"
+            ? ev.content_block as Record<string, unknown>
+            : null;
+          if (block && typeof block.type === "string" && block.type.endsWith("tool_use")) {
+            logDiag("error", {
+              requestId: opts.traceId || "",
+              message: "native_tool_call_blocked",
+              tools: [typeof block.name === "string" ? block.name : ""],
             });
             abortController.abort();
             throw new AgentError(

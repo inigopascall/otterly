@@ -76,6 +76,8 @@ export interface OpenAIChatResponse {
 export interface OpenAIStreamDelta {
   role?: string;
   content?: string | null;
+  /** Thinking text. OpenAI-compatible clients show it as the model's reasoning. */
+  reasoning_content?: string;
   tool_calls?: Array<{
     index: number;
     id?: string;
@@ -94,6 +96,35 @@ export interface OpenAIStreamChunk {
     delta: OpenAIStreamDelta;
     finish_reason: string | null;
   }>;
+  /** Token usage. Sent on the final chunk only. */
+  usage?: OpenAIUsage;
+}
+
+/** OpenAI `usage`. */
+export interface OpenAIUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  prompt_tokens_details?: { cached_tokens: number };
+}
+
+/**
+ * Convert an engine's usage object to OpenAI `usage`. The Claude CLI reports
+ * cache reads and cache writes apart from `input_tokens`; OpenAI counts all
+ * three as prompt tokens and reports the cache reads again as `cached_tokens`.
+ */
+export function toOpenAIUsage(usage: unknown): OpenAIUsage {
+  const u: Record<string, unknown> = usage && typeof usage === "object" ? usage as Record<string, unknown> : {};
+  const n = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  const cached = n(u.cache_read_input_tokens);
+  const prompt = n(u.input_tokens) + cached + n(u.cache_creation_input_tokens);
+  const completion = n(u.output_tokens);
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    ...(cached > 0 ? { prompt_tokens_details: { cached_tokens: cached } } : {}),
+  };
 }
 
 /** Claude Code's built-in tool names. When a client supplies its own OpenAI
@@ -465,13 +496,14 @@ export function buildModelsList(): {
 }
 
 /**
- * Build a streaming SSE chunk.
+ * Build a streaming SSE chunk. Pass `usage` on the final chunk.
  */
 export function makeStreamChunk(
   id: string,
   delta: OpenAIStreamDelta,
   finishReason: string | null,
-  model: string
+  model: string,
+  usage?: OpenAIUsage,
 ): OpenAIStreamChunk {
   return {
     id,
@@ -485,6 +517,7 @@ export function makeStreamChunk(
         finish_reason: finishReason,
       },
     ],
+    ...(usage ? { usage } : {}),
   };
 }
 

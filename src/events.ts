@@ -103,6 +103,13 @@ export function normalizeEvents(
             type: "text_delta",
             delta: text,
           });
+        } else if (delta?.type === "thinking_delta" && typeof delta.thinking === "string" && delta.thinking) {
+          // Readable thinking text, present when the CLI runs with
+          // --thinking-display summarized. Empty deltas only mark progress.
+          events.push({
+            type: "thinking_delta",
+            delta: delta.thinking,
+          });
         }
       }
       break;

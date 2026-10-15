@@ -1,5 +1,5 @@
 ---
-verified: 2026-10-12
+verified: 2026-10-15
 verified_by: workhorse
 ---
 
@@ -44,9 +44,15 @@ routing happens client-side. Each process resolves its backend once at startup
 **Claude-specific behaviour:**
 - The CLI path uses safe-mode, empty built-in tools, strict empty MCP configuration,
   and forwards `maxTurns`; the SDK fallback is not described as verified isolation.
+- The CLI runs with `--include-partial-messages --thinking-display summarized`, so
+  the model's summarised thinking and its reply arrive as `stream_event` lines
+  while they are generated. Streamed responses relay them as `reasoning_content`
+  and `content` chunks (§15).
 - When `clientToolCalls` is enabled, unexpected native tool inventory or activity
-  is rejected after the CLI has completed/buffered its response, and is surfaced
-  as HTTP 502. Cursor retains its external-client JSON tool intent behavior.
+  is rejected; a native `tool_use` block is rejected as soon as it starts. A
+  non-streamed request gets HTTP 502; a streamed one has its connection dropped
+  so the client retries (§15). Cursor retains its external-client JSON tool
+  intent behavior.
 
 **Cursor-specific behaviour:**
 - Every `cursor-agent` spawn runs inside a **bubblewrap jail** that confines
@@ -164,11 +170,13 @@ malformed events rather than throwing.
 
 - **Claude** — the CLI path applies safe-mode, empty built-ins, and a strict empty
   MCP config. With `clientToolCalls`, unexpected native inventory/activity is
-  rejected after CLI completion/buffering and reported as HTTP 502; this is not a
-  pre-execution sandbox claim. `maxTurns` is forwarded to the CLI.
+  rejected as soon as it appears: HTTP 502 for a non-streamed request, a dropped
+  connection for a streamed one. This is not a pre-execution sandbox claim.
+  `maxTurns` is forwarded to the CLI.
 - **Unparsed tool-call intent** — a tool-enabled reply that cannot be parsed or
-  repaired into OpenAI `tool_calls` is rejected with HTTP 502 rather than
-  returned as prose, when it shows tool-call intent: the `{`"tool_calls"`: …}`
+  repaired into OpenAI `tool_calls` is rejected rather than returned as prose
+  (HTTP 502 non-streamed; a dropped connection streamed, §15), when it shows
+  tool-call intent: the `{`"tool_calls"`: …}`
   envelope, or `<invoke name="X">` markup where `X` is a tool the request
   offered. Markup inside a code fence or an inline code span does not count, so a
   reply that discusses the syntax stays prose. See `looksLikeToolCallIntent` in
@@ -209,9 +217,9 @@ catalog for the active backend, so discovery endpoints (`/v1/models`,
 ## 6. Cursor Engine Detail (`cursor-engine.ts`)
 
 `CursorEngine` mirrors `ClaudeEngine`'s `run()`/`stream()` interface. It builds an
-argv array (no shell), feeds the prompt via stdin, spawns through the shared
-`spawnWithAbort` from `engine.ts`, splits the NDJSON output by line, and passes
-each parsed object through `normalizeCursorEvent`.
+argv array (no shell), feeds the prompt via stdin, reads the output line by line
+as it arrives through the shared `streamLines` from `engine.ts`, and passes each
+parsed object through `normalizeCursorEvent`.
 
 **Command (`buildCursorCommand`):**
 
@@ -245,13 +253,17 @@ directly, since the request path does not validate against the catalog.
 | `src/cli.ts` | `--backend` flag + `OTTERLY_BACKEND`; starts the server |
 | `src/cursor-events.ts` | Cursor NDJSON → `AgentEvent` parser |
 | `src/cursor-engine.ts` | Cursor command builder, bubblewrap jail, stream/run |
-| `src/engine.ts` | Claude engine + shared `spawnWithAbort` |
+| `src/engine.ts` | Claude engine + shared `spawnWithAbort` and `streamLines` |
+| `src/events.ts` | Claude NDJSON → `AgentEvent` parser (`text_delta`, `thinking_delta`) |
 | `src/session.ts` | Claude multi-turn SDK session (used by `/ws`) |
 | `src/server/engine-factory.ts` | `makeEngine()` — backend-aware engine selection |
 | `src/server/routes-openai.ts` | `/v1/chat/completions`; sets `clientToolCalls` |
 | `src/server/ws-handler.ts` | `/ws` sessions; sets `disallowedTools` |
 | `src/server/models.ts` | Backend-aware model catalogs + backend state |
 | `src/server/openai-compat.ts` | OpenAI translation, `CLAUDE_BUILTIN_TOOLS`, tool bridge |
+| `src/server/sse-stream.ts` | `SseStream`: the SSE chunks of one streamed completion |
+| `src/server/tool-call-stream.ts` | `ToolCallStreamer`, `reconcileStreamedCalls`: live tool calls |
+| `src/server/retry-notice.ts` | Remembers dropped requests; notice on the retry |
 
 ---
 
@@ -282,9 +294,9 @@ The Cursor backend requires `bwrap` installed (`sudo apt install bubblewrap`).
   (`/v1/chat/completions`, `/api/run`, `/api/stream`, Ollama routes) use
   `run()`/`stream()` and apply to both backends.
 - **Transport selection** (`resolveSDK` in `engine.ts`): the on-PATH `claude`
-  CLI is tried **first**, and the npm SDK is used only when no CLI is found. On
-  the CLI path there are no `stream_event` messages, so no `text_delta` events
-  are produced and the final text comes from the `result` line.
+  CLI is tried **first**, and the npm SDK is used only when no CLI is found.
+  Both paths produce `stream_event` messages, so both emit `text_delta` and
+  `thinking_delta` events.
 
 ## 10. Building and re-deploying the global install
 
@@ -301,6 +313,10 @@ Run Vitest through pnpm dlx, which downloads a temporary executable and runs it 
 ```
 pnpm dlx vitest run
 ```
+
+`vitest.config.ts` sets `OTTERLY_DISABLE_CLAUDE_CLI=1`, which makes
+`findClaudeCLI()` return null, so tests use the mocked npm SDK and never spawn
+a real `claude`.
 
 ## 12. Request tracing
 
@@ -327,8 +343,9 @@ containing:
 | `run-final.txt` | The text `run()` chose to return |
 | `engine-text.txt` | Engine text entering the function-calling path |
 | `unparsed-prose.txt` | A tool-enabled reply returned to the client as prose |
-| `unparseable-tool-call.txt` | A reply that failed with 502 |
-| `stream-sent.txt` | Exactly what was written to the SSE stream |
+| `unparseable-tool-call.txt` | A reply that failed with 502, or whose stream was dropped |
+| `stream-sent.txt` | The reply text written to the SSE stream |
+| `stream-reasoning.txt` | The reasoning text written to the SSE stream |
 | `response-text.txt` | Exactly what was returned non-streamed |
 | `cli-stdout.live.ndjson` | The CLI's stdout lines as they arrived; present even when the run was killed |
 | `cli-stderr.txt` | The CLI's stderr as it arrived |
@@ -352,7 +369,8 @@ Log messages worth grepping: `run_text_sources`, `cli_spawn`, `cli_stdout`,
 `tool_call_unparseable_detail`, `native_tool_call_blocked`,
 `native_tool_inventory_detected`, `stream_summary`, `fc_response`,
 `response_text`, `cli_timing`, `cli_terminated`, `request_timeout`,
-`response_unsettled`, `cli_progress`.
+`response_unsettled`, `cli_progress`, `stream_dropped_for_retry`,
+`tool_call_repaired`.
 
 `tool_call_unparseable` is the terse console line for a 502; the bytes that
 caused it are in `tool_call_unparseable_detail` and in
@@ -364,8 +382,8 @@ Traces are never pruned. Delete the directory when you are done with it.
 
 A Claude run is stopped in either of two cases:
 
-- **No output for 2 minutes** (the idle limit). While the model thinks, the CLI
-  prints a `thinking_tokens` line about once a second, so silence means the run
+- **No output for 2 minutes** (the idle limit). The CLI prints the model's
+  thinking and its reply as they are generated, so silence means the run
   has stopped making progress.
 - **20 minutes in total** (the hard cap), however much output there is.
 
@@ -381,8 +399,9 @@ environment variable. The startup banner prints the values in force on its
 
 When a run is stopped, the client gets an answer:
 
-- nothing sent yet: HTTP **504** with `"type":"timeout_error"`;
-- SSE stream already open: an error chunk with `"code":504`, then `data: [DONE]`.
+- non-streamed: HTTP **504** with `"type":"timeout_error"`;
+- streamed, hard cap: an error chunk with `"code":504`, then `data: [DONE]`;
+- streamed, idle limit: the connection is dropped, which the client retries (§15).
 
 The error message says which limit was hit. The console shows
 `request_timeout`. Timeouts do not trip the circuit breaker.
@@ -418,7 +437,42 @@ CLI receives unchanged. The OpenAI values `none` and `minimal` are forwarded as
 `low`, the CLI's lowest level. Any other value returns HTTP 400. On the Claude
 backend the CLI receives the selected value as `--effort`, visible in each
 trace's `command.txt`. Cursor selects reasoning tier through the model suffix.
-Reused sessions retain their construction options.
+Reused sessions retain their construction options. Covered by
+`tests/server/reasoning-effort.test.ts`.
+
+## 15. Streamed responses
+
+A streamed `/v1/chat/completions` response (`SseStream` in `sse-stream.ts`)
+opens with a `role: "assistant"` chunk, then sends the model's thinking as
+`delta.reasoning_content` and its reply as `delta.content` as they are
+generated. The last chunk carries `finish_reason` and `usage`, followed by
+`data: [DONE]`. After 5 s without a write, a `: keepalive` comment is sent.
+AiderDesk shows `reasoning_content` as its collapsible thinking block.
+
+With client `tools`, the reply is classified as it arrives
+(`ToolCallStreamer`): prose streams as `content`; in a reply that is a
+`{"tool_calls": …}` envelope, each call is sent as its own `tool_calls` entry
+as soon as its name is known, and its arguments follow as they are written;
+anything that may be tool-call markup is held back until the end. The finished
+reply is then parsed as in the non-streamed path, and that parse decides:
+
+- the calls match what was streamed (`reconcileStreamedCalls`):
+  `finish_reason: "tool_calls"`;
+- the reply is prose: held-back text is sent, `finish_reason: "stop"`;
+- the reply shows tool-call intent but cannot be parsed, or the parse disagrees
+  with what was streamed: the connection is dropped.
+
+Clients on the AI SDK, AiderDesk among them, retry a dropped connection and
+discard the partial reply; they do not retry an HTTP error or an in-stream
+error. Otterly therefore drops the connection for an unparseable or
+unconfirmed tool call, a native tool call and the idle limit, and sends an
+in-stream error for everything else. Each drop is recorded against a
+fingerprint of the request's model, messages and tools (`retry-notice.ts`,
+kept 10 minutes); the retry's reasoning opens with a notice such as
+`⚠️ Otterly: the previous attempt … (attempt 2)`. The console shows
+`stream_dropped_for_retry`.
+
+Non-streamed tool requests are buffered, and fail with HTTP 502 as in §4.
 
 ## Verify
 
@@ -438,11 +492,24 @@ grep -F -c 'options.effort = (effort ?? "medium") as EngineOptions["effort"];' s
 grep -F -c 'new Map<string, string>([["none", "low"], ["minimal", "low"]])' src/server/routes-openai.ts # 1
 grep -F -c 'reasoning_effort?: string;' src/server/openai-compat.ts          # 1
 grep -F -c 'reasoning_effort must be one of:' src/server/routes-openai.ts     # 1
-grep -F -c 'reasoning-effort.test.ts' AGENTS.md                              # 1
+grep -F -c 'reasoning-effort.test.ts' AGENTS.md                              # 2
 grep -c 'idle-timeout' src/cli.ts                                                # 1 or more
 grep -c 'OTTERLY_IDLE_TIMEOUT' src/cli.ts                                        # 1 or more
 grep -c 'killAllChildren' src/cli.ts                                             # 1 or more
 grep -c '504: "timeout_error"' src/server/openai-compat.ts                       # 1
 grep -c 'settleResponse' src/server/index.ts                                     # 1 or more
 grep -c '499' src/server/index.ts                                                # 1 or more
+grep -F -c 'parts.push("--include-partial-messages", "--thinking-display", "summarized");' src/engine.ts # 1
+grep -F -c 'export async function* streamLines' src/engine.ts                    # 1
+grep -F -c 'type: "thinking_delta"' src/events.ts                               # 1
+grep -F -c 'streamLines(cmd' src/cursor-engine.ts                                # 1
+grep -F -c 'OTTERLY_DISABLE_CLAUDE_CLI: "1"' vitest.config.ts                    # 1
+grep -F -c 'reasoning_content: text' src/server/sse-stream.ts                    # 1
+grep -F -c 'export const KEEPALIVE_MS = 5000;' src/server/sse-stream.ts          # 1
+grep -F -c 'this.response.destroy();' src/server/sse-stream.ts                   # 1
+grep -F -c 'export function reconcileStreamedCalls' src/server/tool-call-stream.ts # 1
+grep -F -c 'export const RETRY_NOTICE_TTL_MS = 10 * 60 * 1000;' src/server/retry-notice.ts # 1
+grep -F -c 'the previous attempt' src/server/retry-notice.ts                     # 1
+grep -F -c '"stream_dropped_for_retry"' src/server/routes-openai.ts              # 1
+grep -F -c 'err.code === "NATIVE_TOOL_CALL"' src/server/routes-openai.ts         # 1
 ```

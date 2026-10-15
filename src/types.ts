@@ -72,6 +72,12 @@ export interface TextDeltaEvent {
   delta: string;
 }
 
+/** A piece of the model's (summarised) thinking, as it streams. */
+export interface ThinkingDeltaEvent {
+  type: "thinking_delta";
+  delta: string;
+}
+
 export interface ToolUseEvent {
   type: "tool_use";
   id: string;
@@ -113,6 +119,7 @@ export interface ResultEvent {
 export type AgentEvent =
   | TextEvent
   | TextDeltaEvent
+  | ThinkingDeltaEvent
   | ToolUseEvent
   | ToolResultEvent
   | SystemEvent

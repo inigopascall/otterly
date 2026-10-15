@@ -164,7 +164,13 @@ async function handleChat(
   send({ kind: "status", status: "thinking" });
 
   try {
+    // The reply arrives as text_delta events and is then repeated as one
+    // consolidated `text` block. Once a delta has been sent, the block is a
+    // duplicate and is not sent.
+    let sawTextDelta = false;
     for await (const event of state.session.sendStream(text)) {
+      if (event.type === "text_delta") sawTextDelta = true;
+      else if (event.type === "text" && sawTextDelta) continue;
       const payload = eventToWsPayload(event);
       if (payload) send(payload);
     }

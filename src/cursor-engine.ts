@@ -5,11 +5,8 @@
  * drives the `cursor-agent` CLI instead of the Anthropic Claude CLI.
  *
  * Design notes:
- *  - spawnWithAbort() buffers the full stdout before resolving (same as the
- *    Claude CLI path in engine.ts).  stream() therefore yields all events
- *    after process exit, not incrementally.  This is behaviourally identical
- *    to the existing Claude CLI mode and is acceptable for the two-process
- *    design.
+ *  - stream() yields events as cursor-agent prints them (streamLines in
+ *    engine.ts), so a client sees the reply while it is being written.
  *  - session() is intentionally omitted: the Session abstraction is
  *    hard-coupled to the Claude SDK QueryFn/normalizeEvents protocol and is
  *    out of scope for the Cursor backend.
@@ -19,7 +16,7 @@ import { execFileSync } from "child_process";
 import { realpathSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { spawnWithAbort } from "./engine.js";
+import { streamLines } from "./engine.js";
 import { normalizeCursorEvent, createCursorParseState } from "./cursor-events.js";
 import type { AgentEvent, AgentResult, EngineOptions, ToolExecution } from "./types.js";
 import { classifyError, AgentError } from "./errors.js";
@@ -303,12 +300,8 @@ export class CursorEngine {
   }
 
   /**
-   * Streams AgentEvents produced by a single cursor-agent invocation.
-   *
-   * Internally calls spawnWithAbort() which buffers full stdout, then splits
-   * the buffered NDJSON into lines and yields events.  All events are yielded
-   * after the subprocess exits (not incrementally), which is consistent with
-   * the existing Claude CLI streaming behaviour.
+   * Streams AgentEvents produced by a single cursor-agent invocation, each as
+   * soon as cursor-agent prints the line it comes from.
    */
   async *stream(prompt: string, options?: EngineOptions): AsyncGenerator<AgentEvent> {
     const opts = this.mergeOptions(options);
@@ -357,14 +350,26 @@ export class CursorEngine {
     // is expected to cancel via that signal if it needs a shorter deadline.
     const timeoutMs = opts.signal ? 10 * 60 * 1000 : 5 * 60 * 1000;
 
-    let stdout: string;
+    // Each NDJSON line is parsed and its events yielded as soon as
+    // cursor-agent prints it.
+    const state = createCursorParseState();
     try {
-      stdout = await spawnWithAbort(cmd, {
+      for await (const line of streamLines(cmd, {
         cwd: opts.cwd ? String(opts.cwd) : undefined,
         abortController,
         timeoutMs,
         input,
-      });
+      })) {
+        let obj: Record<string, unknown>;
+        try {
+          obj = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          continue; // Skip malformed lines.
+        }
+        for (const ev of normalizeCursorEvent(obj, state)) {
+          yield ev;
+        }
+      }
     } catch (err: unknown) {
       // If the abort was triggered by our own signal, exit silently.
       if (
@@ -374,21 +379,6 @@ export class CursorEngine {
         return;
       }
       throw classifyError(err);
-    }
-
-    // Parse the NDJSON output and yield normalised AgentEvents.
-    const state = createCursorParseState();
-    for (const line of stdout.trim().split("\n")) {
-      if (!line.trim()) continue;
-      let obj: Record<string, unknown>;
-      try {
-        obj = JSON.parse(line) as Record<string, unknown>;
-      } catch {
-        continue; // Skip malformed lines.
-      }
-      for (const ev of normalizeCursorEvent(obj, state)) {
-        yield ev;
-      }
     }
   }
 

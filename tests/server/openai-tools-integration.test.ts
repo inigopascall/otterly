@@ -101,13 +101,24 @@ describe("OpenAI function calling (/v1/chat/completions with tools)", () => {
       stream: true,
     });
     const dataLines = raw.split("\n").filter((l) => l.startsWith("data: ") && !l.includes("[DONE]")).map((l) => JSON.parse(l.slice(6)));
-    const toolDelta = dataLines.find((d) => d.choices[0].delta.tool_calls);
-    const calls = toolDelta.choices[0].delta.tool_calls;
-    expect(calls).toHaveLength(2);
-    expect(calls[0].index).toBe(0);
-    expect(calls[1].index).toBe(1);
-    expect(calls[0].function.name).toBe("get_weather");
-    expect(calls[1].function.name).toBe("get_time");
+    // Each call is its own tool_calls entry: name in its first chunk, arguments
+    // possibly spread over later chunks at the same index.
+    const toolChunks = dataLines.filter((d) => d.choices[0].delta.tool_calls);
+    for (const d of toolChunks) expect(d.choices[0].delta.tool_calls).toHaveLength(1);
+    const byIndex = new Map<number, { name?: string; args: string }>();
+    for (const d of toolChunks) {
+      const tc = d.choices[0].delta.tool_calls[0];
+      const entry = byIndex.get(tc.index) ?? { args: "" };
+      if (tc.function?.name) entry.name = tc.function.name;
+      entry.args += tc.function?.arguments ?? "";
+      byIndex.set(tc.index, entry);
+    }
+    expect([...byIndex.keys()].sort()).toEqual([0, 1]);
+    expect(byIndex.get(0)!.name).toBe("get_weather");
+    expect(byIndex.get(1)!.name).toBe("get_time");
+    expect(JSON.parse(byIndex.get(0)!.args)).toEqual({ city: "Paris" });
+    expect(JSON.parse(byIndex.get(1)!.args)).toEqual({ tz: "CET" });
+    expect(dataLines.some((d) => d.choices[0].finish_reason === "tool_calls")).toBe(true);
   });
 
   it("streams a plain text turn when the model declines to call a tool", async () => {
