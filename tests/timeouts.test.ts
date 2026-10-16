@@ -106,9 +106,9 @@ describe("timeout status mapping", () => {
   it("labels 504 as timeout_error", () => {
     expect(openaiErrorBody(504, "x").error.type).toBe("timeout_error");
   });
-  it("defaults to a twenty-minute cap, a two-minute idle limit and a one-minute CLI backstop", () => {
-    expect(DEFAULT_TIMEOUT_MS).toBe(1_200_000);
-    expect(DEFAULT_IDLE_TIMEOUT_MS).toBe(120_000);
+  it("defaults to a forty-five-minute cap, a five-minute idle limit and a one-minute CLI backstop", () => {
+    expect(DEFAULT_TIMEOUT_MS).toBe(2_700_000);
+    expect(DEFAULT_IDLE_TIMEOUT_MS).toBe(300_000);
     expect(CLI_BACKSTOP_MS).toBe(60_000);
   });
 });

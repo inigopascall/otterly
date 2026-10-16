@@ -168,12 +168,12 @@ export function formatCommand(argv: string[]): string {
 
 /** Default server-side hard cap for one Claude run, in ms. A backstop: a run
  *  that has stopped producing output is caught much sooner by the idle limit. */
-export const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
+export const DEFAULT_TIMEOUT_MS = 45 * 60 * 1000;
 
 /** Default limit on silence from the Claude CLI, in ms. The CLI prints the
- *  model's thinking and its reply as they are generated, so two minutes with
+ *  model's thinking and its reply as they are generated, so five minutes with
  *  no stdout at all means the run has stopped making progress. */
-export const DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 1000;
+export const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 /** How often a running Claude request reports its progress on the console. */
 export const PROGRESS_INTERVAL_MS = 30 * 1000;

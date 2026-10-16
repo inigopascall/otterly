@@ -21,6 +21,53 @@
 
 ---
 
+## About this fork
+
+This is a fork of [Otterly](https://github.com/ReallyArtificial/otterly) by Harsh Joshi. I use it every day to run Claude inside [AiderDesk](https://github.com/hotovo/aider-desk). The original is at **[github.com/ReallyArtificial/otterly](https://github.com/ReallyArtificial/otterly)**; everything else on this page describes the fork.
+
+### What's different from the original
+
+**Claude can't touch your computer on its own**
+
+- In the original, a plain chat request gave Claude its full set of built-in tools with every action pre-approved, so it could read and change files and run commands on the machine without asking. Here, every request through the server runs with all of Claude's own tools switched off. That includes any tool a future Claude Code release adds.
+- Claude also starts without your personal Claude Code settings, CLAUDE.md files, plugins, hooks or add-on tool servers (MCP).
+- Before the server starts, it checks the installed `claude` program at no cost, and refuses to start if `claude` is missing or still offers any tools.
+
+**Uses only the `claude` program you installed**
+
+- The original could quietly fall back to an old copy of Claude Code bundled inside it (version 1.0.128, from September 2025). That fallback is gone: Otterly now needs the `claude` program on your PATH, and the startup banner shows which version it is using.
+- A test suite checks the installed `claude` against everything Otterly relies on. Run it after each Claude Code upgrade (see [After upgrading Claude Code](#5-after-upgrading-claude-code)).
+
+**Better tool calls for apps like AiderDesk**
+
+- Tool calls are streamed to the app as Claude writes them, instead of all at once at the end.
+- A tool call that is slightly malformed (a missing closing bracket) is repaired. One that can't be repaired is rejected instead of being shown to you as a wall of broken text.
+- When a streamed reply goes wrong, Otterly cuts the connection. AiderDesk, like other apps built on the AI SDK, then retries automatically, and the retry starts with a short note saying what happened.
+- If Claude tries to use one of its own tools instead of the app's, the reply is rejected the same way.
+
+**You can watch Claude think**
+
+- Claude's thinking is streamed live as `reasoning_content`, which AiderDesk shows in its collapsible thinking box.
+- Keep-alive pings stop apps from giving up while Claude is still working.
+
+**It never hangs**
+
+- Each request has time limits: 45 minutes in total, and 5 minutes without any output. Both can be changed (`--request-timeout`, `--stream-timeout`, `--idle-timeout`).
+- A stuck `claude` process is stopped properly, and Ctrl+C stops every `claude` process the server started.
+- Every request gets an answer, even when something fails.
+
+**Other additions**
+
+- `reasoning_effort` is supported (`low`, `medium`, `high`, `xhigh`, `max`); the default is `medium`.
+- Optional request tracing for debugging (`OTTERLY_TRACE=1`): each request's input, output and timings are saved under `~/.otterly/traces`, and traces older than 7 days are deleted.
+- Multi-turn sessions (`/ws`) and permission prompts now work through the installed `claude` program.
+
+**One change for people who call Otterly from their own code**
+
+If you `import` Otterly into a Node.js script rather than running the server, Claude now gets **no** built-in tools unless you ask for them, e.g. `{ tools: ["Read", "Grep"] }` or `{ tools: ["default"] }`. The examples in `examples/` show how.
+
+---
+
 ## The pitch in one breath
 
 You already pay **\$20–\$200/month** for Claude Code. Then you build a side project, a script, a tiny agent, and Anthropic charges you **again** per token via the API. That's double-paying for the same brain.
@@ -538,6 +585,9 @@ npx otterly serve --port 11435 --dir ./project --max-concurrent 3
 | `--max-queue` | `50` | Max queued requests |
 | `--queue-timeout` | `120` | Seconds a request may wait in the queue before 408 |
 | `--rate-limit` | `60` | Requests/min per client |
+| `--request-timeout` | `2700` | Seconds a non-streamed request may run before 504 |
+| `--stream-timeout` | `2700` | Seconds a streamed request may run before it is stopped |
+| `--idle-timeout` | `300` | Seconds a Claude run may go without any output before it is stopped |
 
 Programmatic options on `startApiServer()` mirror the flags, plus `requestTimeoutMs`, `streamTimeoutMs`, `queueTimeoutMs`, and `verifyCli` (default `true`; `false` skips the startup check of the `claude` CLI). Set `OTTERLY_API_KEY` in the environment to require Bearer auth.
 

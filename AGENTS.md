@@ -255,15 +255,15 @@ rotated to `otterly.log.1` when it reaches 50 MB, keeping three old files
 
 A Claude run is stopped in either of two cases:
 
-- **No output for 2 minutes** (the idle limit). The CLI prints the model's
+- **No output for 5 minutes** (the idle limit). The CLI prints the model's
   thinking and its reply as they are generated, so silence means the run
   has stopped making progress.
-- **20 minutes in total** (the hard cap), however much output there is.
+- **45 minutes in total** (the hard cap), however much output there is.
 
 Override either, in seconds:
 
-    otterly serve --idle-timeout 180 --request-timeout 1800 --stream-timeout 1800
-    OTTERLY_IDLE_TIMEOUT=180 OTTERLY_REQUEST_TIMEOUT=1800 OTTERLY_STREAM_TIMEOUT=1800 otterly serve
+    otterly serve --idle-timeout 600 --request-timeout 3600 --stream-timeout 3600
+    OTTERLY_IDLE_TIMEOUT=600 OTTERLY_REQUEST_TIMEOUT=3600 OTTERLY_STREAM_TIMEOUT=3600 otterly serve
 
 `--request-timeout` sets the hard cap for non-streamed requests and
 `--stream-timeout` for streamed ones. A flag takes precedence over its
@@ -357,8 +357,8 @@ Run from the Z-Book. Expected values follow `#`.
 
 ```bash
 cd /home/inigo/code/iwd/otterly
-grep -c 'export const DEFAULT_TIMEOUT_MS = 20 \* 60 \* 1000' src/engine.ts       # 1
-grep -c 'export const DEFAULT_IDLE_TIMEOUT_MS = 2 \* 60 \* 1000' src/engine.ts   # 1
+grep -c 'export const DEFAULT_TIMEOUT_MS = 45 \* 60 \* 1000' src/engine.ts       # 1
+grep -c 'export const DEFAULT_IDLE_TIMEOUT_MS = 5 \* 60 \* 1000' src/engine.ts   # 1
 grep -c 'export const PROGRESS_INTERVAL_MS = 30 \* 1000' src/engine.ts           # 1
 grep -c 'export const CLI_BACKSTOP_MS = 60 \* 1000' src/engine.ts                # 1
 grep -c '"cli_progress"' src/engine.ts                                           # 1
@@ -373,6 +373,8 @@ grep -F -c 'reasoning-effort.test.ts' AGENTS.md                              # 2
 grep -c 'idle-timeout' src/cli.ts                                                # 1 or more
 grep -c 'OTTERLY_IDLE_TIMEOUT' src/cli.ts                                        # 1 or more
 grep -c 'killAllChildren' src/cli.ts                                             # 1 or more
+grep -F -c '(default: 2700)' src/cli.ts                                          # 2
+grep -F -c '(default: 300)' src/cli.ts                                           # 1
 grep -c '504: "timeout_error"' src/server/openai-compat.ts                       # 1
 grep -c 'settleResponse' src/server/index.ts                                     # 1 or more
 grep -c '499' src/server/index.ts                                                # 1 or more

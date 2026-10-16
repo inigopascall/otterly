@@ -46,9 +46,9 @@ if (values.help || command === "help") {
     --max-concurrent <number>   Max concurrent requests (default: 5)
     --max-queue <number>        Max queued requests (default: 50)
     --queue-timeout <seconds>   Max time a request waits in queue before 408 (default: 120)
-    --request-timeout <seconds> Max time for a non-streamed request before 504 (default: 1200)
-    --stream-timeout <seconds>  Max time for a streamed request before 504 (default: 1200)
-    --idle-timeout <seconds>    Stop a Claude run after this long with no output (default: 120)
+    --request-timeout <seconds> Max time for a non-streamed request before 504 (default: 2700)
+    --stream-timeout <seconds>  Max time for a streamed request before 504 (default: 2700)
+    --idle-timeout <seconds>    Stop a Claude run after this long with no output (default: 300)
     --rate-limit <number>       Requests per minute per client (default: 60)
 
     -v, --version               Print version

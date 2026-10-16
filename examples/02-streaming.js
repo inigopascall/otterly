@@ -9,7 +9,7 @@ console.log("Streaming response...\n");
 
 for await (const event of claude.stream(
   "Read package.json and give me a one-line summary of what this package does.",
-  { cwd: process.cwd() }
+  { cwd: process.cwd(), tools: ["Read"] }
 )) {
   switch (event.type) {
     case "system":
