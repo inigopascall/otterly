@@ -43,118 +43,54 @@ Same OpenAI-compatible API. Zero per-token cost. No API keys.
 
 ---
 
-## Setup: running Claude and Cursor side by side
+## Setup
 
-This fork drives **two** subscriptions: your **Claude Code** subscription and your
-**Cursor** subscription. Each runs as its own `otterly serve` process on its own
-port, selected with `--backend`:
+Otterly drives your **Claude Code** subscription through the `claude` CLI that is
+already installed and signed in on your machine. It never handles API keys.
 
-- `--backend claude` (default) — Anthropic models via the `claude` CLI/SDK.
-- `--backend cursor` — the `cursor-agent` CLI, which exposes GPT-5.x, Gemini,
-  Grok, Kimi, Cursor's own Composer, and Anthropic models served through Cursor.
-
-### 1. Authenticate both CLIs (once)
-
-Otterly uses your already-signed-in CLIs; it never handles API keys.
+### 1. Install and sign in to Claude Code (once)
 
 ```bash
-# Claude Code
 npm i -g @anthropic-ai/claude-code
 claude          # browser login, persists afterwards
-
-# Cursor CLI
-cursor-agent login
 ```
 
-### 2. Install bubblewrap (required for the Cursor backend)
+### 2. The working directory
 
-The Cursor backend runs every `cursor-agent` invocation inside a
-[bubblewrap](https://github.com/containers/bubblewrap) jail. The jail makes the
-agent see **only** your working directory plus Cursor's own login/runtime folders
-— every other path on your machine (home, SSH keys, other projects, system
-secrets) is invisible, so a read of anything outside the workspace simply fails.
-Network stays on so the Cursor subscription works.
+The server runs Claude inside a working directory, set with `-d`:
 
 ```bash
-sudo apt install bubblewrap     # Debian/Ubuntu
-sudo dnf install bubblewrap     # Fedora/RHEL
-sudo pacman -S bubblewrap       # Arch
-bwrap --version                 # verify
-```
-
-The Cursor backend refuses to start a request if `bwrap` is missing. To run a
-Cursor process **unconfined** (for debugging only), set `OTTERLY_NO_SANDBOX=1`.
-
-### 3. The working directory
-
-Each server runs the agent inside a working directory, set with `-d`:
-
-```bash
-otterly serve --backend cursor -d /path/to/project   # agent works in this dir
-otterly serve --backend cursor                       # uses a clean scratch dir
+otterly serve -d /path/to/project   # Claude works in this dir
+otterly serve                       # uses a clean scratch dir
 ```
 
 With no `-d`, otterly creates an empty **scratch directory** under your system
-temp folder and uses that. A clean scratch dir keeps the agent's context free of
-project files and the `AGENTS.md`/`CLAUDE.md` rules that `cursor-agent`
-auto-loads from a workspace root — so the model reasons only over what each
-request sends. For the Cursor backend, the working directory is also the **one
-writable path** inside the bubblewrap jail.
+temp folder and uses that, so the model reasons only over what each request
+sends.
 
-### 4. Start both servers
-
-Run each backend on its own port:
+### 3. Start the server
 
 ```bash
-otterly serve --backend claude -p 11435      # Claude
-otterly serve --backend cursor -p 11436      # Cursor
+otterly serve -p 11435
 ```
 
-A small script keeps both up together:
+### 4. Add it as a provider in your client
 
-```bash
-#!/bin/bash
-# start-otterly.sh
-otterly serve --backend claude -p 11435 &
-otterly serve --backend cursor -p 11436 &
-wait
-```
-
-### 5. Add both as providers in your client
-
-In an OpenAI-compatible client (e.g. AiderDesk, Cherry Studio), add **two**
-OpenAI-Compatible providers, each with its own provider ID/prefix and base URL:
+In an OpenAI-compatible client (e.g. AiderDesk, Cherry Studio), add an
+OpenAI-Compatible provider:
 
 | Provider | Base URL | API key |
 |---|---|---|
-| Otterly (Claude) | `http://localhost:11435/v1` | any non-empty string |
-| Otterly (Cursor) | `http://localhost:11436/v1` | any non-empty string |
+| Otterly | `http://localhost:11435/v1` | any non-empty string |
 
-Start both servers before launching the client so model discovery
-(`GET /v1/models`) populates each provider's dropdown.
+Start the server before launching the client so model discovery
+(`GET /v1/models`) populates the provider's dropdown.
 
-### Choosing a Cursor model and reasoning tier
-
-`cursor-agent` encodes the reasoning tier in the model ID, so you pick it by
-name — there is no separate temperature or effort setting. Send the exact ID:
-
-```bash
-curl -X POST http://localhost:11436/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "gpt-5.5-high", "messages": [{"role": "user", "content": "Explain quicksort"}]}'
-```
-
-`GET /v1/models` lists a representative set (`composer-2.5`, `gpt-5.5-high`,
-`gpt-5.5-extra-high`, `claude-opus-4-8-max`, `gemini-3.1-pro`, `grok-4.3`, …).
-Any valid `cursor-agent` ID also works when sent directly — run
-`cursor-agent --list-models` for the full catalog, including every `-fast` and
-finer reasoning-tier variant.
-
-Both the Claude and Cursor backends run with their own built-in file and shell
-tools disabled, so they answer purely from each request and never read, edit, or
-execute anything on your machine on their own. When a request includes OpenAI
-`tools`, either backend emits structured `tool_calls` JSON for your client to
-execute and feed back — your client orchestrates every tool call.
+Claude runs with its own built-in file and shell tools disabled, so it answers
+purely from each request and never reads, edits, or executes anything on your
+machine on its own. When a request includes OpenAI `tools`, Claude emits
+structured `tool_calls` JSON for your client to execute and feed back — your
+client orchestrates every tool call.
 
 ---
 
@@ -489,9 +425,9 @@ Send OpenAI-format `tools` and otterly returns real `tool_calls` with
 `finish_reason: "tool_calls"` — so agentic clients (Cline, Aider, your own
 scripts) get the structured function calls they expect. **Your** code runs the
 function and sends the result back as a `role: "tool"` message, exactly like the
-OpenAI API. Both backends run with their own built-in file and shell tools
-disabled, so a request never touches your filesystem or shell — every tool call
-is emitted as structured `tool_calls` JSON for your client to execute.
+OpenAI API. Claude runs with its own built-in file and shell tools disabled, so a
+request never touches your filesystem or shell — every tool call is emitted as
+structured `tool_calls` JSON for your client to execute.
 
 ```typescript
 const res = await ai.chat.completions.create({
@@ -594,8 +530,7 @@ pnpm i -g .
 
 Then stop otterly serve (Ctrl+C) and start it again:
 
-`otterly serve --backend claude -p 11435`
-`otterly serve --backend cursor -p 11436`
+`otterly serve -p 11435`
 
 ---
 

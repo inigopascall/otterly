@@ -7,7 +7,6 @@ import { WebSocketServer } from "ws";
 import { existsSync, mkdirSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { setBackend, type Backend } from "./models.js";
 import { handleChatCompletions } from "./routes-openai.js";
 import {
   handleOllamaChat,
@@ -91,8 +90,6 @@ export interface ApiServerOptions {
   streamTimeoutMs?: number;
   /** Stop a Claude run after this long with no CLI output, in ms. */
   idleTimeoutMs?: number;
-  /** Which inference backend to use ("claude" or "cursor"). Defaults to "claude". */
-  backend?: Backend;
 }
 
 export interface ApiServerHandle {
@@ -104,9 +101,8 @@ export interface ApiServerHandle {
 }
 
 /** Default working directory when no --dir is supplied. A dedicated, empty
- *  folder keeps the agent's cwd free of project files and auto-loaded context
- *  (cursor-agent reads AGENTS.md / CLAUDE.md from the workspace root with no
- *  opt-out), so the model reasons over only what the request carries. */
+ *  folder keeps the agent's cwd free of project files, so the model reasons
+ *  over only what the request carries. */
 export const SCRATCH_DIR = join(tmpdir(), "otterly-scratch");
 
 /** Resolve the working directory, creating it on demand. Falls back to the
@@ -133,9 +129,6 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
   const port = opts.port ?? 11435;
   const workingDir = resolveWorkingDir(opts.workingDir);
 
-  // Activate the chosen backend process-wide so all compat modules pick it up.
-  const backend = opts.backend ?? "claude";
-  setBackend(backend);
   const apiKey = process.env.OTTERLY_API_KEY || null;
   const requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_TIMEOUT_MS;
   const streamTimeoutMs = opts.streamTimeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -422,7 +415,6 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
       console.log(`  Health        : http://localhost:${port}/api/status`);
       console.log(`  Playground    : http://localhost:${port}/playground`);
       console.log(`  Dashboard     : http://localhost:${port}/dashboard`);
-      console.log(`  Backend       : ${backend}`);
       console.log(`  Working dir   : ${workingDir}`);
       console.log(`  Timeouts      : ${Math.round(requestTimeoutMs / 1000)} s request · ${Math.round(streamTimeoutMs / 1000)} s stream · ${Math.round(idleTimeoutMs / 1000)} s idle`);
       if (apiKey) {

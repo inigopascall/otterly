@@ -1,12 +1,9 @@
 /**
- * Returns a ClaudeEngine or CursorEngine depending on the process-wide backend
- * selection.  Both engines expose identical run()/stream() signatures so
- * call sites can use the result interchangeably.
+ * Returns the engine every HTTP route uses. Tests replace this module to
+ * script engine output.
  */
 import { ClaudeEngine } from "../engine.js";
-import { CursorEngine } from "../cursor-engine.js";
-import { getBackend } from "./models.js";
 
-export function makeEngine(): ClaudeEngine | CursorEngine {
-  return getBackend() === "cursor" ? new CursorEngine() : new ClaudeEngine();
+export function makeEngine(): ClaudeEngine {
+  return new ClaudeEngine();
 }

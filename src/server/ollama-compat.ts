@@ -6,7 +6,7 @@
 // Reference: https://github.com/ollama/ollama/blob/main/docs/api.md
 
 import crypto from "crypto";
-import { getModels, findModel, getBackend, DEFAULT_MODEL, getDefaultModel } from "./models.js";
+import { getModels, findModel, DEFAULT_MODEL, getDefaultModel } from "./models.js";
 
 // Version we report from GET /api/version. Some clients gate features on a
 // minimum Ollama version, so we advertise a recent one.
@@ -103,8 +103,7 @@ function msToNs(ms: number): number {
 export function buildOllamaTags(): {
   models: Array<Record<string, unknown>>;
 } {
-  // Report the family name based on the active backend.
-  const family = getBackend() === "cursor" ? "cursor" : "claude";
+  const family = "claude";
   return {
     models: getModels().map((m) => ({
       name: m.id,
@@ -126,7 +125,7 @@ export function buildOllamaTags(): {
 
 /** POST /api/show — model metadata (context length, capabilities). */
 export function buildOllamaShow(modelId: string | undefined): Record<string, unknown> {
-  const family = getBackend() === "cursor" ? "cursor" : "claude";
+  const family = "claude";
   const m = findModel(modelId ?? "");
   return {
     license: "",

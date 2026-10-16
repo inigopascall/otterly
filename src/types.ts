@@ -27,9 +27,8 @@ export interface EngineOptions {
   resume?: string;
   /** Reasoning effort level */
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
-  /** When true, client tools are external OpenAI tools: Cursor may emit JSON
-   *  tool intent, while Claude rejects native tool inventory/activity on this
-   *  path. */
+  /** When true, client tools are external OpenAI tools: Claude rejects native
+   *  tool inventory/activity on this path. */
   clientToolCalls?: boolean;
   /** Correlation id for logging and file tracing. Set from the HTTP request id
    *  so engine-level log lines line up with the request that produced them. */

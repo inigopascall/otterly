@@ -242,7 +242,7 @@ export function spawnWithAbort(cmd: string | string[], opts: SpawnWithAbortOptio
     // When cmd is an array, use the first element as the executable and the
     // rest as argv — no shell involved, so no quoting is needed and there is
     // no /bin/sh dependency.  When cmd is a plain string, preserve the legacy
-    // shell: true path (used by the Claude CLI backend).
+    // shell: true path (used by buildCLICommand).
     const child = doSpawn(
       Array.isArray(cmd) ? cmd[0] : cmd,
       Array.isArray(cmd) ? cmd.slice(1) : [],

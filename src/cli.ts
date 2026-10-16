@@ -19,7 +19,7 @@ const { values, positionals } = parseArgs({
     "stream-timeout": { type: "string" },
     "idle-timeout":   { type: "string" },
     "rate-limit":     { type: "string",  default: "60" },
-    backend:          { type: "string",  default: "claude" },
+
     help:             { type: "boolean", short: "h", default: false },
     version:          { type: "boolean", short: "v", default: false },
   },
@@ -50,13 +50,13 @@ if (values.help || command === "help") {
     --stream-timeout <seconds>  Max time for a streamed request before 504 (default: 1200)
     --idle-timeout <seconds>    Stop a Claude run after this long with no output (default: 120)
     --rate-limit <number>       Requests per minute per client (default: 60)
-    --backend <name>            Inference backend: claude (default) | cursor
+
     -v, --version               Print version
     -h, --help                  Show this help
 
   Environment:
     OTTERLY_API_KEY       Set to require Bearer auth on all requests
-    OTTERLY_BACKEND       Override the backend (claude | cursor)
+
     OTTERLY_REQUEST_TIMEOUT  Seconds; used when --request-timeout is not given
     OTTERLY_STREAM_TIMEOUT   Seconds; used when --stream-timeout is not given
     OTTERLY_IDLE_TIMEOUT     Seconds; used when --idle-timeout is not given
@@ -73,14 +73,6 @@ if (values.help || command === "help") {
 }
 
 if (command === "serve") {
-  // Resolve the active backend: env var takes precedence over the CLI flag.
-  const rawBackend = (process.env.OTTERLY_BACKEND || values.backend || "claude").toLowerCase();
-  if (rawBackend !== "claude" && rawBackend !== "cursor") {
-    console.error(`Invalid backend "${rawBackend}". Must be one of: claude, cursor.`);
-    process.exit(1);
-  }
-  const backend = rawBackend as "claude" | "cursor";
-
   // A flag takes precedence over its environment variable. Values are seconds.
   const timeoutMs = (flag: string | undefined, envName: string): number | undefined => {
     const raw = flag ?? process.env[envName];
@@ -103,7 +95,6 @@ if (command === "serve") {
     requestTimeoutMs: timeoutMs(values["request-timeout"], "OTTERLY_REQUEST_TIMEOUT"),
     streamTimeoutMs: timeoutMs(values["stream-timeout"], "OTTERLY_STREAM_TIMEOUT"),
     idleTimeoutMs: timeoutMs(values["idle-timeout"], "OTTERLY_IDLE_TIMEOUT"),
-    backend,
   }).then((handle) => {
     // Graceful shutdown on SIGTERM/SIGINT
     let shutdownInitiated = false;
