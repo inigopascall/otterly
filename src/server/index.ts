@@ -26,7 +26,14 @@ import { generateRequestId, logRequest, logResponse, logError, log } from "./log
 import { settleResponse } from "./settle.js";
 import { startTraceRetention } from "./trace.js";
 import { AgentError } from "../errors.js";
-import { DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, setIdleTimeoutMs } from "../engine.js";
+import {
+  DEFAULT_TIMEOUT_MS,
+  DEFAULT_IDLE_TIMEOUT_MS,
+  setIdleTimeoutMs,
+  verifyClaudeCLI,
+  cliSemver,
+  TESTED_CLAUDE_CLI_VERSION,
+} from "../engine.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import { openApiSpec } from "./swagger.js";
 import { getPlaygroundHtml } from "./playground.js";
@@ -90,6 +97,9 @@ export interface ApiServerOptions {
   streamTimeoutMs?: number;
   /** Stop a Claude run after this long with no CLI output, in ms. */
   idleTimeoutMs?: number;
+  /** Check the claude CLI before listening (verifyClaudeCLI in engine.ts) and
+   *  refuse to start if the check fails. Default true. */
+  verifyCli?: boolean;
 }
 
 export interface ApiServerHandle {
@@ -134,6 +144,22 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
   const streamTimeoutMs = opts.streamTimeoutMs ?? DEFAULT_TIMEOUT_MS;
   const idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
   setIdleTimeoutMs(idleTimeoutMs);
+
+  // Refuse to serve through a claude CLI that is missing, rejects Otterly's
+  // flags, or still offers tools or MCP servers with them.
+  let cliLine = "not checked (verifyCli: false)";
+  let cliWarning = "";
+  if (opts.verifyCli !== false) {
+    const check = await verifyClaudeCLI();
+    if (!check.ok || !check.cli) {
+      throw new Error(check.problem || "The claude CLI check failed.");
+    }
+    const version = cliSemver(check.cli.version);
+    cliLine = `${check.cli.version} at ${check.cli.path} · isolation verified (no tools, no MCP servers)`;
+    if (version !== TESTED_CLAUDE_CLI_VERSION) {
+      cliWarning = `claude ${version || check.cli.version} has not been tested with this build (tested: ${TESTED_CLAUDE_CLI_VERSION}). Run the CLI suite: pnpm dlx vitest run --config vitest.cli.config.ts`;
+    }
+  }
   startTraceRetention();
 
   const ctx: ServerContext = { workingDir, apiKey };
@@ -417,6 +443,8 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
       console.log(`  Dashboard     : http://localhost:${port}/dashboard`);
       console.log(`  Working dir   : ${workingDir}`);
       console.log(`  Timeouts      : ${Math.round(requestTimeoutMs / 1000)} s request · ${Math.round(streamTimeoutMs / 1000)} s stream · ${Math.round(idleTimeoutMs / 1000)} s idle`);
+      console.log(`  Claude CLI    : ${cliLine}`);
+      if (cliWarning) console.log(`  ⚠ ${cliWarning}`);
       if (apiKey) {
         console.log(`  Auth          : API key required (OTTERLY_API_KEY)`);
       } else {

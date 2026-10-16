@@ -48,7 +48,7 @@ async function runWithRetry(prompt, options = {}, maxRetries = 2) {
           throw classified;
 
         case "SDK_NOT_FOUND":
-          console.error("@anthropic-ai/claude-code is not installed. Run: npm install @anthropic-ai/claude-code");
+          console.error("The claude CLI was not found. Install Claude Code (npm install -g @anthropic-ai/claude-code) and sign in by running `claude` once.");
           throw classified;
 
         case "ABORTED":

@@ -1,23 +1,20 @@
-import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import http from "http";
+import { buildCLICommand, setQueryFnForTests, type QueryFn } from "../../src/engine.js";
 
-// Mock the SDK so Claude "responds" with text we control per-test (a tool-call
-// JSON, multiple calls, or plain prose). The route must parse tool calls back
-// into OpenAI tool_calls, and fall back to a text turn otherwise.
+// Inject controlled text responses for tool-call and plain-text route cases.
 const TOOL_JSON = '{"tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}';
-const h = vi.hoisted(() => ({ result: '{"tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}' }));
-const seenOptions: any[] = [];
+const h = { result: TOOL_JSON };
+const seenOptions: Record<string, unknown>[] = [];
 
-vi.mock("@anthropic-ai/claude-code", () => ({
-  query: vi.fn(({ options }: any) => {
-    seenOptions.push(options);
-    return (async function* () {
-      yield { type: "system", subtype: "init", session_id: "s1", model: "m", cwd: "/test", tools: [] };
-      yield { type: "assistant", message: { content: [{ type: "text", text: h.result }] } };
-      yield { type: "result", subtype: "success", result: h.result, total_cost_usd: 0.01, duration_ms: 50, session_id: "s1", usage: { input_tokens: 8, output_tokens: 4 } };
-    })();
-  }),
-}));
+const query: QueryFn = ({ options }) => {
+  seenOptions.push(options);
+  return (async function* () {
+    yield { type: "system", subtype: "init", session_id: "s1", model: "m", cwd: "/test", tools: [] };
+    yield { type: "assistant", message: { content: [{ type: "text", text: h.result }] } };
+    yield { type: "result", subtype: "success", result: h.result, total_cost_usd: 0.01, duration_ms: 50, session_id: "s1", usage: { input_tokens: 8, output_tokens: 4 } };
+  })();
+};
 
 afterEach(() => { h.result = TOOL_JSON; });
 
@@ -52,10 +49,14 @@ const WEATHER_TOOLS = [{
 
 describe("OpenAI function calling (/v1/chat/completions with tools)", () => {
   beforeAll(async () => {
-    handle = await startApiServer({ port: 0, workingDir: "/test" });
+    setQueryFnForTests(query);
+    handle = await startApiServer({ port: 0, workingDir: "/test", verifyCli: false });
     baseUrl = `http://localhost:${(handle.server.address() as { port: number }).port}`;
   });
-  afterAll(() => handle.close());
+  afterAll(() => {
+    handle.close();
+    setQueryFnForTests(null);
+  });
 
   it("returns OpenAI tool_calls with finish_reason tool_calls", async () => {
     const { status, body } = await post("/v1/chat/completions", {
@@ -72,10 +73,23 @@ describe("OpenAI function calling (/v1/chat/completions with tools)", () => {
     expect(JSON.parse(call.function.arguments)).toEqual({ city: "Paris" });
   });
 
-  it("disables Claude's own built-in tools when the client supplies tools", () => {
+  it.each([true, false])("disables Claude's own built-in tools when client tools are supplied: %s", async (withTools) => {
+    seenOptions.length = 0;
+    const { status } = await post("/v1/chat/completions", {
+      messages: [{ role: "user", content: "isolation check" }],
+      stream: false,
+      ...(withTools ? { tools: WEATHER_TOOLS } : {}),
+    });
+    expect(status).toBe(200);
+    expect(seenOptions).toHaveLength(1);
     const last = seenOptions[seenOptions.length - 1];
-    expect(last.disallowedTools).toContain("Bash");
-    expect(last.disallowedTools).toContain("Write");
+    expect(last).not.toHaveProperty("tools");
+    const argv = buildCLICommand("claude", last);
+    expect(argv).toContain("--tools");
+    expect(argv[argv.indexOf("--tools") + 1]).toBe("");
+    expect(argv).toContain("--safe-mode");
+    expect(argv).toContain("--disallowedTools");
+    expect(argv[argv.indexOf("--disallowedTools") + 1]).toBe("*");
   });
 
   it("streams the tool_calls as a terminal SSE chunk", async () => {

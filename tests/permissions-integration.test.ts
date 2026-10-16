@@ -238,18 +238,6 @@ describe("permissions: option forwarding", () => {
     expect("mcpServers" in captured).toBe(false);
   });
 
-  it("always sets includePartialMessages", async () => {
-    let captured: Record<string, unknown> = {};
-    const qfn = vi.fn((args: any) => {
-      captured = args.options;
-      return (async function* () { yield MINIMAL_RESULT; })();
-    });
-
-    const session = new Session(qfn, { cwd: "/" });
-    await session.send("test");
-    expect(captured.includePartialMessages).toBe(true);
-  });
-
   it("always creates its own abortController", async () => {
     let captured: Record<string, unknown> = {};
     const qfn = vi.fn((args: any) => {

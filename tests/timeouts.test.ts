@@ -210,12 +210,14 @@ describe("idle timeout", () => {
 
 describe("effort", () => {
   it("forwards the effort level to the CLI", () => {
-    expect(buildCLICommand("claude", "hi", { effort: "max" })).toContain("--effort max");
+    const argv = buildCLICommand("claude", { effort: "max" });
+    expect(argv).toContain("--effort");
+    expect(argv[argv.indexOf("--effort") + 1]).toBe("max");
   });
   it("rejects an unknown effort level", () => {
-    expect(() => buildCLICommand("claude", "hi", { effort: "extreme" })).toThrow("effort must be one of");
+    expect(() => buildCLICommand("claude", { effort: "extreme" })).toThrow("effort must be one of");
   });
   it("omits the flag when no effort is set", () => {
-    expect(buildCLICommand("claude", "hi", {})).not.toContain("--effort");
+    expect(buildCLICommand("claude", {})).not.toContain("--effort");
   });
 });

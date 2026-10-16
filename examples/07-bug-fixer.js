@@ -29,6 +29,7 @@ for await (const event of claude.stream(
   4. Explain what you changed and why`,
   {
     cwd: process.cwd(),
+    tools: ["default"],
     permissionMode: "acceptEdits",
   }
 )) {

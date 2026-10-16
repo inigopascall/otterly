@@ -13,15 +13,23 @@ export interface EngineOptions {
   systemPrompt?: string;
   /** Max agent turns before stopping */
   maxTurns?: number;
-  /** Tool whitelist — only these tools can be used */
+  /** Tools that run without asking for permission, in Claude Code's
+   *  permission-rule syntax (e.g. "Bash(git log *)"). To choose which tools
+   *  exist at all, use `tools`. */
   allowedTools?: string[];
-  /** Tool blacklist — these tools are blocked */
+  /** Deny rules. A bare tool name removes that tool. */
   disallowedTools?: string[];
-  /** MCP server configurations */
+  /** Built-in Claude Code tools the model may use, as for `claude --tools`:
+   *  names such as ["Read", "Grep"], or ["default"] for Claude Code's default
+   *  set. Unset or empty: no tools at all. */
+  tools?: string[];
+  /** MCP servers to load, in Claude Code's `mcpServers` format. Setting any
+   *  runs the CLI without --safe-mode, which would stop them loading. */
   mcpServers?: Record<string, unknown>;
   /** AbortSignal to cancel the operation */
   signal?: AbortSignal;
-  /** Custom permission handler. When set, permissionMode should be "default" to enable prompting */
+  /** Called before each tool use that needs approval; read-only tools such as
+   *  Read may run without asking. Setting it sets permissionMode to "default". */
   onPermission?: PermissionHandler;
   /** Session ID to resume a previous conversation */
   resume?: string;

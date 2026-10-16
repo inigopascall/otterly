@@ -1,52 +1,51 @@
-import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import http from "http";
+import { setQueryFnForTests, type QueryFn } from "../../src/engine.js";
 
-// Mock the SDK before importing server modules
-vi.mock("@anthropic-ai/claude-code", () => ({
-  query: vi.fn(({ prompt, options }: any) => {
-    const promptStr = typeof prompt === "string" ? prompt : "mock";
+// Inject a deterministic Claude Code query implementation for route tests.
+const query: QueryFn = ({ prompt, options }: any) => {
+  const promptStr = typeof prompt === "string" ? prompt : "mock";
 
-    return (async function* () {
-      yield {
-        type: "system",
-        subtype: "init",
-        session_id: "test-session",
-        model: "claude-sonnet-4-20250514",
-        cwd: "/test",
-        tools: ["Read"],
-      };
-      yield {
-        type: "stream_event",
-        event: {
-          type: "content_block_delta",
-          delta: { type: "text_delta", text: "Hello " },
-        },
-      };
-      yield {
-        type: "stream_event",
-        event: {
-          type: "content_block_delta",
-          delta: { type: "text_delta", text: "world" },
-        },
-      };
-      yield {
-        type: "assistant",
-        message: {
-          content: [{ type: "text", text: "Hello world" }],
-        },
-      };
-      yield {
-        type: "result",
-        subtype: "success",
-        result: "Hello world",
-        total_cost_usd: 0.01,
-        duration_ms: 1000,
-        session_id: "test-session",
-        usage: { input_tokens: 10, output_tokens: 5 },
-      };
-    })();
-  }),
-}));
+  return (async function* () {
+    yield {
+      type: "system",
+      subtype: "init",
+      session_id: "test-session",
+      model: "claude-sonnet-4-20250514",
+      cwd: "/test",
+      tools: ["Read"],
+    };
+    yield {
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "Hello " },
+      },
+    };
+    yield {
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "world" },
+      },
+    };
+    yield {
+      type: "assistant",
+      message: {
+        content: [{ type: "text", text: "Hello world" }],
+      },
+    };
+    yield {
+      type: "result",
+      subtype: "success",
+      result: "Hello world",
+      total_cost_usd: 0.01,
+      duration_ms: 1000,
+      session_id: "test-session",
+      usage: { input_tokens: 10, output_tokens: 5 },
+    };
+  })();
+};
 
 import { startApiServer, type ApiServerHandle } from "../../src/server/index.js";
 
@@ -80,13 +79,15 @@ function fetch(path: string, opts: { method?: string; body?: unknown; headers?: 
 
 describe("API Server Routes", () => {
   beforeAll(async () => {
-    handle = await startApiServer({ port: 0, workingDir: "/test" });
+    setQueryFnForTests(query);
+    handle = await startApiServer({ port: 0, workingDir: "/test", verifyCli: false });
     const addr = handle.server.address() as { port: number };
     baseUrl = `http://localhost:${addr.port}`;
   });
 
   afterAll(() => {
     handle.close();
+    setQueryFnForTests(null);
   });
 
   describe("GET /api/status", () => {
@@ -287,7 +288,8 @@ describe("API Key Auth", () => {
 
   beforeAll(async () => {
     process.env.OTTERLY_API_KEY = "test-secret";
-    authHandle = await startApiServer({ port: 0, workingDir: "/test" });
+    setQueryFnForTests(query);
+    authHandle = await startApiServer({ port: 0, workingDir: "/test", verifyCli: false });
     const addr = authHandle.server.address() as { port: number };
     authBaseUrl = `http://localhost:${addr.port}`;
   });
@@ -295,6 +297,7 @@ describe("API Key Auth", () => {
   afterAll(() => {
     delete process.env.OTTERLY_API_KEY;
     authHandle.close();
+    setQueryFnForTests(null);
   });
 
   function authFetch(path: string, opts: { method?: string; body?: unknown; headers?: Record<string, string> } = {}): Promise<{ status: number; body: any }> {

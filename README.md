@@ -55,6 +55,11 @@ npm i -g @anthropic-ai/claude-code
 claude          # browser login, persists afterwards
 ```
 
+Otterly requires the `claude` CLI on your PATH. At startup it checks it, and
+refuses to start if `claude` is missing, rejects one of Otterly's flags, or
+still offers tools or MCP servers with them. The startup banner's `Claude CLI`
+line shows the version and path in use.
+
 ### 2. The working directory
 
 The server runs Claude inside a working directory, set with `-d`:
@@ -86,9 +91,25 @@ OpenAI-Compatible provider:
 Start the server before launching the client so model discovery
 (`GET /v1/models`) populates the provider's dropdown.
 
-Claude runs with its own built-in file and shell tools disabled, so it answers
-purely from each request and never reads, edits, or executes anything on your
-machine on its own. When a request includes OpenAI `tools`, Claude emits
+### 5. After upgrading Claude Code
+
+Claude Code ships often, and Otterly depends on its command-line flags and its
+stream-json protocol. After each upgrade, run the CLI suite from a clone of this
+repository:
+
+```bash
+pnpm dlx vitest run --config vitest.cli.config.ts
+```
+
+It checks every flag Otterly passes (at no cost), then makes a few short,
+low-effort calls on your subscription. The startup banner warns when the
+installed version is not the one the suite was last recorded against
+(`TESTED_CLAUDE_CLI_VERSION` in `src/engine.ts`). If the suite fails, go back to
+the previous Claude Code version and open an issue with the failing output.
+
+Claude runs with no built-in tools, no MCP servers, and none of your Claude Code
+settings, CLAUDE.md files, hooks or plugins, so it answers purely from each
+request and never reads, edits, or executes anything on your machine on its own. When a request includes OpenAI `tools`, Claude emits
 structured `tool_calls` JSON for your client to execute and feed back — your
 client orchestrates every tool call.
 
@@ -338,13 +359,15 @@ for await (const event of claude.stream("Refactor auth", { cwd: "." })) {
 }
 
 // Multi-turn session. Context persists in-memory, no server.
-const session = claude.session({ cwd: "./app" });
+const session = claude.session({ cwd: "./app", tools: ["default"] });
 await session.send("Create a REST API");
 await session.send("Now add auth to it");   // remembers the API you just built
 session.close();
 ```
 
-Sessions run entirely in-process. No WebSocket. No HTTP. The async generator stays alive between `send()` calls and keeps Claude's working context warm. As lightweight as a function call.
+A session is one long-lived `claude` process: each `send()` is another turn of the same conversation, so Claude keeps its context. No WebSocket. No HTTP.
+
+By default Claude gets **no** built-in tools. Pass `tools: ["default"]` for Claude Code's default set, or a list such as `["Read", "Grep"]`, when you want it to read or change files. Add `onPermission` to approve or deny each tool use.
 
 ---
 
@@ -516,7 +539,7 @@ npx otterly serve --port 11435 --dir ./project --max-concurrent 3
 | `--queue-timeout` | `120` | Seconds a request may wait in the queue before 408 |
 | `--rate-limit` | `60` | Requests/min per client |
 
-Programmatic options on `startApiServer()` mirror the flags, plus `requestTimeoutMs`, `streamTimeoutMs`, and `queueTimeoutMs`. Set `OTTERLY_API_KEY` in the environment to require Bearer auth.
+Programmatic options on `startApiServer()` mirror the flags, plus `requestTimeoutMs`, `streamTimeoutMs`, `queueTimeoutMs`, and `verifyCli` (default `true`; `false` skips the startup check of the `claude` CLI). Set `OTTERLY_API_KEY` in the environment to require Bearer auth.
 
 ## Rebuild & restart
 
@@ -537,7 +560,7 @@ Then stop otterly serve (Ctrl+C) and start it again:
 ## Library API at a glance
 
 ```typescript
-import { claude, ClaudeEngine, READONLY, AUTOPILOT } from "otterly";
+import { claude, ClaudeEngine, READONLY, AUTOPILOT, verifyClaudeCLI } from "otterly";
 
 // One-shot
 const result = await claude.run(prompt, options);
@@ -556,9 +579,12 @@ session.close();
 // Custom engine with defaults
 const engine = new ClaudeEngine({ model: "claude-sonnet-4-6", maxTurns: 10 });
 
-// Permission modes
-await claude.run(prompt, { permissionMode: READONLY });   // read-only
-await claude.run(prompt, { permissionMode: AUTOPILOT });  // full auto
+// Built-in tools are off unless you name them; a handler approves each use
+await claude.run(prompt, { tools: ["Read", "Grep"], onPermission: READONLY });  // read-only
+await claude.run(prompt, { tools: ["default"], onPermission: AUTOPILOT });       // approve everything
+
+// Check the installed claude CLI, as the server does at startup
+const check = await verifyClaudeCLI();   // → { ok, cli: { path, version }, problem? }
 
 // Embedded server
 import { startApiServer } from "otterly";
@@ -580,7 +606,7 @@ Why is it called "otterly"? Because otters carry their tools with them, and your
 ## Requirements
 
 - **Node.js 18+**
-- **Claude Code** installed and signed in (`claude --version` to confirm)
+- **Claude Code CLI** (`claude`) on your PATH and signed in (`claude --version` to confirm). Otterly checks it at startup and will not start without it.
 - An active Claude subscription (Pro, Max, or Team)
 
 ---

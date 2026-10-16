@@ -13,41 +13,82 @@ import { Session } from "./session.js";
 import { log, logDiag } from "./server/logger.js";
 import { traceWrite, traceAppend, traceAppendRaw } from "./server/trace.js";
 
-type QueryFn = (args: { prompt: unknown; options: Record<string, unknown> }) => AsyncIterable<Record<string, unknown>>;
+/**
+ * Runs one conversation and yields the CLI's stream-json messages, parsed.
+ * `prompt` is a string (one turn) or an async iterable of stream-json user
+ * messages (a multi-turn Session). `options` holds the keys ClaudeEngine and
+ * Session set; buildCLICommand and createCLIQueryFn read them.
+ */
+export type QueryFn = (args: { prompt: unknown; options: Record<string, unknown> }) => AsyncIterable<Record<string, unknown>>;
 
 let cachedQueryFn: QueryFn | null = null;
-let resolvedMode: "sdk" | "cli" | null = null;
 
 /**
- * Find the `claude` CLI binary. Returns the name or null.
+ * Make every ClaudeEngine and Session that was not given its own query
+ * function use `fn` in place of the claude CLI. For tests; null undoes it.
  */
-function findClaudeCLI(): string | null {
+export function setQueryFnForTests(fn: QueryFn | null): void {
+  cachedQueryFn = fn;
+}
+
+/** The claude CLI found on PATH. */
+export interface ClaudeCLIInfo {
+  /** Absolute path of the executable. */
+  path: string;
+  /** What `claude --version` printed, e.g. "2.1.296 (Claude Code)". */
+  version: string;
+}
+
+let cachedCLIInfo: ClaudeCLIInfo | null | undefined;
+
+/** The claude CLI version the CLI suite (tests-cli/) last passed against.
+ *  Update it whenever that suite passes on a newer version. */
+export const TESTED_CLAUDE_CLI_VERSION = "2.1.296";
+
+/** Shown when no claude CLI is on PATH. */
+export const CLI_NOT_FOUND_MESSAGE =
+  "Could not find the Claude Code CLI (`claude`) on PATH. Install it (npm install -g @anthropic-ai/claude-code) and sign in by running `claude` once.";
+
+/**
+ * Find the `claude` CLI on PATH. Returns null when there is none. The answer
+ * is cached for the life of the process.
+ */
+export function findClaudeCLI(): ClaudeCLIInfo | null {
   // Set by the test configuration so that no test ever spawns a real `claude`
-  // binary, whatever is on PATH; the npm SDK (mocked in tests) is used instead.
+  // binary, whatever is on PATH; tests inject a query function instead.
   if (process.env.OTTERLY_DISABLE_CLAUDE_CLI === "1") return null;
+  if (cachedCLIInfo !== undefined) return cachedCLIInfo;
+  cachedCLIInfo = null;
   for (const bin of ["claude", "claude-code"]) {
     try {
-      execFileSync("which", [bin], { stdio: "pipe" });
-      execFileSync(bin, ["--version"], { stdio: "pipe", timeout: 5000 });
-      return bin;
+      const path = execFileSync("which", [bin], { stdio: "pipe" }).toString().trim();
+      const version = execFileSync(path, ["--version"], { stdio: "pipe", timeout: 5000 }).toString().trim();
+      cachedCLIInfo = { path, version };
+      break;
     } catch {
       // Try next
     }
   }
-  return null;
+  return cachedCLIInfo;
+}
+
+/** The x.y.z at the start of a `claude --version` string, or "". */
+export function cliSemver(version: string): string {
+  const m = /\d+\.\d+\.\d+/.exec(version);
+  return m ? m[0] : "";
 }
 
 /**
- * Build a shell command string for `claude -p`.
- * The prompt is NOT embedded in the command — it is passed via stdin by the
- * caller (see createCLIQueryFn). This avoids hitting ARG_MAX (E2BIG) for large
- * prompts such as those produced by IDEs/agents that include repo maps and
- * file context.
+ * Build the argv for one `claude -p` run. The conversation itself is written
+ * to the CLI's stdin as stream-json messages (see createCLIQueryFn), never
+ * placed on the command line, so large prompts cannot hit ARG_MAX (E2BIG).
+ *
+ * The run is isolated unless the caller opts out: no built-in tools, no MCP
+ * servers, and no settings, CLAUDE.md, hooks, plugins, skills or auto memory.
+ * `tools` and `mcpServers` opt in.
  */
-export function buildCLICommand(cliBin: string, prompt: string, opts: Record<string, unknown>): string {
-  // Prompt is fed via stdin; do not place it on the command line.
-  void prompt;
-  const parts = [cliBin, "-p", "--output-format", "stream-json", "--verbose"];
+export function buildCLICommand(cliBin: string, opts: Record<string, unknown>): string[] {
+  const parts = [cliBin, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"];
 
   // Stream the run as it happens: the model's thinking (as readable summaries)
   // and its reply arrive as stream_event lines while they are generated, not
@@ -69,23 +110,35 @@ export function buildCLICommand(cliBin: string, prompt: string, opts: Record<str
   // --system-prompt is supplied. Honour the caller's system prompt when present;
   // otherwise fall back to a minimal neutral one so the model behaves like a
   // plain text-in/text-out chat API rather than an agentic coding assistant.
-  const sysPrompt = opts.systemPrompt ? String(opts.systemPrompt) : "You are a helpful assistant.";
-  const safeSys = sysPrompt.replace(/'/g, "'\\''");
-  parts.push("--system-prompt", `'${safeSys}'`);
+  parts.push("--system-prompt", opts.systemPrompt ? String(opts.systemPrompt) : "You are a helpful assistant.");
 
   // Do not load user/project/local settings or CLAUDE.md project memory, so the
   // model has no repo-specific context the caller did not explicitly send.
-  parts.push("--setting-sources", "''");
+  parts.push("--setting-sources", "");
 
-  // Disable all of Claude Code's built-in tools (Bash/Read/Edit/etc). Per
-  // `claude --help`, an empty value to --tools disables the entire built-in
-  // set. This makes the model behave like a plain text-in/text-out chat API:
-  // it cannot autonomously read or edit files on disk. Tool orchestration is
-  // left entirely to the OpenAI-compatible client (e.g. AiderDesk/Aider), so
-  // every tool call is visible to and controlled by that client rather than
-  // happening invisibly inside the `claude` process.
-  parts.push("--tools", "''");
-  parts.push("--safe-mode", "--strict-mcp-config", "--mcp-config", `'${JSON.stringify({ mcpServers: {} })}'`);
+  // Built-in tools: only those the caller names. An empty value disables the
+  // whole built-in set, so a tool added in a later Claude Code release is
+  // excluded too. Tool orchestration is then left to the OpenAI-compatible
+  // client, so every tool call is visible to and controlled by that client.
+  const tools = Array.isArray(opts.tools) ? opts.tools.map(String).filter((t) => t !== "") : [];
+  parts.push("--tools", tools.join(","));
+
+  // MCP servers: only the caller's. --safe-mode also stops plugins, hooks,
+  // skills and auto memory from loading, but it stops servers named in
+  // --mcp-config as well, so it is left off when the caller supplies some.
+  const mcp = opts.mcpServers && typeof opts.mcpServers === "object" && Object.keys(opts.mcpServers).length > 0
+    ? opts.mcpServers as Record<string, unknown>
+    : null;
+  if (mcp) {
+    parts.push("--strict-mcp-config", "--mcp-config", JSON.stringify({ mcpServers: mcp }));
+  } else {
+    parts.push("--safe-mode", "--strict-mcp-config", "--mcp-config", JSON.stringify({ mcpServers: {} }));
+  }
+
+  // With no tools and no MCP servers asked for, also deny every tool by rule,
+  // whatever its source.
+  if (tools.length === 0 && !mcp) parts.push("--disallowedTools", "*");
+
   if (opts.maxTurns !== undefined) {
     if (typeof opts.maxTurns !== "number" || !Number.isSafeInteger(opts.maxTurns) || opts.maxTurns <= 0) {
       throw new Error("maxTurns must be a positive safe integer");
@@ -94,6 +147,8 @@ export function buildCLICommand(cliBin: string, prompt: string, opts: Record<str
   }
   if (opts.resume) parts.push("--resume", String(opts.resume));
   if (opts.permissionMode) parts.push("--permission-mode", String(opts.permissionMode));
+  // A permission handler answers the CLI's can_use_tool requests over stdio.
+  if (typeof opts.canUseTool === "function") parts.push("--permission-prompt-tool", "stdio");
   if (opts.allowedTools) {
     for (const tool of opts.allowedTools as string[]) parts.push("--allowedTools", tool);
   }
@@ -101,7 +156,14 @@ export function buildCLICommand(cliBin: string, prompt: string, opts: Record<str
     for (const tool of opts.disallowedTools as string[]) parts.push("--disallowedTools", tool);
   }
 
-  return parts.join(" ");
+  return parts;
+}
+
+/** Render an argv array as one shell-quoted line, for logs and traces. */
+export function formatCommand(argv: string[]): string {
+  return argv
+    .map((a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : "'" + a.replace(/'/g, "'\\''") + "'"))
+    .join(" ");
 }
 
 /** Default server-side hard cap for one Claude run, in ms. A backstop: a run
@@ -206,26 +268,29 @@ export function killAllChildren(signal: NodeJS.Signals = "SIGTERM"): number {
  * compiled binary that re-execs or spawns helpers can be reaped in one shot
  * via the negative-PID kill (`process.kill(-pid, signal)`).
  *
- * `shell: true` is used because the legacy execSync path worked through a
- * shell and the Bun-compiled `claude` binary historically had stdout-piping
- * quirks with direct `spawn`. Using a shell preserves the previous behavior
- * while making the call cancellable.
+ * `cmd` is either an argv array, spawned directly, or a command string, run
+ * through a shell. buildCLICommand returns an argv array.
  *
- * The prompt (if any) is written to the child's stdin via the `input` option
- * rather than being placed on the command line, so that large prompts do not
- * exceed the OS ARG_MAX limit (E2BIG).
+ * Input (if any) is written to the child's stdin via the `input` option rather
+ * than being placed on the command line, so that large prompts do not exceed
+ * the OS ARG_MAX limit (E2BIG).
  */
 export interface SpawnWithAbortOptions {
   cwd?: string;
   abortController?: AbortController;
-  /** Hard timeout in ms. Triggers the same kill ladder as abort. */
-  timeoutMs: number;
+  /** Hard timeout in ms. Triggers the same kill ladder as abort. Unset: no limit. */
+  timeoutMs?: number;
   /** Stop the child after this long with no stdout, in ms. Unset: no limit. */
   idleTimeoutMs?: number;
   /** Grace period between SIGTERM and SIGKILL. Default 5s. */
   killGraceMs?: number;
-  /** Data to write to the child's stdin (e.g. the prompt). */
-  input?: string;
+  /** Data for the child's stdin. A string is written whole and stdin is then
+   *  closed. An async iterable is written chunk by chunk as it yields, and
+   *  stdin is closed when it ends. */
+  input?: string | AsyncIterable<string>;
+  /** Asked when the idle limit is reached. Returning true restarts the limit
+   *  instead of stopping the child, which is waiting for input, not stalled. */
+  idleExempt?: () => boolean;
   /** Called with each stdout chunk as it arrives. */
   onStdout?: (chunk: Buffer) => void;
   /** Called with each stderr chunk as it arrives. */
@@ -241,8 +306,8 @@ export function spawnWithAbort(cmd: string | string[], opts: SpawnWithAbortOptio
   return new Promise<string>((resolve, reject) => {
     // When cmd is an array, use the first element as the executable and the
     // rest as argv — no shell involved, so no quoting is needed and there is
-    // no /bin/sh dependency.  When cmd is a plain string, preserve the legacy
-    // shell: true path (used by buildCLICommand).
+    // no /bin/sh dependency.  When cmd is a plain string, run it through a
+    // shell.
     const child = doSpawn(
       Array.isArray(cmd) ? cmd[0] : cmd,
       Array.isArray(cmd) ? cmd.slice(1) : [],
@@ -254,16 +319,6 @@ export function spawnWithAbort(cmd: string | string[], opts: SpawnWithAbortOptio
         stdio: [opts.input != null ? "pipe" : "ignore", "pipe", "pipe"],
       }
     );
-
-    // Feed the prompt to the child via stdin. Guard against EPIPE in case the
-    // child exits before consuming all input.
-    if (opts.input != null && child.stdin) {
-      child.stdin.on("error", () => {
-        // Child closed stdin early — ignore (e.g. EPIPE).
-      });
-      child.stdin.write(opts.input);
-      child.stdin.end();
-    }
 
     const startedAt = Date.now();
     liveChildren.add(child);
@@ -311,11 +366,13 @@ export function spawnWithAbort(cmd: string | string[], opts: SpawnWithAbortOptio
       sigkillTimer = setTimeout(() => killGroup("SIGKILL"), killGraceMs);
     };
 
-    const hardTimer = setTimeout(() => {
-      if (killing) return;
-      timedOut = true;
-      beginKillLadder();
-    }, opts.timeoutMs);
+    const hardTimer = opts.timeoutMs !== undefined
+      ? setTimeout(() => {
+          if (killing) return;
+          timedOut = true;
+          beginKillLadder();
+        }, opts.timeoutMs)
+      : null;
 
     // Restarted by every stdout chunk: the child is stopped only after
     // idleTimeoutMs with no output at all.
@@ -324,11 +381,43 @@ export function spawnWithAbort(cmd: string | string[], opts: SpawnWithAbortOptio
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         if (killing) return;
+        if (opts.idleExempt?.()) {
+          armIdle();
+          return;
+        }
         idledOut = true;
         beginKillLadder();
       }, opts.idleTimeoutMs);
     };
     armIdle();
+
+    // Feed the child's stdin. Guard against EPIPE in case the child exits
+    // before consuming all input. Each write counts as activity for the idle
+    // limit, as output does.
+    if (opts.input != null && child.stdin) {
+      const stdin = child.stdin;
+      stdin.on("error", () => {
+        // Child closed stdin early — ignore (e.g. EPIPE).
+      });
+      if (typeof opts.input === "string") {
+        stdin.write(opts.input);
+        stdin.end();
+      } else {
+        const input = opts.input;
+        void (async () => {
+          try {
+            for await (const chunk of input) {
+              if (stdin.destroyed || stdin.writableEnded) break;
+              stdin.write(chunk);
+              armIdle();
+            }
+          } catch {
+            // A failing input source just ends the input.
+          }
+          if (!stdin.destroyed && !stdin.writableEnded) stdin.end();
+        })();
+      }
+    }
 
     const onAbort = () => {
       if (killing) return;
@@ -339,7 +428,7 @@ export function spawnWithAbort(cmd: string | string[], opts: SpawnWithAbortOptio
     if (opts.abortController?.signal.aborted) onAbort();
 
     const cleanup = () => {
-      clearTimeout(hardTimer);
+      if (hardTimer) clearTimeout(hardTimer);
       if (idleTimer) clearTimeout(idleTimer);
       if (sigkillTimer) clearTimeout(sigkillTimer);
       opts.abortController?.signal.removeEventListener("abort", onAbort);
@@ -487,18 +576,73 @@ export async function* streamLines(
   }
 }
 
+/** A stream of lines for a child's stdin. Lines pushed while nobody is reading
+ *  wait in order; end() finishes the stream after them. */
+class LineFeed implements AsyncIterable<string> {
+  private lines: string[] = [];
+  private ended = false;
+  private wake: (() => void) | null = null;
+
+  push(line: string): void {
+    if (this.ended) return;
+    this.lines.push(line);
+    this.notify();
+  }
+
+  end(): void {
+    this.ended = true;
+    this.notify();
+  }
+
+  private notify(): void {
+    const wake = this.wake;
+    this.wake = null;
+    if (wake) wake();
+  }
+
+  async *[Symbol.asyncIterator](): AsyncGenerator<string> {
+    while (true) {
+      if (this.lines.length > 0) {
+        yield this.lines.shift()!;
+        continue;
+      }
+      if (this.ended) return;
+      await new Promise<void>((resolve) => { this.wake = resolve; });
+    }
+  }
+}
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return value != null && typeof (value as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === "function";
+}
+
+/** The permission callback createCLIQueryFn calls (see wrapPermissionHandler). */
+type CanUseToolFn = (
+  toolName: string,
+  input: Record<string, unknown>,
+  options: Record<string, unknown>,
+) => Promise<Record<string, unknown>> | Record<string, unknown>;
+
 /**
  * Build a QueryFn that runs `claude -p` as a cancellable subprocess and yields
  * each NDJSON line of its output, parsed, as soon as the CLI prints it.
  *
- * The prompt is fed to claude via stdin (not argv) so that large prompts do
- * not exceed the OS ARG_MAX limit (E2BIG).
+ * The conversation goes to the CLI's stdin as stream-json messages. A string
+ * prompt is one turn: stdin is closed once its result arrives. An async
+ * iterable prompt is a multi-turn Session: the next message is read from it
+ * after each result, and stdin is closed when it ends. The CLI's can_use_tool
+ * permission requests are answered with options.canUseTool.
  */
-function createCLIQueryFn(cliBin: string): QueryFn {
+export function createCLIQueryFn(cliBin: string): QueryFn {
   return function cliQuery(args: { prompt: unknown; options: Record<string, unknown> }): AsyncIterable<Record<string, unknown>> {
     const opts = args.options || {};
-    const prompt = typeof args.prompt === "string" ? args.prompt : JSON.stringify(args.prompt);
-    const cmd = buildCLICommand(cliBin, prompt, opts);
+    const cmd = buildCLICommand(cliBin, opts);
+    const cmdText = formatCommand(cmd);
+    const canUseTool = typeof opts.canUseTool === "function" ? opts.canUseTool as CanUseToolFn : null;
+    const turns = isAsyncIterable(args.prompt) ? args.prompt[Symbol.asyncIterator]() : null;
+    const firstPrompt = turns
+      ? ""
+      : typeof args.prompt === "string" ? args.prompt : JSON.stringify(args.prompt);
 
     const traceId = typeof opts.traceId === "string" ? opts.traceId : "";
 
@@ -507,23 +651,95 @@ function createCLIQueryFn(cliBin: string): QueryFn {
         const ac = opts.abortController as AbortController | undefined;
         // The server's deadline (opts.timeoutMs) decides when a run is given up
         // on. The CLI's own timer sits CLI_BACKSTOP_MS beyond it, so the server
-        // always reports the timeout first.
+        // always reports the timeout first. A Session waits between turns for
+        // as long as its caller does, so it has no hard cap; the idle limit
+        // still stops a turn that stalls.
         const serverTimeoutMs = typeof opts.timeoutMs === "number" && opts.timeoutMs > 0
           ? opts.timeoutMs
           : DEFAULT_TIMEOUT_MS;
-        const timeoutMs = serverTimeoutMs + CLI_BACKSTOP_MS;
+        const timeoutMs = turns ? undefined : serverTimeoutMs + CLI_BACKSTOP_MS;
 
         logDiag("info", {
           requestId: traceId,
           message: "cli_spawn",
           model: opts.model ? String(opts.model) : "",
           cwd: opts.cwd ? String(opts.cwd) : "",
-          promptChars: prompt.length,
+          promptChars: firstPrompt.length,
           systemPromptChars: opts.systemPrompt ? String(opts.systemPrompt).length : 0,
-          commandHead: cmd.slice(0, 2000),
+          commandHead: cmdText.slice(0, 2000),
         });
-        traceWrite(traceId, "prompt.txt", prompt);
-        traceWrite(traceId, "command.txt", cmd);
+        traceWrite(traceId, "command.txt", cmdText);
+
+        // Everything written to the CLI's stdin, in order: user messages and
+        // answers to permission requests. prompt.txt records each line as it
+        // is sent.
+        const feed = new LineFeed();
+        const send = (message: Record<string, unknown>) => {
+          const line = JSON.stringify(message) + "\n";
+          traceAppendRaw(traceId, "prompt.txt", line);
+          feed.push(line);
+        };
+
+        // While a Session waits for its next message, or a permission handler
+        // for its decision, the CLI is silent by design, not stalled.
+        let awaitingInput = false;
+        let pendingPermissions = 0;
+
+        // After a result: close a one-shot run's stdin, or send a Session's
+        // next message once its caller supplies one.
+        const nextTurn = async (): Promise<void> => {
+          if (!turns) {
+            feed.end();
+            return;
+          }
+          awaitingInput = true;
+          try {
+            const next = await turns.next();
+            if (next.done) feed.end();
+            else send({ parent_tool_use_id: null, ...(next.value as Record<string, unknown>) });
+          } catch {
+            feed.end();
+          } finally {
+            awaitingInput = false;
+          }
+        };
+
+        // Answer a control_request from the CLI. can_use_tool goes to the
+        // permission handler; with none set, the tool use is denied.
+        const answerControlRequest = async (msg: Record<string, unknown>): Promise<void> => {
+          const requestId = typeof msg.request_id === "string" ? msg.request_id : "";
+          const req = msg.request && typeof msg.request === "object" ? msg.request as Record<string, unknown> : {};
+          if (req.subtype !== "can_use_tool") {
+            send({
+              type: "control_response",
+              response: { subtype: "error", request_id: requestId, error: `Unsupported control request: ${String(req.subtype)}` },
+            });
+            return;
+          }
+          let decision: Record<string, unknown> = { behavior: "deny", message: "No permission handler is set." };
+          if (canUseTool) {
+            pendingPermissions++;
+            try {
+              const input = req.input && typeof req.input === "object" ? req.input as Record<string, unknown> : {};
+              decision = await canUseTool(String(req.tool_name ?? ""), input, {
+                decisionReason: req.decision_reason,
+                toolUseID: req.tool_use_id,
+                requestId,
+              });
+            } catch (err) {
+              decision = {
+                behavior: "deny",
+                message: `The permission handler failed: ${err instanceof Error ? err.message : String(err)}`,
+              };
+            } finally {
+              pendingPermissions--;
+            }
+          }
+          send({ type: "control_response", response: { subtype: "success", request_id: requestId, response: decision } });
+        };
+
+        if (turns) void nextTurn();
+        else send({ type: "user", message: { role: "user", content: firstPrompt }, parent_tool_use_id: null });
 
         // Each line is recorded and timed as it arrives, so a run that is
         // killed still leaves evidence of how far it got. The longest silence
@@ -592,7 +808,8 @@ function createCLIQueryFn(cliBin: string): QueryFn {
             abortController: ac,
             timeoutMs,
             idleTimeoutMs: idleMs,
-            input: prompt,
+            idleExempt: () => awaitingInput || pendingPermissions > 0,
+            input: feed,
             onLine,
             onStderr,
           })) {
@@ -618,7 +835,15 @@ function createCLIQueryFn(cliBin: string): QueryFn {
             const t = typeof obj.type === "string" ? obj.type : "(no type)";
             typeCounts[t] = (typeCounts[t] || 0) + 1;
 
+            // Permission requests are answered here; the caller never sees them.
+            if (t === "control_request") {
+              void answerControlRequest(obj);
+              continue;
+            }
+
             if (t === "result") {
+              // Close a one-shot run's stdin, or send a Session's next message.
+              void nextTurn();
               const r = obj.result;
               logDiag("info", {
                 requestId: traceId,
@@ -657,6 +882,7 @@ function createCLIQueryFn(cliBin: string): QueryFn {
           }
           throw err;
         } finally {
+          feed.end();
           clearInterval(progress);
           logTiming(outcome);
 
@@ -675,39 +901,110 @@ function createCLIQueryFn(cliBin: string): QueryFn {
   };
 }
 
-async function resolveSDK(): Promise<QueryFn> {
+async function resolveQueryFn(): Promise<QueryFn> {
   if (cachedQueryFn) return cachedQueryFn;
+  const cli = findClaudeCLI();
+  if (!cli) throw new AgentError("SDK_NOT_FOUND", CLI_NOT_FOUND_MESSAGE);
+  cachedQueryFn = createCLIQueryFn(cli.path);
+  return cachedQueryFn;
+}
 
-  // 1. Prefer the on-PATH `claude` CLI binary. It is the user's installed
-  //    version (e.g. 2.1.201) and matches what they run in their shell,
-  //    whereas the bundled npm SDK may ship a stale cli.js (e.g. 1.0.128)
-  //    that rejects flag combinations newer models require.
-  const cliBin = findClaudeCLI();
-  if (cliBin) {
-    cachedQueryFn = createCLIQueryFn(cliBin);
-    resolvedMode = "cli";
-    return cachedQueryFn;
-  }
+/** What one no-cost start of the claude CLI reported (probeClaudeCLI). */
+export interface CLIProbe {
+  /** Exit code, or null if the CLI was killed or could not start. */
+  exitCode: number | null;
+  /** The system/init message, or null if the CLI printed none. */
+  init: Record<string, unknown> | null;
+  /** The result message, or null if the CLI printed none. */
+  result: Record<string, unknown> | null;
+  stderr: string;
+}
 
-  // 2. Fall back to the npm SDK packages if no CLI is on PATH.
-  for (const pkg of ["@anthropic-ai/claude-code", "@anthropic-ai/claude-agent-sdk"]) {
-    try {
-      const mod = await import(pkg);
-      const fn = mod.query || mod.default?.query;
-      if (typeof fn === "function") {
-        cachedQueryFn = fn as QueryFn;
-        resolvedMode = "sdk";
-        return cachedQueryFn;
+/**
+ * Start the claude CLI with the flags `opts` produce (see buildCLICommand) and
+ * send it one user message marked `shouldQuery: false`, which the CLI records
+ * without calling the model. It costs nothing, yet the CLI still validates
+ * every flag and reports its tools and MCP servers in its system/init message.
+ * Rejects when there is no claude CLI on PATH.
+ */
+export async function probeClaudeCLI(opts: Record<string, unknown> = {}, timeoutMs = 60_000): Promise<CLIProbe> {
+  const cli = findClaudeCLI();
+  if (!cli) throw new AgentError("SDK_NOT_FOUND", CLI_NOT_FOUND_MESSAGE);
+  const argv = buildCLICommand(cli.path, opts);
+  const input = JSON.stringify({
+    type: "user",
+    message: { role: "user", content: "ping" },
+    parent_tool_use_id: null,
+    shouldQuery: false,
+  }) + "\n";
+
+  return new Promise<CLIProbe>((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let done = false;
+    const child = spawn(argv[0], argv.slice(1), {
+      cwd: opts.cwd ? String(opts.cwd) : undefined,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    const finish = (exitCode: number | null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      let init: Record<string, unknown> | null = null;
+      let result: Record<string, unknown> | null = null;
+      for (const line of stdout.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const m = JSON.parse(line) as Record<string, unknown>;
+          if (m.type === "system" && m.subtype === "init" && !init) init = m;
+          if (m.type === "result") result = m;
+        } catch {
+          // Not JSON; ignore.
+        }
       }
-    } catch {
-      // Try next
-    }
-  }
+      resolve({ exitCode, init, result, stderr });
+    };
+    child.stdout?.on("data", (c: Buffer) => { stdout += c.toString("utf-8"); });
+    child.stderr?.on("data", (c: Buffer) => { stderr += c.toString("utf-8"); });
+    child.on("error", (err) => { stderr += String(err); finish(null); });
+    child.on("close", (code) => finish(code));
+    child.stdin?.on("error", () => { /* the CLI exited before reading its input */ });
+    child.stdin?.end(input);
+  });
+}
 
-  throw new AgentError(
-    "SDK_NOT_FOUND",
-    "Could not find Claude Code. Install it from https://docs.anthropic.com/en/docs/claude-code or:\n  npm install -g @anthropic-ai/claude-code"
-  );
+/** The outcome of verifyClaudeCLI. */
+export interface CLIVerification {
+  ok: boolean;
+  /** The CLI checked, or null when there is none on PATH. */
+  cli: ClaudeCLIInfo | null;
+  /** Why ok is false. */
+  problem?: string;
+}
+
+/**
+ * Check that the installed claude CLI accepts the flags Otterly passes and,
+ * with them, offers no tools and loads no MCP servers. Costs nothing (see
+ * probeClaudeCLI). The server refuses to start when this fails.
+ */
+export async function verifyClaudeCLI(): Promise<CLIVerification> {
+  const cli = findClaudeCLI();
+  if (!cli) return { ok: false, cli, problem: CLI_NOT_FOUND_MESSAGE };
+  const probe = await probeClaudeCLI({});
+  if (probe.exitCode !== 0 || !probe.init) {
+    const detail = probe.stderr.trim().slice(-500) || "no output";
+    return { ok: false, cli, problem: `claude ${cli.version} did not start with Otterly's flags (exit ${probe.exitCode}): ${detail}` };
+  }
+  const tools = probe.init.tools;
+  if (!Array.isArray(tools) || tools.length > 0) {
+    return { ok: false, cli, problem: `claude ${cli.version} still offers tools with --tools "": ${JSON.stringify(tools)}` };
+  }
+  const mcp = probe.init.mcp_servers;
+  if (!Array.isArray(mcp) || mcp.length > 0) {
+    return { ok: false, cli, problem: `claude ${cli.version} still loads MCP servers with an empty --mcp-config: ${JSON.stringify(mcp)}` };
+  }
+  return { ok: true, cli };
 }
 
 export class ClaudeEngine {
@@ -834,7 +1131,7 @@ export class ClaudeEngine {
    */
   async *stream(prompt: string, options?: EngineOptions): AsyncGenerator<AgentEvent> {
     const opts = this.mergeOptions(options);
-    const queryFn = this.queryFnOverride || await resolveSDK();
+    const queryFn = this.queryFnOverride || await resolveQueryFn();
 
     const abortController = new AbortController();
     if (opts.signal) {
@@ -849,11 +1146,6 @@ export class ClaudeEngine {
       abortController,
       cwd: opts.cwd || process.cwd(),
       permissionMode: opts.permissionMode || "bypassPermissions",
-      includePartialMessages: true,
-      // Surface the underlying `claude` subprocess's stderr. The SDK otherwise
-      // swallows it and only throws a bare "process exited with code 1". This
-      // prints the real cause (auth/policy/model error) to the server terminal.
-      stderr: (data: string) => process.stderr.write(`[claude stderr] ${data}`),
     };
 
     if (opts.model) queryOptions.model = opts.model;
@@ -865,23 +1157,11 @@ export class ClaudeEngine {
     if (opts.resume) queryOptions.resume = opts.resume;
     if (opts.traceId) queryOptions.traceId = opts.traceId;
     if (opts.timeoutMs !== undefined) queryOptions.timeoutMs = opts.timeoutMs;
+    if (opts.idleTimeoutMs !== undefined) queryOptions.idleTimeoutMs = opts.idleTimeoutMs;
+    if (opts.tools) queryOptions.tools = opts.tools;
 
-    // The SDK option is `customSystemPrompt` (see @anthropic-ai/claude-code
-    // sdk.d.ts), NOT `systemPrompt` — passing the latter is silently ignored,
-    // leaving Claude Code's *default* system prompt in place. That default is
-    // where the dynamic cwd / env info / git-status sections live (per
-    // `claude --help`: --exclude-dynamic-system-prompt-sections). So always
-    // set customSystemPrompt to strip that injection: honour the caller's
-    // system prompt when present, otherwise fall back to a neutral one so the
-    // model behaves like a plain text-in/text-out chat API.
-    queryOptions.customSystemPrompt = opts.systemPrompt
-      ? String(opts.systemPrompt)
-      : "You are a helpful assistant.";
-
-    // Also forward under otterly's own `systemPrompt` name, but ONLY when the
-    // caller actually provided one — so a caller-supplied system prompt reaches
-    // consumers that read `systemPrompt`, while "no system message" leaves it
-    // unset (preserving the no-hidden-default contract).
+    // Only a caller-supplied system prompt is forwarded; buildCLICommand fills
+    // in a neutral one, so "no system message" never carries a hidden default.
     if (opts.systemPrompt) {
       queryOptions.systemPrompt = String(opts.systemPrompt);
     }
@@ -1012,13 +1292,13 @@ export class ClaudeEngine {
    */
   session(options?: EngineOptions): Session {
     const opts = this.mergeOptions(options);
-    // Session needs the query function — resolve it lazily on first send()
-    // We wrap it in a lazy resolver to avoid top-level await
+    const override = this.queryFnOverride;
+    // Resolve the query function on the first send(), to avoid a top-level await.
     let resolvedFn: QueryFn | null = null;
 
     const lazyQueryFn: QueryFn = async function* (args) {
       if (!resolvedFn) {
-        resolvedFn = await resolveSDK();
+        resolvedFn = override ?? await resolveQueryFn();
       }
       yield* resolvedFn(args);
     };

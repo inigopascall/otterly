@@ -388,16 +388,57 @@ describe("Claude client-tool isolation", () => {
   function engine(messages: Record<string, unknown>[]) {
     return new ClaudeEngine({}, async function* () { for (const message of messages) yield message; });
   }
+  function flagValue(argv: string[], flag: string) {
+    expect(argv).toContain(flag);
+    return argv[argv.indexOf(flag) + 1];
+  }
   it("builds an isolated command with a turn limit", () => {
-    const cmd = buildCLICommand("claude", "hello", { maxTurns: 1 });
+    const cmd = buildCLICommand("claude", { maxTurns: 1 });
     expect(cmd).toContain("--safe-mode");
     expect(cmd).toContain("--strict-mcp-config");
-    expect(cmd).toContain(`--mcp-config '{"mcpServers":{}}'`);
-    expect(cmd).toContain("--tools ''");
-    expect(cmd).toContain("--max-turns 1");
+    expect(flagValue(cmd, "--mcp-config")).toBe('{"mcpServers":{}}');
+    expect(flagValue(cmd, "--tools")).toBe("");
+    expect(flagValue(cmd, "--max-turns")).toBe("1");
+    expect(flagValue(cmd, "--disallowedTools")).toBe("*");
+    expect(flagValue(cmd, "--input-format")).toBe("stream-json");
+    expect(flagValue(cmd, "--output-format")).toBe("stream-json");
+    expect(flagValue(cmd, "--thinking-display")).toBe("summarized");
+    expect(flagValue(cmd, "--system-prompt")).toBe("You are a helpful assistant.");
+    expect(flagValue(cmd, "--setting-sources")).toBe("");
+    expect(cmd).toContain("-p");
+    expect(cmd).toContain("--verbose");
+    expect(cmd).toContain("--include-partial-messages");
   });
   it.each([0, -1, 1.5, "1"])("rejects invalid maxTurns %s", (maxTurns) => {
-    expect(() => buildCLICommand("claude", "", { maxTurns })).toThrow("maxTurns must be a positive safe integer");
+    expect(() => buildCLICommand("claude", { maxTurns })).toThrow("maxTurns must be a positive safe integer");
+  });
+  it("passes explicit tools without wildcard disallowance", () => {
+    const cmd = buildCLICommand("claude", { tools: ["Read", "Grep"] });
+    expect(cmd).toContain("--safe-mode");
+    expect(flagValue(cmd, "--tools")).toBe("Read,Grep");
+    const values = cmd
+      .map((value, index) => value === "--disallowedTools" ? cmd[index + 1] : undefined)
+      .filter((value): value is string => value !== undefined);
+    expect(values).not.toContain("*");
+  });
+  it("passes MCP configuration without safe mode", () => {
+    const cmd = buildCLICommand("claude", { mcpServers: { probe: { command: "/bin/false" } } });
+    expect(cmd).not.toContain("--safe-mode");
+    expect(cmd).toContain("--strict-mcp-config");
+    expect(flagValue(cmd, "--mcp-config")).toBe('{"mcpServers":{"probe":{"command":"/bin/false"}}}');
+    const values = cmd
+      .map((value, index) => value === "--disallowedTools" ? cmd[index + 1] : undefined)
+      .filter((value): value is string => value !== undefined);
+    expect(values).not.toContain("*");
+  });
+  it("passes canUseTool as permission-prompt-tool stdio", () => {
+    const cmd = buildCLICommand("claude", { canUseTool: () => ({ behavior: "allow" }) });
+    expect(flagValue(cmd, "--permission-prompt-tool")).toBe("stdio");
+  });
+  it("passes a custom system prompt verbatim", () => {
+    const prompt = "Caller's exact prompt";
+    const cmd = buildCLICommand("claude", { systemPrompt: prompt });
+    expect(flagValue(cmd, "--system-prompt")).toBe(prompt);
   });
   it("rejects native calls even without tool results", async () => {
     await expect(engine([native, result]).run("hello", { clientToolCalls: true })).rejects.toMatchObject({ code: "NATIVE_TOOL_CALL" });

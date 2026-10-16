@@ -7,19 +7,19 @@ import type {
 import { normalizeEvents, createEventContext, type EventContext } from "./events.js";
 import { classifyError, AgentError } from "./errors.js";
 import { wrapPermissionHandler } from "./permissions.js";
-
-type QueryFn = (args: { prompt: unknown; options: Record<string, unknown> }) => AsyncIterable<Record<string, unknown>>;
+import type { QueryFn } from "./engine.js";
 
 /**
  * Multi-turn session that keeps conversation context alive across send() calls.
  *
- * Uses the SDK's streaming input mode: an async generator yields user messages
- * on demand, and the SDK processes them within one long-lived query() call.
+ * Uses the claude CLI's streaming input mode: an async generator yields user
+ * messages on demand, and one long-lived `claude -p` process answers them as a
+ * single conversation (see createCLIQueryFn in engine.ts).
  *
- * Internally, the SDK iteration runs in the background. Events are queued and
+ * Internally, the query iteration runs in the background. Events are queued and
  * pulled by sendStream(). After a result event, sendStream() returns but the
- * background loop continues — allowing the SDK to call prompt.next() and await
- * the next user message.
+ * background loop continues — the query function then calls prompt.next() and
+ * awaits the next user message.
  */
 export class Session {
   private options: EngineOptions;
@@ -48,7 +48,7 @@ export class Session {
     }
   }
 
-  /** Session ID from the SDK. Available after first send(). */
+  /** Session ID reported by the CLI. Available after the first send(). */
   get id(): string | null {
     return this._sessionId;
   }
@@ -221,7 +221,6 @@ export class Session {
       abortController: this.abortController,
       cwd: this.options.cwd || process.cwd(),
       permissionMode: this.options.permissionMode || "bypassPermissions",
-      includePartialMessages: true,
     };
 
     if (this.options.model) queryOptions.model = this.options.model;
@@ -232,6 +231,9 @@ export class Session {
     if (this.options.effort) queryOptions.effort = this.options.effort;
     if (this.options.resume) queryOptions.resume = this.options.resume;
     if (this.options.systemPrompt) queryOptions.systemPrompt = this.options.systemPrompt;
+    if (this.options.tools) queryOptions.tools = this.options.tools;
+    if (this.options.traceId) queryOptions.traceId = this.options.traceId;
+    if (this.options.idleTimeoutMs !== undefined) queryOptions.idleTimeoutMs = this.options.idleTimeoutMs;
 
     if (this.options.onPermission) {
       queryOptions.permissionMode = "default";

@@ -31,6 +31,7 @@ const result = await claude.run(
   - Don't over-mock — use real objects where possible`,
   {
     cwd: process.cwd(),
+    tools: ["default"],
     permissionMode: "acceptEdits",
   }
 );

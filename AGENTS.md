@@ -1,5 +1,5 @@
 ---
-verified: 2026-10-15
+verified: 2026-10-16
 verified_by: workhorse
 ---
 
@@ -22,21 +22,22 @@ requests; Otterly fulfils them by driving a locally installed,
 already-authenticated Claude Code. This uses a **flat-rate subscription**
 instead of per-token API rates.
 
-**Transport:** the on-PATH `claude` CLI, with the `@anthropic-ai/claude-code`
-npm SDK as a fallback when no CLI is found (§5).
+**Transport:** the `claude` CLI on PATH, and nothing else. Otterly refuses to
+start without it (§5).
 
 **Behaviour:**
-- Large prompts are piped via **stdin** (avoids `E2BIG` "argument list too long").
+- Each run is one `claude -p --input-format stream-json --output-format
+  stream-json` process. The conversation is written to its stdin as stream-json
+  user messages, so large prompts never hit `E2BIG` ("argument list too long").
 - Streaming emits incremental text deltas; the final consolidated block is
   suppressed once deltas have been sent.
 - A function-calling bridge converts the model's tool-call intent into OpenAI
   `tool_calls`, so clients drive tool execution.
-- The CLI path uses safe-mode, empty built-in tools, strict empty MCP configuration,
-  and forwards `maxTurns`; the SDK fallback is not described as verified isolation.
+- Every run is isolated unless the caller opts in (§2).
 - The CLI runs with `--include-partial-messages --thinking-display summarized`, so
   the model's summarised thinking and its reply arrive as `stream_event` lines
-  while they are generated. Streamed responses relay them as `reasoning_content`
-  and `content` chunks (§11).
+  while they are generated. Streamed responses relay them as
+  `reasoning_content` and `content` chunks (§11).
 - When `clientToolCalls` is enabled, unexpected native tool inventory or activity
   is rejected; a native `tool_use` block is rejected as soon as it starts. A
   non-streamed request gets HTTP 502; a streamed one has its connection dropped
@@ -46,11 +47,30 @@ npm SDK as a fallback when no CLI is found (§5).
 
 ## 2. Security Posture
 
-- **Native tools** — the CLI path applies safe-mode, empty built-ins, and a strict
-  empty MCP config. With `clientToolCalls`, unexpected native inventory/activity is
-  rejected as soon as it appears: HTTP 502 for a non-streamed request, a dropped
-  connection for a streamed one. This is not a pre-execution sandbox claim.
-  `maxTurns` is forwarded to the CLI.
+- **Isolation** — `buildCLICommand` in `engine.ts` gives every run:
+  - `--tools ""`: no built-in tools, including any a later Claude Code release adds;
+  - `--disallowedTools "*"`: a deny rule matching every tool, whatever its source;
+  - `--safe-mode`: no CLAUDE.md, hooks, plugins, skills, MCP servers or auto memory;
+  - `--setting-sources ""`: no user, project or local settings;
+  - `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`: no MCP servers.
+
+  The HTTP routes and `/ws` never opt out. A library caller opts in with `tools`
+  (named built-ins, or `["default"]` for Claude Code's default set), which drops
+  `--disallowedTools "*"`, or with `mcpServers`, which also drops `--safe-mode`,
+  because safe mode stops servers named in `--mcp-config` from loading.
+- **Startup check** — before listening, the server runs `verifyClaudeCLI()`: one
+  start of the CLI with the default flags and a user message marked
+  `shouldQuery: false`, which the CLI records without calling the model, so it
+  costs nothing. The server refuses to start if the CLI is missing, exits
+  non-zero, or reports any tool or MCP server in its `system/init` message.
+  `verifyCli: false` on `startApiServer` skips the check; the tests use it.
+- **Native tool activity** — with `clientToolCalls`, unexpected native
+  inventory/activity is rejected as soon as it appears: HTTP 502 for a
+  non-streamed request, a dropped connection for a streamed one. This is
+  detection, not a pre-execution sandbox. `maxTurns` is forwarded to the CLI.
+- **Permission handler** — a library caller's `onPermission` answers the CLI's
+  `can_use_tool` requests over stdio (§5). Read-only tools such as `Read` may run
+  without a request. A request that arrives with no handler set is denied.
 - **Unparsed tool-call intent** — a tool-enabled reply that cannot be parsed or
   repaired into OpenAI `tool_calls` is rejected rather than returned as prose
   (HTTP 502 non-streamed; a dropped connection streamed, §11), when it shows
@@ -73,17 +93,20 @@ npm SDK as a fallback when no CLI is found (§5).
 | File | Role |
 |---|---|
 | `src/cli.ts` | Parses flags and environment variables; starts the server |
-| `src/engine.ts` | Claude engine, CLI command builder, `spawnWithAbort` and `streamLines` |
+| `src/engine.ts` | Claude engine, CLI command builder, stdio transport, startup check, `spawnWithAbort` and `streamLines` |
 | `src/events.ts` | Claude NDJSON → `AgentEvent` parser (`text_delta`, `thinking_delta`) |
-| `src/session.ts` | Claude multi-turn SDK session (used by `/ws`) |
+| `src/session.ts` | Multi-turn `Session`: one CLI process per conversation (used by `/ws`) |
+| `src/permissions.ts` | `wrapPermissionHandler`, `READONLY`, `AUTOPILOT` |
 | `src/server/engine-factory.ts` | `makeEngine()` — the engine every HTTP route uses; tests replace it |
 | `src/server/routes-openai.ts` | `/v1/chat/completions`; sets `clientToolCalls` |
-| `src/server/ws-handler.ts` | `/ws` sessions; sets `disallowedTools` |
+| `src/server/ws-handler.ts` | `/ws` sessions |
 | `src/server/models.ts` | Model catalog |
-| `src/server/openai-compat.ts` | OpenAI translation, `CLAUDE_BUILTIN_TOOLS`, tool bridge |
+| `src/server/openai-compat.ts` | OpenAI translation and the tool bridge |
 | `src/server/sse-stream.ts` | `SseStream`: the SSE chunks of one streamed completion |
 | `src/server/tool-call-stream.ts` | `ToolCallStreamer, reconcileStreamedCalls`: live tool calls |
 | `src/server/retry-notice.ts` | Remembers dropped requests; notice on the retry |
+| `tests/fixtures/fake-claude.mjs` | A stand-in CLI that speaks stream-json, for `tests/cli-transport.test.ts` |
+| `tests-cli/claude-cli.test.ts` | The CLI suite: checks the real installed `claude` (§7) |
 
 ---
 
@@ -97,15 +120,34 @@ provider with base URL `http://localhost:11435/v1`.
 
 ---
 
-## 5. Scope Notes
+## 5. Transport and the Claude CLI
 
-- **`Session`** is the multi-turn path and serves the `/ws` endpoint. One-shot
-  routes (`/v1/chat/completions`, `/api/run`, `/api/stream`, Ollama routes) use
-  `run()`/`stream()`.
-- **Transport selection** (`resolveSDK` in `engine.ts`): the on-PATH `claude`
-  CLI is tried **first**, and the npm SDK is used only when no CLI is found.
-  Both paths produce `stream_event` messages, so both emit `text_delta` and
-  `thinking_delta` events.
+- **Finding the CLI** — `findClaudeCLI()` looks for `claude`, then `claude-code`,
+  on PATH, and caches its path and `--version` output. The startup banner's
+  `Claude CLI` line shows both. There is no other transport: without a CLI,
+  every run fails with `SDK_NOT_FOUND`.
+- **One-shot runs** (`/v1/chat/completions`, `/api/run`, `/api/stream`, Ollama
+  routes) use `run()`/`stream()`: one user message, and stdin is closed when its
+  `result` arrives.
+- **`Session`** (library and `/ws`) keeps one CLI process for the whole
+  conversation: each `send()` writes the next user message, and the CLI emits
+  one `result` per turn. `resume`, on a one-shot run or a session, passes
+  `--resume <session id>`.
+- **Permission requests** — with a handler set, the CLI runs with
+  `--permission-prompt-tool stdio` and sends
+  `{"type":"control_request","request_id":…,"request":{"subtype":"can_use_tool","tool_name":…,"input":…}}`
+  on stdout. `createCLIQueryFn` answers on stdin with
+  `{"type":"control_response","response":{"subtype":"success","request_id":…,"response":{"behavior":"allow","updatedInput":…}}}`,
+  or `"behavior":"deny"` with a `"message"`. This is the protocol the Agent SDK
+  uses; `tests/cli-transport.test.ts` and the CLI suite cover it.
+- **Tested version** — `TESTED_CLAUDE_CLI_VERSION` in `engine.ts` is the Claude
+  Code version the CLI suite last passed against. The banner warns when the
+  installed version differs.
+- **After a Claude Code upgrade**, run the CLI suite (§7). If it passes, set
+  `TESTED_CLAUDE_CLI_VERSION` to the new version. If it fails, go back to the
+  previous Claude Code version and open an issue with the failing output.
+  `--thinking-display` is absent from the official CLI reference, so it is the
+  flag most likely to change; the suite checks it.
 
 ## 6. Building and re-deploying the global install
 
@@ -124,8 +166,21 @@ pnpm dlx vitest run
 ```
 
 `vitest.config.ts` sets `OTTERLY_DISABLE_CLAUDE_CLI=1`, which makes
-`findClaudeCLI()` return null, so tests use the mocked npm SDK and never spawn
-a real `claude`.
+`findClaudeCLI()` return null, so the default suite never spawns a real
+`claude`. Tests fake the CLI by injecting a query function: with
+`setQueryFnForTests()`, as the server tests do, or as the second argument of
+`new ClaudeEngine()`. `tests/cli-transport.test.ts` drives the stdin/stdout
+protocol against `tests/fixtures/fake-claude.mjs`.
+
+The **CLI suite** (`tests-cli/`) checks the real installed `claude`: the
+startup check, every flag Otterly can pass (at no cost), and a few short,
+low-effort conversations on the subscription (streaming, a two-turn session,
+resume, a denied and an approved write). Run it after every Claude Code
+upgrade (§5):
+
+```
+pnpm dlx vitest run --config vitest.cli.config.ts
+```
 
 ## 8. Request tracing
 
@@ -143,8 +198,8 @@ containing:
 | File | Contents |
 |---|---|
 | `request.json` | The OpenAI request body as received |
-| `command.txt` | The exact `claude` command line |
-| `prompt.txt` | The exact bytes written to the CLI's stdin |
+| `command.txt` | The exact `claude` command line, shell-quoted |
+| `prompt.txt` | Every stream-json line written to the CLI's stdin, in order: user messages and answers to permission requests |
 | `run-result-event.txt` | Text carried by the `result` line |
 | `run-text-blocks.txt` | Concatenation of every assistant text block |
 | `run-text-deltas.txt` | Concatenation of every streamed delta |
@@ -239,6 +294,10 @@ The Claude CLI's own hard timer is set 60 s past the server's hard cap
 (`CLI_BACKSTOP_MS` in `engine.ts`), so the server always reports the timeout
 first.
 
+A `Session` has no hard cap, since it waits between turns for as long as its
+caller does. The idle limit does not count the time it spends waiting for its
+next message or for a permission handler's decision.
+
 Claude CLI children run in their own process groups, so Ctrl+C in the server's
 terminal does not reach them. On SIGINT or SIGTERM the server sends SIGTERM to
 every live child, drains for up to 10 s, then sends SIGKILL (`killAllChildren`
@@ -290,7 +349,7 @@ kept 10 minutes); the retry's reasoning opens with a notice such as
 `⚠️ Otterly: the previous attempt … (attempt 2)`. The console shows
 `stream_dropped_for_retry`.
 
-Non-streamed tool requests are buffered, and fail with HTTP 502 as in §4.
+Non-streamed tool requests are buffered, and fail with HTTP 502 as in §2.
 
 ## Verify
 
@@ -341,4 +400,15 @@ grep -F -c '"sse-out.tsv"' src/server/sse-stream.ts                             
 grep -F -c '"dropped_for_retry"' src/server/settle.ts                            # 2
 grep -F -c '"request_fingerprint"' src/server/routes-openai.ts                   # 1
 grep -F -c '"cli_api_error"' src/engine.ts                                       # 1
+grep -c 'anthropic-ai/claude-code' package.json                                  # 0
+grep -rlE 'resolveSDK|CLAUDE_BUILTIN_TOOLS|customSystemPrompt' src tests | wc -l # 0
+grep -F -c 'parts.push("--tools", tools.join(","));' src/engine.ts               # 1
+grep -F -c 'parts.push("--disallowedTools", "*");' src/engine.ts                 # 1
+grep -F -c 'parts.push("--permission-prompt-tool", "stdio");' src/engine.ts      # 1
+grep -F -c 'export const TESTED_CLAUDE_CLI_VERSION = "2.1.296";' src/engine.ts   # 1
+grep -F -c 'export function setQueryFnForTests' src/engine.ts                    # 1
+grep -F -c 'await verifyClaudeCLI()' src/server/index.ts                         # 1
+grep -F -c '"test:cli": "vitest run --config vitest.cli.config.ts"' package.json # 1
+test -f tests-cli/claude-cli.test.ts && echo present                             # present
+test -f tests/fixtures/fake-claude.mjs && echo present                           # present
 ```

@@ -98,9 +98,9 @@ let base: string;
 let slowBase: string;
 
 beforeAll(async () => {
-  handle = await startApiServer({ port: 0, workingDir: "/tmp" });
+  handle = await startApiServer({ port: 0, workingDir: "/tmp", verifyCli: false });
   base = `http://localhost:${(handle.server.address() as { port: number }).port}`;
-  slow = await startApiServer({ port: 0, workingDir: "/tmp", streamTimeoutMs: 300 });
+  slow = await startApiServer({ port: 0, workingDir: "/tmp", streamTimeoutMs: 300, verifyCli: false });
   slowBase = `http://localhost:${(slow.server.address() as { port: number }).port}`;
 });
 afterAll(() => { handle.close(); slow.close(); });

@@ -8,18 +8,15 @@
 // what Claude Code sees. No hidden anti-tool guardrails. If a regression
 // reintroduces one, these tests fail.
 
-import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import http from "http";
+import { setQueryFnForTests, type QueryFn } from "../../src/engine.js";
 
-// Capture what the engine was called with. Vitest hoists vi.mock(), so we
-// stash the spy on globalThis and reach it from the test body.
 const queryCalls: Array<{ prompt: unknown; options: Record<string, unknown> }> = [];
-(globalThis as unknown as { __queryCalls: typeof queryCalls }).__queryCalls = queryCalls;
 
-vi.mock("@anthropic-ai/claude-code", () => ({
-  query: vi.fn(({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
-    const calls = (globalThis as unknown as { __queryCalls: typeof queryCalls }).__queryCalls;
-    calls.push({ prompt, options });
+// Inject a query implementation that records the options passed to the engine.
+const query: QueryFn = ({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
+    queryCalls.push({ prompt, options });
     return (async function* () {
       yield {
         type: "system",
@@ -43,8 +40,7 @@ vi.mock("@anthropic-ai/claude-code", () => ({
         usage: { input_tokens: 1, output_tokens: 1 },
       };
     })();
-  }),
-}));
+};
 
 import { startApiServer, type ApiServerHandle } from "../../src/server/index.js";
 
@@ -82,7 +78,8 @@ const lastCall = () => queryCalls[queryCalls.length - 1];
 
 describe("OpenAI-compat system prompt passthrough", () => {
   beforeAll(async () => {
-    handle = await startApiServer({ port: 0, workingDir: "/test" });
+    setQueryFnForTests(query);
+    handle = await startApiServer({ port: 0, workingDir: "/test", verifyCli: false });
     const addr = handle.server.address() as { port: number };
     baseUrl = `http://localhost:${addr.port}`;
   });
@@ -90,6 +87,7 @@ describe("OpenAI-compat system prompt passthrough", () => {
   afterAll(() => {
     handle.close();
     queryCalls.length = 0;
+    setQueryFnForTests(null);
   });
 
   // Phrases that MUST NOT appear in the system prompt sent to Claude Code.

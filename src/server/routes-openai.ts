@@ -25,7 +25,6 @@ import {
   parseToolCalls,
   describeToolCallIntent,
   toOpenAIToolCalls,
-  CLAUDE_BUILTIN_TOOLS,
   TOOL_CALL_REMINDER,
   toOpenAIUsage,
   type OpenAIChatRequest,
@@ -291,11 +290,13 @@ export async function handleChatCompletions(
   }
 
   // Function calling: when the client supplies `tools`, OpenAI semantics say the
-  // CLIENT executes them. We teach Claude to emit a tool-call JSON object and
-  // disable its own built-in tools so it never runs Bash/Write on the server.
-  // The directive goes into the user turn (not the system prompt) because
-  // Claude Code's agentic prior otherwise overrides a system-level instruction
-  // and refuses ("I can't access live data") instead of emitting the call.
+  // CLIENT executes them. We teach Claude to emit a tool-call JSON object.
+  // Claude's own built-in tools are always off here (options.tools is unset),
+  // so it never runs Bash/Write on the server; the OpenAI-compatible client
+  // drives all tool use. The directive goes into the user turn (not the system
+  // prompt) because Claude Code's agentic prior otherwise overrides a
+  // system-level instruction and refuses ("I can't access live data") instead
+  // of emitting the call.
   const wantsTools =
     Array.isArray(body.tools) && body.tools.length > 0 && body.tool_choice !== "none";
   let enginePrompt = prompt;
@@ -305,14 +306,7 @@ export async function handleChatCompletions(
     // above it sits at the top of a prompt that can run to hundreds of thousands
     // of characters, far from where the model actually starts generating.
     enginePrompt = `${instruction}\n\n=== USER REQUEST ===\n${prompt}\n\n${TOOL_CALL_REMINDER}`;
-    options.disallowedTools = CLAUDE_BUILTIN_TOOLS;
     options.clientToolCalls = true;
-  } else {
-    // No client tools: behave like a plain chat model. Disable Claude Code's
-    // built-in tools so it cannot autonomously read/edit files or run commands
-    // on the server — the OpenAI-compatible client (e.g. AiderDesk) drives all
-    // tool use, and every tool call stays visible to and controlled by it.
-    options.disallowedTools = CLAUDE_BUILTIN_TOOLS;
   }
 
   if (finalSystemPrompt) {

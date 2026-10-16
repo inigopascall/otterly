@@ -1,15 +1,15 @@
-import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import WebSocket from "ws";
+import { setQueryFnForTests, type QueryFn } from "../../src/engine.js";
 
-vi.mock("@anthropic-ai/claude-code", () => ({
-  query: vi.fn(() => (async function* () {
+// Inject a deterministic query stream for WebSocket route tests.
+const query: QueryFn = () => (async function* () {
     yield { type: "system", subtype: "init", session_id: "ws-s1", model: "m", cwd: "/tmp", tools: [] };
     yield { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hel" } } };
     yield { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "lo" } } };
     yield { type: "assistant", message: { content: [{ type: "text", text: "Hello" }] } };
     yield { type: "result", subtype: "success", result: "Hello", total_cost_usd: 0, duration_ms: 1, session_id: "ws-s1", usage: { input_tokens: 1, output_tokens: 1 } };
-  })()),
-}));
+  })();
 
 import { startApiServer, type ApiServerHandle } from "../../src/server/index.js";
 
@@ -17,10 +17,14 @@ let handle: ApiServerHandle;
 let port: number;
 
 beforeAll(async () => {
-  handle = await startApiServer({ port: 0, workingDir: "/tmp" });
+  setQueryFnForTests(query);
+  handle = await startApiServer({ port: 0, workingDir: "/tmp", verifyCli: false });
   port = (handle.server.address() as { port: number }).port;
 });
-afterAll(() => handle.close());
+afterAll(() => {
+  handle.close();
+  setQueryFnForTests(null);
+});
 
 describe("/ws streaming", () => {
   it("sends text deltas and not the consolidated text block", async () => {

@@ -22,9 +22,10 @@ export const READONLY: PermissionHandler = ({ tool }) => {
 };
 
 /**
- * Wrap our simple PermissionHandler into the SDK's canUseTool callback shape.
+ * Wrap our simple PermissionHandler into the canUseTool callback that answers
+ * the claude CLI's can_use_tool permission requests (see createCLIQueryFn).
  *
- * SDK expects: (toolName, input, options) => { behavior, updatedInput?, message? }
+ * The CLI expects: { behavior: "allow", updatedInput } | { behavior: "deny", message }
  * We accept: ({ tool, input, reason }) => { allow, updatedInput?, message? }
  */
 export function wrapPermissionHandler(

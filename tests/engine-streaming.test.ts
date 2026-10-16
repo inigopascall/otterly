@@ -22,9 +22,10 @@ describe("test isolation", () => {
 
 describe("buildCLICommand partial messages", () => {
   it("asks the CLI for partial messages and summarised thinking", () => {
-    const cmd = buildCLICommand("claude", "prompt", {});
+    const cmd = buildCLICommand("claude", {});
     expect(cmd).toContain("--include-partial-messages");
-    expect(cmd).toContain("--thinking-display summarized");
+    expect(cmd).toContain("--thinking-display");
+    expect(cmd[cmd.indexOf("--thinking-display") + 1]).toBe("summarized");
   });
 });
 

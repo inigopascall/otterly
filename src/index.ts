@@ -1,4 +1,11 @@
 export { ClaudeEngine } from "./engine.js";
+export {
+  findClaudeCLI,
+  probeClaudeCLI,
+  verifyClaudeCLI,
+  TESTED_CLAUDE_CLI_VERSION,
+} from "./engine.js";
+export type { ClaudeCLIInfo, CLIProbe, CLIVerification } from "./engine.js";
 export { Session } from "./session.js";
 export { AUTOPILOT, READONLY } from "./permissions.js";
 export { AgentError, classifyError } from "./errors.js";

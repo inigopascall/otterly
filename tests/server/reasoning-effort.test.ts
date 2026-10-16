@@ -50,7 +50,7 @@ const request = (extra: Record<string, unknown> = {}) => ({
 
 describe("OpenAI reasoning_effort", () => {
   beforeAll(async () => {
-    handle = await startApiServer({ port: 0, workingDir: "/tmp" });
+    handle = await startApiServer({ port: 0, workingDir: "/tmp", verifyCli: false });
     const address = handle.server.address() as { port: number };
     baseUrl = `http://localhost:${address.port}`;
   });

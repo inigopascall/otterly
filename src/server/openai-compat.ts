@@ -127,22 +127,6 @@ export function toOpenAIUsage(usage: unknown): OpenAIUsage {
   };
 }
 
-/** Claude Code's built-in tool names. When a client supplies its own OpenAI
- *  `tools`, OpenAI semantics say the *client* executes them — so we disable all
- *  of Claude's built-ins to stop it running Bash/Write/etc. on the server.
- *
- *  This list must stay in sync with the tool names the installed `claude` CLI
- *  actually recognises. Unrecognised names cause `claude` to exit 1 with a
- *  "Permission deny rule … matches no known tool" error. The SDK path
- *  (queryOptions.disallowedTools) is more lenient — it silently ignores
- *  unknown names — but the CLI path is strict. */
-export const CLAUDE_BUILTIN_TOOLS = [
-  "Read", "Write", "Edit", "Bash", "BashOutput", "KillShell",
-  "Glob", "Grep", "WebFetch", "WebSearch", "Task", "NotebookEdit",
-  "TodoWrite", "ExitPlanMode", "AskUserQuestion",
-  "Skill", "Monitor", "ToolSearch", "Agent", "TaskCreate", "TaskUpdate",
-];
-
 // ── Conversion Functions ──
 
 /**
@@ -215,8 +199,9 @@ export function openaiToClaudeInput(body: OpenAIChatRequest): {
 // final text — it has no native "stop and emit a tool call" mode. So when an
 // OpenAI client supplies its own `tools` (which IT will execute), we get real
 // function calling by instructing Claude to emit a tool-call JSON object, then
-// parsing that back into OpenAI `tool_calls`. The caller's tools are disabled
-// inside Claude (see CLAUDE_BUILTIN_TOOLS) so it can't run them on the server.
+// parsing that back into OpenAI `tool_calls`. Claude's own built-in tools are
+// disabled (see buildCLICommand in engine.ts), so it cannot run anything on
+// the server.
 
 export interface ParsedToolCall {
   name: string;

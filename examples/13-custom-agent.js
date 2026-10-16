@@ -19,6 +19,7 @@ const docsAgent = new ClaudeEngine({
   - Output documentation to stdout — do not create files`,
 
   // Only allow reading tools — no writes, no bash
+  tools: ["Read", "Glob", "Grep"],
   allowedTools: ["Read", "Glob", "Grep"],
 });
 

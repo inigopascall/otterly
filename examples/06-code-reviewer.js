@@ -30,6 +30,7 @@ const result = await claude.run(
   If the code looks solid, say so briefly.`,
   {
     cwd: process.cwd(),
+    tools: ["Read", "Glob", "Grep"],
     onPermission: READONLY,
   }
 );

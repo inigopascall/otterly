@@ -1,21 +1,17 @@
-import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import http from "http";
+import { setQueryFnForTests, type QueryFn } from "../../src/engine.js";
 
-// Mock the SDK to emit a deterministic "Hello world" turn (same shape the real
-// Claude Code SDK yields: partial text deltas plus a final assistant + result).
-// `h.throwMid` makes the generator throw partway through to exercise the
-// mid-stream error branch.
-const h = vi.hoisted(() => ({ throwMid: false }));
-vi.mock("@anthropic-ai/claude-code", () => ({
-  query: vi.fn(() => (async function* () {
+// Inject a deterministic query stream, including a configurable mid-stream failure.
+const h = { throwMid: false };
+const query: QueryFn = () => (async function* () {
     yield { type: "system", subtype: "init", session_id: "s1", model: "claude-sonnet-4-20250514", cwd: "/test", tools: [] };
     yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hello " } } };
     if (h.throwMid) throw new Error("boom mid-stream");
     yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "world" } } };
     yield { type: "assistant", message: { content: [{ type: "text", text: "Hello world" }] } };
     yield { type: "result", subtype: "success", result: "Hello world", total_cost_usd: 0.01, duration_ms: 100, session_id: "s1", usage: { input_tokens: 10, output_tokens: 5 } };
-  })()),
-}));
+  })();
 
 afterEach(() => { h.throwMid = false; });
 
@@ -45,10 +41,14 @@ function req(path: string, opts: { method?: string; body?: unknown } = {}): Prom
 
 describe("Ollama-native + model discovery routes", () => {
   beforeAll(async () => {
-    handle = await startApiServer({ port: 0, workingDir: "/test" });
+    setQueryFnForTests(query);
+    handle = await startApiServer({ port: 0, workingDir: "/test", verifyCli: false });
     baseUrl = `http://localhost:${(handle.server.address() as { port: number }).port}`;
   });
-  afterAll(() => handle.close());
+  afterAll(() => {
+    handle.close();
+    setQueryFnForTests(null);
+  });
 
   describe("discovery", () => {
     it("GET /v1/models returns an OpenAI model list", async () => {
@@ -150,10 +150,11 @@ describe("Ollama routes — auth", () => {
 
   beforeAll(async () => {
     process.env.OTTERLY_API_KEY = "sekret";
-    authHandle = await startApiServer({ port: 0, workingDir: "/test" });
+    setQueryFnForTests(query);
+    authHandle = await startApiServer({ port: 0, workingDir: "/test", verifyCli: false });
     authUrl = `http://localhost:${(authHandle.server.address() as { port: number }).port}`;
   });
-  afterAll(() => { delete process.env.OTTERLY_API_KEY; authHandle.close(); });
+  afterAll(() => { delete process.env.OTTERLY_API_KEY; authHandle.close(); setQueryFnForTests(null); });
 
   function call(path: string, body: unknown, headers: Record<string, string> = {}): Promise<number> {
     return new Promise((resolve, reject) => {

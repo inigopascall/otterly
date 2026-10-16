@@ -8,7 +8,6 @@ import { ClaudeEngine } from "../engine.js";
 import { Session } from "../session.js";
 import type { EngineOptions, AgentEvent } from "../types.js";
 import { apiSessions } from "./session-store.js";
-import { CLAUDE_BUILTIN_TOOLS } from "./openai-compat.js";
 
 interface WsMessage {
   type: "chat" | "cancel" | "resume" | "new_session";
@@ -57,15 +56,11 @@ export function attachWsHandler(wss: WebSocketServer, ctx: { workingDir: string 
 
     const state: ConnectionState = {
       session: null,
-      // Disable all of Claude's built-in tools (file read/write, Bash, etc.)
-      // so the WS session path matches the OpenAI route security posture.
-      // These defaults survive mergeOptions() in ClaudeEngine.session() because
-      // none of the per-message opts objects set disallowedTools, and session.ts
-      // forwards the merged value to the SDK on every session creation.
+      // No `tools` option is set, so Claude's built-in tools are off for every
+      // session (buildCLICommand in engine.ts), matching the OpenAI route.
       engine: new ClaudeEngine({
         cwd: ctx.workingDir,
         permissionMode: "bypassPermissions",
-        disallowedTools: CLAUDE_BUILTIN_TOOLS,
       }),
       isAlive: true,
     };

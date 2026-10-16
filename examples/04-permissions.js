@@ -10,7 +10,7 @@ console.log("--- Read-only mode ---");
 try {
   const result = await claude.run(
     "Read package.json and tell me the version number. Do NOT modify any files.",
-    { cwd: process.cwd(), onPermission: READONLY }
+    { cwd: process.cwd(), tools: ["default"], onPermission: READONLY }
   );
   console.log(result.text);
   console.log(`Tools used: ${result.tools.map((t) => `${t.tool}${t.isError ? " (denied)" : ""}`).join(", ")}\n`);
@@ -24,6 +24,7 @@ const result = await claude.run(
   "What files are in the src/ directory?",
   {
     cwd: process.cwd(),
+    tools: ["default"],
     onPermission: ({ tool, input, reason }) => {
       const action = ["Write", "Edit", "Bash", "NotebookEdit"].includes(tool)
         ? "DENY"
