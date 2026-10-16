@@ -12,6 +12,7 @@ import { wrapPermissionHandler } from "./permissions.js";
 import { Session } from "./session.js";
 import { log, logDiag } from "./server/logger.js";
 import { traceWrite, traceAppend, traceAppendRaw } from "./server/trace.js";
+import { quota } from "./server/quota.js";
 
 /**
  * Runs one conversation and yields the CLI's stream-json messages, parsed.
@@ -834,6 +835,10 @@ export function createCLIQueryFn(cliBin: string): QueryFn {
 
             const t = typeof obj.type === "string" ? obj.type : "(no type)";
             typeCounts[t] = (typeCounts[t] || 0) + 1;
+
+            // Every rate_limit_event, from one-shot runs and Sessions alike,
+            // feeds GET /api/quota (server/quota.ts). It is still yielded.
+            if (t === "rate_limit_event") quota.recordRateLimitEvent(obj.rate_limit_info);
 
             // Permission requests are answered here; the caller never sees them.
             if (t === "control_request") {

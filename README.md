@@ -1,3 +1,8 @@
+---
+verified: 2026-10-16
+verified_by: workdonkey
+---
+
 <p align="center">
   <h1 align="center">otterly</h1>
   <p align="center"><strong>Ollama for Claude.</strong> Use your Claude Code subscription as a local AI API. For free.</p>
@@ -558,6 +563,7 @@ This is exactly what `npx otterly serve` runs under the hood. Bundle it inside a
 | `GET /playground` | HTML | Interactive API explorer in your browser |
 | `GET /api/status` | JSON | Health + queue stats |
 | `GET /api/metrics` | JSON | Today + lifetime usage, recent runs, top tools |
+| `GET /api/quota` | JSON | Usage of your Claude subscription: the 5-hour and weekly windows, in the shape of Anthropic's own usage endpoint. Needs the `Bearer` token when `OTTERLY_API_KEY` is set |
 | `GET /swagger.json` | OpenAPI 3.0 | Full spec. Generate a client in any language. |
 
 Plus all the boring-but-essential stuff:
@@ -580,6 +586,7 @@ npx otterly serve --port 11435 --dir ./project --max-concurrent 3
 | Flag | Default | |
 |---|---|---|
 | `-p, --port` | `11434` | Port to listen on |
+| `-H, --host` | all interfaces | Interface to listen on, e.g. `127.0.0.1` |
 | `-d, --dir` | cwd | Working directory Claude runs in |
 | `--max-concurrent` | `5` | Parallel Claude processes |
 | `--max-queue` | `50` | Max queued requests |
@@ -674,3 +681,21 @@ PRs and issues welcome at [github.com/ReallyArtificial/otterly](https://github.c
 ## License
 
 MIT. Use it for anything, ship it anywhere, don't blame me when an otter gets in your codebase.
+
+---
+
+## Verify
+
+These checks cover the `GET /api/quota` and `-H, --host` rows above. Run from
+the Z-Book. Expected values follow `#`.
+
+```bash
+cd /home/inigo/code/iwd/otterly
+grep -F -c 'req.method === "GET" && path === "/api/quota"' src/server/index.ts     # 1
+grep -A4 'path === "/api/quota"' src/server/index.ts | grep -c 'checkAuth(req, ctx)' # 1
+grep -F -c 'const EVENT_WINDOWS = ["five_hour", "seven_day"];' src/server/quota.ts # 1
+grep -F -c 'export const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";' src/server/quota.ts # 1
+grep -F -c 'host:             { type: "string",  short: "H" },' src/cli.ts        # 1
+grep -F -c 'host: values.host,' src/cli.ts                                        # 1
+grep -F -c 'server.listen({ port, host: opts.host }' src/server/index.ts           # 1
+```

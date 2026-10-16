@@ -11,6 +11,7 @@ const { values, positionals } = parseArgs({
   allowPositionals: true,
   options: {
     port:             { type: "string",  short: "p", default: "11435" },
+    host:             { type: "string",  short: "H" },
     dir:              { type: "string",  short: "d" },
     "max-concurrent": { type: "string",  default: "5" },
     "max-queue":      { type: "string",  default: "50" },
@@ -42,6 +43,7 @@ if (values.help || command === "help") {
 
   Options:
     -p, --port <number>         Port to listen on (default: 11435)
+    -H, --host <address>        Interface to listen on (default: all interfaces)
     -d, --dir <path>            Working directory (default: a clean scratch dir)
     --max-concurrent <number>   Max concurrent requests (default: 5)
     --max-queue <number>        Max queued requests (default: 50)
@@ -66,6 +68,7 @@ if (values.help || command === "help") {
     POST /api/run               Native one-shot execution
     POST /api/stream            Native NDJSON streaming
     GET  /api/status            Health check + queue/circuit stats
+    GET  /api/quota             Claude subscription usage (5-hour and weekly)
     GET  /playground            Interactive API playground
     WS   /ws                    Multi-turn WebSocket sessions
 `);
@@ -87,6 +90,7 @@ if (command === "serve") {
 
   startApiServer({
     port: parseInt(values.port!, 10),
+    host: values.host,
     workingDir: values.dir,
     maxConcurrent: parseInt(values["max-concurrent"]!, 10),
     maxQueueSize: parseInt(values["max-queue"]!, 10),

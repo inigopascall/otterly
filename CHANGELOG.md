@@ -7,6 +7,18 @@ and uses [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) formatting.
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /api/quota`** — the 5-hour and weekly usage of the Claude
+  subscription that the `claude` CLI is logged in to, in the shape of
+  Anthropic's own usage endpoint, plus an `otterly` key saying where the
+  figures came from. It combines the CLI's `rate_limit_event` lines with
+  Anthropic's usage endpoint, which it reads with the CLI's token at most every
+  5 minutes and backs off from after a failure. The CLI's credentials are only
+  ever read. With `OTTERLY_API_KEY` set, the route requires the bearer token.
+- **`--host` / `-H <address>`** — the interface to listen on. With no flag,
+  Otterly listens on all interfaces, as before.
+
 ### Changed
 
 - Moved the source repository to ReallyArtificial/otterly and the companion website to ReallyArtificial/otterly-website. The npm package remains `otterly`.

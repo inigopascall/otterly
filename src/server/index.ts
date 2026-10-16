@@ -18,6 +18,7 @@ import { buildModelsList } from "./openai-compat.js";
 import { buildOllamaTags, OLLAMA_COMPAT_VERSION } from "./ollama-compat.js";
 import { handleStatus, handleRun, handleStream, PKG_VERSION, type ParsedRequest, type ServerContext } from "./routes-native.js";
 import { metrics } from "./metrics.js";
+import { quota } from "./quota.js";
 import { attachWsHandler } from "./ws-handler.js";
 import { apiSessions } from "./session-store.js";
 import { RequestQueue, QueueFullError, QueueTimeoutError } from "./request-queue.js";
@@ -88,6 +89,8 @@ function setCors(res: ServerResponse): void {
 
 export interface ApiServerOptions {
   port?: number;
+  /** Interface to listen on, e.g. "127.0.0.1". Default: all interfaces. */
+  host?: string;
   workingDir?: string;
   maxConcurrent?: number;
   maxQueueSize?: number;
@@ -215,6 +218,17 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
         version: PKG_VERSION,
         ...metrics.snapshot(),
       });
+      return;
+    }
+
+    // GET /api/quota — usage of the Claude subscription (quota.ts). It names
+    // the account, so it needs the API key when one is set.
+    if (req.method === "GET" && path === "/api/quota") {
+      if (!checkAuth(req, ctx)) {
+        sendAuthError(res, "native");
+        return;
+      }
+      jsonResponse(res, 200, await quota.snapshot({ refresh: url.searchParams.get("refresh") === "1" }));
       return;
     }
 
@@ -429,7 +443,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
       reject(err);
     });
 
-    server.listen(port, () => {
+    server.listen({ port, host: opts.host }, () => {
       console.log(`\n  otterly serve — local inference server`);
       console.log(`  ──────────────────────────────────────`);
       console.log(`  OpenAI compat : http://localhost:${port}/v1/chat/completions`);
@@ -442,6 +456,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
       console.log(`  Playground    : http://localhost:${port}/playground`);
       console.log(`  Dashboard     : http://localhost:${port}/dashboard`);
       console.log(`  Working dir   : ${workingDir}`);
+      console.log(`  Interface     : ${opts.host ?? "all interfaces"}`);
       console.log(`  Timeouts      : ${Math.round(requestTimeoutMs / 1000)} s request · ${Math.round(streamTimeoutMs / 1000)} s stream · ${Math.round(idleTimeoutMs / 1000)} s idle`);
       console.log(`  Claude CLI    : ${cliLine}`);
       if (cliWarning) console.log(`  ⚠ ${cliWarning}`);

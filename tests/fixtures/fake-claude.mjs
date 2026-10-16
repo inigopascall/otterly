@@ -7,6 +7,8 @@
 //                 {"path":"x"}, waits for the control_response, and replies
 //                 "allow: <updatedInput as JSON>" or "deny: <message>"
 //   "SILENT <ms>" prints nothing for <ms>, then replies "echo: SILENT <ms>"
+//   "RATE_LIMIT"  prints a rate_limit_event in the CLI's own shape, then
+//                 replies "echo: RATE_LIMIT"
 //   anything else replies "echo: <text>"
 // It prints system/init once, before its first reply, then one assistant
 // message and one result per user message, and exits when stdin ends.
@@ -56,6 +58,28 @@ async function turn(text) {
       : `deny: ${decision.message}`;
   }
   if (silent) await new Promise((resolve) => setTimeout(resolve, Number(silent[1])));
+  if (text === "RATE_LIMIT") {
+    // The shape of a real line from claude 2.1.296. The windows reset an hour
+    // and six days from now, so neither has reset when a test reads them.
+    const now = Math.floor(Date.now() / 1000);
+    out({
+      type: "rate_limit_event",
+      rate_limit_info: {
+        status: "allowed",
+        resetsAt: now + 3600,
+        rateLimitType: "five_hour",
+        overageStatus: "rejected",
+        overageDisabledReason: "out_of_credits",
+        isUsingOverage: false,
+        unifiedWindows: {
+          five_hour: { utilization: 0.04, resetsAt: now + 3600 },
+          seven_day: { utilization: 0.43, resetsAt: now + 6 * 86400 },
+        },
+      },
+      uuid: "c573ffe9-8f6d-4c23-9a09-0c74556e243a",
+      session_id: "fake-session",
+    });
+  }
   out({ type: "assistant", message: { content: [{ type: "text", text: reply }] }, session_id: "fake-session" });
   out({
     type: "result",

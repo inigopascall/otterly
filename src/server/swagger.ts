@@ -44,6 +44,78 @@ export const openApiSpec = {
         },
       },
     },
+    "/api/quota": {
+      get: {
+        summary: "Claude subscription usage",
+        description:
+          "The 5-hour and weekly usage of the Claude subscription the claude CLI is logged in to, " +
+          "in the shape of Anthropic's own usage endpoint, whose other keys are passed through, plus an `otterly` key. " +
+          "Always 200; with no data the body holds only `otterly`, with source \"none\". " +
+          "Requires the API key when OTTERLY_API_KEY is set.",
+        operationId: "getQuota",
+        security: [{ BearerAuth: [] }],
+        parameters: [
+          {
+            name: "refresh",
+            in: "query",
+            schema: { type: "string", enum: ["1"] },
+            description: "Read Anthropic's usage endpoint even if its last body is under 5 minutes old. A back-off still applies.",
+          },
+        ],
+        responses: {
+          "200": {
+            description: "Usage windows, and where they came from",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  additionalProperties: true,
+                  properties: {
+                    five_hour: { $ref: "#/components/schemas/QuotaWindow" },
+                    seven_day: { $ref: "#/components/schemas/QuotaWindow" },
+                    otterly: {
+                      type: "object",
+                      properties: {
+                        source: {
+                          type: "string",
+                          enum: ["oauth_usage", "rate_limit_event", "none"],
+                          description: "What supplied the newest five_hour figure",
+                        },
+                        observed_at: { type: "string", format: "date-time", nullable: true },
+                        status: {
+                          type: "string",
+                          nullable: true,
+                          description: "status of the latest rate_limit_event: allowed, allowed_warning or rejected",
+                        },
+                        live_error: {
+                          type: "string",
+                          nullable: true,
+                          description: "Why the last read of the usage endpoint was skipped or failed",
+                        },
+                        config_dir: { type: "string" },
+                        account: {
+                          type: "object",
+                          nullable: true,
+                          properties: {
+                            email: { type: "string", nullable: true },
+                            organization: { type: "string", nullable: true },
+                            subscription_type: { type: "string", nullable: true },
+                            rate_limit_tier: { type: "string", nullable: true },
+                          },
+                        },
+                      },
+                      required: ["source", "observed_at", "status", "live_error", "config_dir", "account"],
+                    },
+                  },
+                  required: ["otterly"],
+                },
+              },
+            },
+          },
+          "401": { description: "Unauthorized" },
+        },
+      },
+    },
     "/swagger.json": {
       get: {
         summary: "OpenAPI spec",
@@ -381,6 +453,13 @@ export const openApiSpec = {
       },
     },
     schemas: {
+      QuotaWindow: {
+        type: "object",
+        properties: {
+          utilization: { type: "number", description: "Percentage, 0-100", example: 43 },
+          resets_at: { type: "string", format: "date-time", nullable: true, description: "null once the window has reset" },
+        },
+      },
       ChatCompletionResponse: {
         type: "object",
         properties: {
