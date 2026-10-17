@@ -1,8 +1,3 @@
----
-verified: 2026-10-16
-verified_by: workdonkey
----
-
 <p align="center">
   <h1 align="center">otterly</h1>
   <p align="center"><strong>Ollama for Claude.</strong> Use your Claude Code subscription as a local AI API. For free.</p>
@@ -585,9 +580,9 @@ npx otterly serve --port 11435 --dir ./project --max-concurrent 3
 
 | Flag | Default | |
 |---|---|---|
-| `-p, --port` | `11434` | Port to listen on |
+| `-p, --port` | `11435` | Port to listen on |
 | `-H, --host` | all interfaces | Interface to listen on, e.g. `127.0.0.1` |
-| `-d, --dir` | cwd | Working directory Claude runs in |
+| `-d, --dir` | an empty scratch directory, `otterly-scratch` in the system temp folder | Working directory Claude runs in |
 | `--max-concurrent` | `5` | Parallel Claude processes |
 | `--max-queue` | `50` | Max queued requests |
 | `--queue-timeout` | `120` | Seconds a request may wait in the queue before 408 |

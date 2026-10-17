@@ -73,6 +73,7 @@ describe("GET /api/quota", () => {
         source: "none",
         observed_at: null,
         status: null,
+        limited_until: null,
         live_error: `cannot read ${join(configDir, ".credentials.json")}`,
         config_dir: configDir,
         account: null,

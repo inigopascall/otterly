@@ -18,7 +18,7 @@ import { buildModelsList } from "./openai-compat.js";
 import { buildOllamaTags, OLLAMA_COMPAT_VERSION } from "./ollama-compat.js";
 import { handleStatus, handleRun, handleStream, PKG_VERSION, type ParsedRequest, type ServerContext } from "./routes-native.js";
 import { metrics } from "./metrics.js";
-import { quota } from "./quota.js";
+import { quota, type UsageLimit } from "./quota.js";
 import { attachWsHandler } from "./ws-handler.js";
 import { apiSessions } from "./session-store.js";
 import { RequestQueue, QueueFullError, QueueTimeoutError } from "./request-queue.js";
@@ -85,6 +85,21 @@ function setCors(res: ServerResponse): void {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id");
+}
+
+/** The POST routes that start the claude CLI. While the Claude account is at
+ *  its usage limit (quota.ts), they are answered at once with HTTP 429. */
+const INFERENCE_PATHS = new Set(["/v1/chat/completions", "/api/run", "/api/stream", "/api/chat", "/api/generate"]);
+
+/** HTTP 429 for a request that arrives while the Claude account is at its
+ *  usage limit. Retry-After gives the seconds until the limit lifts. */
+function sendUsageLimitError(res: ServerResponse, format: "openai" | "native", limit: UsageLimit): void {
+  const message = `Claude usage limit reached (${limit.type}); resets at ${new Date(limit.until).toISOString()}.`;
+  res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(limit.retryAfterS) });
+  res.end(JSON.stringify(format === "openai"
+    ? { error: { message, type: "rate_limit_error", code: 429 } }
+    : { error: message }
+  ));
 }
 
 export interface ApiServerOptions {
@@ -299,6 +314,17 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
     if (!checkAuth(req, ctx)) {
       sendAuthError(res, format);
       logResponse(requestId, req.method!, path, 401, Date.now() - startTime);
+      return;
+    }
+
+    // Usage limit: the Claude account is at its limit, so a CLI run would fail
+    // the same way. Answered before the rate limiter, the circuit breaker and
+    // the queue, without starting the CLI, and not counted as a
+    // circuit-breaker failure.
+    const usageLimit = INFERENCE_PATHS.has(path) ? quota.usageLimit() : null;
+    if (usageLimit) {
+      sendUsageLimitError(res, format, usageLimit);
+      logResponse(requestId, req.method!, path, 429, Date.now() - startTime);
       return;
     }
 

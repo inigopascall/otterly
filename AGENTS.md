@@ -1,5 +1,5 @@
 ---
-verified: 2026-10-16
+verified: 2026-10-17
 verified_by: workdonkey
 ---
 
@@ -105,7 +105,7 @@ start without it (§5).
 | `src/server/sse-stream.ts` | `SseStream`: the SSE chunks of one streamed completion |
 | `src/server/tool-call-stream.ts` | `ToolCallStreamer, reconcileStreamedCalls`: live tool calls |
 | `src/server/retry-notice.ts` | Remembers dropped requests; notice on the retry |
-| `src/server/quota.ts` | `QuotaTracker` and its singleton `quota`: subscription usage for `GET /api/quota` (§12) |
+| `src/server/quota.ts` | `QuotaTracker` and its singleton `quota`: subscription usage for `GET /api/quota`, and the usage limit (§12) |
 | `tests/fixtures/fake-claude.mjs` | A stand-in CLI that speaks stream-json, for `tests/cli-transport.test.ts` |
 | `tests-cli/claude-cli.test.ts` | The CLI suite: checks the real installed `claude` (§7) |
 
@@ -363,7 +363,8 @@ that the `claude` CLI is logged in to (`QuotaTracker` and its singleton `quota`
 in `server/quota.ts`). The body has the shape of Anthropic's own usage
 endpoint: `five_hour` and `seven_day`, each with `utilization` as a percentage
 (0-100) and `resets_at` as ISO-8601, plus an `otterly` key holding `source`,
-`observed_at`, `status`, `live_error`, `config_dir` and `account`. The answer
+`observed_at`, `status`, `limited_until`, `live_error`, `config_dir` and
+`account`. The answer
 is always HTTP 200; with no data it holds only `otterly`, with
 `source: "none"`. When `OTTERLY_API_KEY` is set, the route needs the bearer
 token, as the POST routes do, because it names the account; the other GET
@@ -405,6 +406,27 @@ token is missing, or expires within 60 s (`TOKEN_EXPIRY_MARGIN_MS`), no request
 is made. Otterly never renews the token and never writes either file: renewing
 rotates the refresh token, which would log the CLI out. The CLI renews the
 token itself when it next starts a run.
+
+**At the usage limit.** A `rate_limit_event` with `status: "rejected"` means
+the account is at its usage limit. The limit lasts until that event's
+`resetsAt`, or for 5 minutes after it when it has none (`LIMIT_HOLD_MS`). A
+later event with any other status ends it at once, and a restart starts
+without one (`usageLimit()` in `server/quota.ts`).
+
+While it lasts, every POST to `/v1/chat/completions`, `/api/run`,
+`/api/stream`, `/api/chat` and `/api/generate` that passes auth is answered at
+once, before the inbound rate limiter, the circuit breaker and the queue
+(`INFERENCE_PATHS` in `server/index.ts`). The CLI is not started, and the
+answer is not a circuit-breaker failure. It is HTTP 429 with `Retry-After` set
+to the seconds until the limit lifts, rounded up and at least 1, and the
+message `Claude usage limit reached (<rateLimitType>); resets at <ISO-8601>.`,
+with `unknown` when the event names no window. `/v1/chat/completions` carries
+the message as `{"error":{"message":…,"type":"rate_limit_error","code":429}}`,
+the other four paths as `{"error":…}`. `/ws` is unaffected.
+
+`otterly.limited_until` in `GET /api/quota` is the time the limit lifts, as
+ISO-8601, while it lasts, and `null` otherwise. Covered by
+`tests/server/usage-limit-route.test.ts` and `tests/server/quota.test.ts`.
 
 ## Verify
 
@@ -491,4 +513,18 @@ grep -F -c 'host:             { type: "string",  short: "H" },' src/cli.ts      
 grep -F -c 'host: values.host,' src/cli.ts                                       # 1
 grep -F -c 'server.listen({ port, host: opts.host }' src/server/index.ts          # 1
 test -f tests/server/quota.test.ts && test -f tests/server/quota-route.test.ts && test -f tests/quota-event-tap.test.ts && echo present # present
+grep -F -c 'export const LIMIT_HOLD_MS = 5 * 60 * 1000;' src/server/quota.ts      # 1
+grep -F -c 'private limit: { until: number; type: string } | null = null;' src/server/quota.ts # 1
+grep -F -c 'if (this.eventStatus === "rejected") {' src/server/quota.ts          # 1
+grep -F -c 'resetsAt * 1000 : at + LIMIT_HOLD_MS,' src/server/quota.ts           # 1
+grep -F -c 'type: stringField(info, "rateLimitType") ?? "unknown",' src/server/quota.ts # 1
+grep -F -c 'retryAfterS: Math.max(1, Math.ceil((this.limit.until - now) / 1000)),' src/server/quota.ts # 1
+grep -F -c 'limited_until: limit ? isoFromEpoch(limit.until, 1) : null,' src/server/quota.ts # 1
+grep -F -c 'const INFERENCE_PATHS = new Set(["/v1/chat/completions", "/api/run", "/api/stream", "/api/chat", "/api/generate"]);' src/server/index.ts # 1
+grep -F -c 'Claude usage limit reached (${limit.type}); resets at ${new Date(limit.until).toISOString()}.' src/server/index.ts # 1
+grep -F -c '"Retry-After": String(limit.retryAfterS)' src/server/index.ts         # 1
+grep -F -c '? { error: { message, type: "rate_limit_error", code: 429 } }' src/server/index.ts # 1
+awk '/sendAuthError\(res, format\)/{a=NR} /quota\.usageLimit\(\)/{u=NR} /rateLimiter\.allow\(/{r=NR} END{print (a && a<u && u<r) ? "after auth, before the rate limiter" : "out of order"}' src/server/index.ts # after auth, before the rate limiter
+grep -c 'usageLimit' src/server/ws-handler.ts                                     # 0
+test -f tests/server/usage-limit-route.test.ts && echo present                   # present
 ```

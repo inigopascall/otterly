@@ -1,5 +1,19 @@
 // OpenAPI 3.0 spec for the otterly local API server.
 
+// The 429 of a POST that starts the claude CLI: the inbound rate limiter, a
+// full queue, or the Claude account at its usage limit (quota.ts).
+const RESPONSE_429 = {
+  description:
+    "Rate limited, queue full, or the Claude account is at its usage limit. " +
+    "At the usage limit the claude CLI is not started, and Retry-After gives the seconds until the limit lifts.",
+  headers: {
+    "Retry-After": {
+      description: "Seconds until the usage limit lifts, rounded up, at least 1. Sent only at the usage limit.",
+      schema: { type: "integer", minimum: 1 },
+    },
+  },
+};
+
 export const openApiSpec = {
   openapi: "3.0.3",
   info: {
@@ -87,6 +101,12 @@ export const openApiSpec = {
                           nullable: true,
                           description: "status of the latest rate_limit_event: allowed, allowed_warning or rejected",
                         },
+                        limited_until: {
+                          type: "string",
+                          format: "date-time",
+                          nullable: true,
+                          description: "While the account is at its usage limit, when the limit lifts; otherwise null",
+                        },
                         live_error: {
                           type: "string",
                           nullable: true,
@@ -104,7 +124,7 @@ export const openApiSpec = {
                           },
                         },
                       },
-                      required: ["source", "observed_at", "status", "live_error", "config_dir", "account"],
+                      required: ["source", "observed_at", "status", "limited_until", "live_error", "config_dir", "account"],
                     },
                   },
                   required: ["otterly"],
@@ -243,6 +263,7 @@ export const openApiSpec = {
           "200": { description: "Ollama chat response (NDJSON stream when stream=true)" },
           "400": { description: "Invalid request" },
           "401": { description: "Unauthorized" },
+          "429": RESPONSE_429,
         },
       },
     },
@@ -272,6 +293,7 @@ export const openApiSpec = {
           "200": { description: "Ollama generate response (NDJSON stream when stream=true)" },
           "400": { description: "Missing prompt" },
           "401": { description: "Unauthorized" },
+          "429": RESPONSE_429,
         },
       },
     },
@@ -339,7 +361,7 @@ export const openApiSpec = {
           },
           "400": { description: "Invalid request" },
           "401": { description: "Unauthorized" },
-          "429": { description: "Rate limited or queue full" },
+          "429": RESPONSE_429,
           "503": { description: "Circuit breaker open" },
         },
       },
@@ -389,7 +411,7 @@ export const openApiSpec = {
           },
           "400": { description: "Missing or invalid prompt" },
           "401": { description: "Unauthorized" },
-          "429": { description: "Rate limited or queue full" },
+          "429": RESPONSE_429,
           "503": { description: "Circuit breaker open" },
         },
       },
@@ -438,7 +460,7 @@ export const openApiSpec = {
           },
           "400": { description: "Missing or invalid prompt" },
           "401": { description: "Unauthorized" },
-          "429": { description: "Rate limited or queue full" },
+          "429": RESPONSE_429,
           "503": { description: "Circuit breaker open" },
         },
       },

@@ -1,5 +1,6 @@
 // Usage of the Claude subscription that the claude CLI is logged in to, for
-// GET /api/quota, in the shape of Anthropic's own usage endpoint.
+// GET /api/quota, in the shape of Anthropic's own usage endpoint; and the
+// account's usage limit, which index.ts answers with HTTP 429 (usageLimit).
 //
 // Two sources feed it:
 //   - rate_limit_event lines, which the CLI prints after each API response.
@@ -29,6 +30,8 @@ export const LIVE_FAILURE_BACKOFF_MS = 60 * 1000;
 export const LIVE_TIMEOUT_MS = 10 * 1000;
 /** A token that expires within this long is treated as expired. */
 export const TOKEN_EXPIRY_MARGIN_MS = 60 * 1000;
+/** A usage limit whose rate_limit_event gives no resetsAt lasts this long. */
+export const LIMIT_HOLD_MS = 5 * 60 * 1000;
 
 /** The windows of the response that a rate_limit_event can update. */
 const EVENT_WINDOWS = ["five_hour", "seven_day"];
@@ -57,6 +60,8 @@ export interface QuotaInfo {
   observed_at: string | null;
   /** status of the latest rate_limit_event: allowed, allowed_warning or rejected. */
   status: string | null;
+  /** While the account is at its usage limit, when the limit lifts (ISO-8601); otherwise null. */
+  limited_until: string | null;
   /** Why the last live read was skipped or failed. */
   live_error: string | null;
   /** The claude CLI's config dir. */
@@ -66,6 +71,16 @@ export interface QuotaInfo {
 
 /** The body of GET /api/quota: the usage endpoint's keys, plus `otterly`. */
 export type QuotaSnapshot = Record<string, unknown> & { otterly: QuotaInfo };
+
+/** The usage limit of the Claude account, while it lasts. */
+export interface UsageLimit {
+  /** When the limit lifts, epoch ms. */
+  until: number;
+  /** The window that binds: the event's rateLimitType, or "unknown" when it names none. */
+  type: string;
+  /** Seconds until the limit lifts, rounded up, at least 1: the Retry-After value. */
+  retryAfterS: number;
+}
 
 /** One request to the usage endpoint. */
 export type QuotaFetch = (
@@ -94,6 +109,9 @@ export class QuotaTracker {
   private readonly eventWindows = new Map<string, { window: QuotaWindow; at: number }>();
   /** status of the latest rate_limit_event. */
   private eventStatus: string | null = null;
+  /** Set while the latest rate_limit_event is rejected: when the limit lifts
+   *  (epoch ms) and the window that binds. */
+  private limit: { until: number; type: string } | null = null;
   /** The last good usage-endpoint body, and when it arrived. */
   private live: { body: Record<string, unknown>; at: number } | null = null;
   /** Why the last live read was skipped or failed; null after a success. */
@@ -117,13 +135,24 @@ export class QuotaTracker {
   /**
    * Record the rate_limit_info of one rate_limit_event line: each window's
    * utilization (a fraction) as a percentage rounded to 2 decimals, its
-   * resetsAt (epoch seconds) as an ISO string, and the event's status. Never
-   * throws, since it runs inside every CLI run.
+   * resetsAt (epoch seconds) as an ISO string, and the event's status. A
+   * rejected event starts the usage limit, which lasts until its resetsAt or,
+   * when it has none, for LIMIT_HOLD_MS; an event with any other status ends
+   * it. Never throws, since it runs inside every CLI run.
    */
   recordRateLimitEvent(info: unknown): void {
     if (!isObject(info)) return;
     const at = this.deps.now();
     this.eventStatus = stringField(info, "status");
+    if (this.eventStatus === "rejected") {
+      const resetsAt = info.resetsAt;
+      this.limit = {
+        until: typeof resetsAt === "number" && Number.isFinite(resetsAt) ? resetsAt * 1000 : at + LIMIT_HOLD_MS,
+        type: stringField(info, "rateLimitType") ?? "unknown",
+      };
+    } else {
+      this.limit = null;
+    }
     for (const [name, value] of Object.entries(objectField(info, "unifiedWindows"))) {
       if (!isObject(value)) continue;
       const fraction = value.utilization;
@@ -138,6 +167,19 @@ export class QuotaTracker {
   /** The claude CLI's config dir: $CLAUDE_CONFIG_DIR, else ~/.claude. */
   configDir(): string {
     return this.deps.env.CLAUDE_CONFIG_DIR || join(this.deps.homeDir(), ".claude");
+  }
+
+  /**
+   * The usage limit while the account is at it: the latest rate_limit_event
+   * was rejected and the limit has not yet lifted. Null otherwise.
+   */
+  usageLimit(): UsageLimit | null {
+    const now = this.deps.now();
+    if (!this.limit || now >= this.limit.until) return null;
+    return {
+      ...this.limit,
+      retryAfterS: Math.max(1, Math.ceil((this.limit.until - now) / 1000)),
+    };
   }
 
   /**
@@ -160,6 +202,7 @@ export class QuotaTracker {
   reset(): void {
     this.eventWindows.clear();
     this.eventStatus = null;
+    this.limit = null;
     this.live = null;
     this.liveError = null;
     this.noRequestBefore = 0;
@@ -269,10 +312,12 @@ export class QuotaTracker {
       const resetsAt = Date.parse(stringField(value, "resets_at") ?? "");
       if (Number.isFinite(resetsAt) && resetsAt <= now) body[name] = { ...value, utilization: 0, resets_at: null };
     }
+    const limit = this.usageLimit();
     const otterly: QuotaInfo = {
       source,
       observed_at: observedAt === null ? null : isoFromEpoch(observedAt, 1),
       status: this.eventStatus,
+      limited_until: limit ? isoFromEpoch(limit.until, 1) : null,
       live_error: this.liveError,
       config_dir: configDir,
       account: this.account(configDir, credentials),

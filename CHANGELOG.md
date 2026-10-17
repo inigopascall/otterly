@@ -18,6 +18,15 @@ and uses [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) formatting.
   ever read. With `OTTERLY_API_KEY` set, the route requires the bearer token.
 - **`--host` / `-H <address>`** — the interface to listen on. With no flag,
   Otterly listens on all interfaces, as before.
+- **HTTP 429 at once at the Claude usage limit** — while the latest
+  `rate_limit_event` from the CLI says `rejected`, `/v1/chat/completions`,
+  `/api/run`, `/api/stream`, `/api/chat` and `/api/generate` answer HTTP 429
+  with `Retry-After` instead of starting a CLI run that would fail the same
+  way. The limit lifts at the event's reset time, 5 minutes after the event
+  when it gives none, or at the next event with another status. The answer
+  follows auth, comes before the rate limiter, circuit breaker and queue, and
+  does not count against the circuit breaker. `GET /api/quota` reports when
+  the limit lifts as `otterly.limited_until`.
 
 ### Changed
 

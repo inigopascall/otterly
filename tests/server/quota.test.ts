@@ -8,6 +8,7 @@ import {
   LIVE_REUSE_MS,
   LIVE_429_BACKOFF_MS,
   LIVE_FAILURE_BACKOFF_MS,
+  LIMIT_HOLD_MS,
   type QuotaDeps,
 } from "../../src/server/quota.js";
 import { TESTED_CLAUDE_CLI_VERSION } from "../../src/engine.js";
@@ -113,6 +114,7 @@ describe("QuotaTracker: rate_limit_event", () => {
         source: "rate_limit_event",
         observed_at: "2026-10-16T12:00:00.000Z",
         status: "allowed",
+        limited_until: null,
         live_error: "cannot read /cfg/.credentials.json",
         config_dir: "/cfg",
         account: null,
@@ -154,6 +156,7 @@ describe("QuotaTracker: merge", () => {
         source: "oauth_usage",
         observed_at: "2026-10-16T12:00:00.000Z",
         status: null,
+        limited_until: null,
         live_error: null,
         config_dir: "/cfg",
         account: {
@@ -405,5 +408,65 @@ describe("QuotaTracker: the credentials are only read", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("QuotaTracker: usage limit", () => {
+  // EVENT_INFO, rejected: the five_hour window binds until FIVE_HOUR_RESET,
+  // 2.5 hours after T0.
+  const REJECTED = { ...EVENT_INFO, status: "rejected" };
+  const UNTIL = Date.parse(FIVE_HOUR_RESET);
+
+  it("starts unlimited", async () => {
+    const { tracker } = harness();
+    expect(tracker.usageLimit()).toBeNull();
+    expect((await tracker.snapshot()).otterly.limited_until).toBeNull();
+  });
+
+  it("is limited until resetsAt after a rejected event", async () => {
+    const { tracker } = harness();
+    tracker.recordRateLimitEvent(REJECTED);
+    expect(tracker.usageLimit()).toEqual({ until: UNTIL, type: "five_hour", retryAfterS: 9000 });
+    expect((await tracker.snapshot()).otterly).toMatchObject({ status: "rejected", limited_until: FIVE_HOUR_RESET });
+  });
+
+  it("lifts at resetsAt, rounding Retry-After up to whole seconds until then", async () => {
+    const { tracker, advance } = harness();
+    tracker.recordRateLimitEvent(REJECTED);
+    advance(UNTIL - T0 - 1_500);
+    expect(tracker.usageLimit()?.retryAfterS).toBe(2);
+    advance(1_499); // 1 ms before the reset
+    expect(tracker.usageLimit()).toEqual({ until: UNTIL, type: "five_hour", retryAfterS: 1 });
+    advance(1);
+    expect(tracker.usageLimit()).toBeNull();
+    expect((await tracker.snapshot()).otterly.limited_until).toBeNull();
+  });
+
+  it("holds LIMIT_HOLD_MS (5 minutes) when the event has no resetsAt, and names the window unknown", async () => {
+    const { tracker, advance } = harness();
+    tracker.recordRateLimitEvent({ status: "rejected" });
+    expect(LIMIT_HOLD_MS).toBe(5 * 60 * 1000);
+    expect(tracker.usageLimit()).toEqual({ until: T0 + LIMIT_HOLD_MS, type: "unknown", retryAfterS: 300 });
+    expect((await tracker.snapshot()).otterly.limited_until).toBe("2026-10-16T12:05:00.000Z");
+    advance(LIMIT_HOLD_MS - 1);
+    expect(tracker.usageLimit()).not.toBeNull();
+    advance(1);
+    expect(tracker.usageLimit()).toBeNull();
+  });
+
+  it.each(["allowed", "allowed_warning"])("ends at once with a later %s event", async (status) => {
+    const { tracker, advance } = harness();
+    tracker.recordRateLimitEvent(REJECTED);
+    advance(60_000);
+    tracker.recordRateLimitEvent({ ...EVENT_INFO, status });
+    expect(tracker.usageLimit()).toBeNull();
+    expect((await tracker.snapshot()).otterly.limited_until).toBeNull();
+  });
+
+  it("is forgotten by reset", () => {
+    const { tracker } = harness();
+    tracker.recordRateLimitEvent(REJECTED);
+    tracker.reset();
+    expect(tracker.usageLimit()).toBeNull();
   });
 });
