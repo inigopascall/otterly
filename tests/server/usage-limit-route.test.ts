@@ -10,8 +10,8 @@ import { quota } from "../../src/server/quota.js";
 // The usage limit (quota.ts, index.ts): while the latest rate_limit_event is
 // rejected, the routes that start the claude CLI answer HTTP 429 at once. The
 // CLI is a fake that counts its runs. CLAUDE_CONFIG_DIR points at an empty
-// directory for the whole file, so GET /api/quota finds no credentials and
-// never calls Anthropic's usage endpoint.
+// directory for the whole file, and the test configuration hides the claude
+// CLI, so GET /api/quota runs no command.
 
 const savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
 let configDir = "";

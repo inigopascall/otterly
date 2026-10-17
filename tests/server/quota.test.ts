@@ -1,26 +1,27 @@
-import { describe, it, expect } from "vitest";
-import { mkdtempSync, writeFileSync, readdirSync, readFileSync, statSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { describe, it, expect, vi } from "vitest";
 import {
   QuotaTracker,
-  USAGE_URL,
+  usageArgv,
+  authStatusArgv,
+  parseUsageOutput,
+  parseAuthStatus,
   LIVE_REUSE_MS,
-  LIVE_429_BACKOFF_MS,
+  USAGE_MIN_INTERVAL_MS,
   LIVE_FAILURE_BACKOFF_MS,
+  USAGE_TIMEOUT_MS,
+  ACCOUNT_REUSE_MS,
+  AUTH_TIMEOUT_MS,
   LIMIT_HOLD_MS,
   type QuotaDeps,
 } from "../../src/server/quota.js";
-import { TESTED_CLAUDE_CLI_VERSION } from "../../src/engine.js";
 
 // QuotaTracker with everything it takes from outside replaced: a clock the
-// test moves, files held in memory, and a usage endpoint that answers from a
-// script. Nothing here touches the network or a real Claude config dir.
+// test moves, and a claude CLI runner that answers from a script. No test
+// here spawns a process or touches the network.
 
 const T0 = Date.UTC(2026, 9, 16, 12, 0, 0); // 2026-10-16T12:00:00.000Z
 const HOUR = 3_600_000;
-const CREDENTIALS = "/cfg/.credentials.json";
-const CLAUDE_JSON = "/cfg/.claude.json";
+const CLI = "/opt/claude/bin/claude";
 
 // The rate_limit_info of a real rate_limit_event line (claude 2.1.296).
 const EVENT_INFO = {
@@ -39,56 +40,85 @@ const EVENT_INFO = {
 const FIVE_HOUR_RESET = "2026-10-16T14:30:00.000Z";
 const SEVEN_DAY_RESET = "2026-10-22T03:00:00.000Z";
 
-// An abridged usage-endpoint body; there utilization is already a percentage.
-const LIVE_BODY = {
-  five_hour: { utilization: 10, resets_at: "2026-10-16T15:00:00.000Z" },
-  seven_day: { utilization: 50, resets_at: "2026-10-21T09:00:00.000Z" },
-  seven_day_opus: { utilization: 5, resets_at: "2026-10-21T09:00:00.000Z" },
-  extra_usage: { is_enabled: false, monthly_limit: null },
-  limits: [{ window: "five_hour" }],
-};
+// The usage_report that `claude -p /usage` printed (claude 2.1.296), verbatim.
+const USAGE_REPORT = JSON.parse(
+  `{"session":{"total_cost_usd":0,"total_api_duration_ms":0,"total_duration_ms":9219,"total_lines_added":0,"total_lines_removed":0,"model_usage":{}},"rate_limits":{"limits":[{"kind":"session","group":"session","percent":4,"resets_at":"2026-10-17T11:09:59.918669+00:00","scope":null,"severity":"normal","is_active":false},{"kind":"weekly_all","group":"weekly","percent":64,"resets_at":"2026-10-22T02:59:59.918692+00:00","scope":null,"severity":"normal","is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":36,"resets_at":"2026-10-22T02:59:59.918836+00:00","scope":{"model":{"display_name":"Fable"},"surface":null},"severity":"normal","is_active":false}],"extra_usage":{"is_enabled":false,"monthly_limit":7500,"used_credits":0,"utilization":0,"currency":"GBP"}}}`,
+);
+const LIMITS = USAGE_REPORT.rate_limits.limits;
+const EXTRA_USAGE = USAGE_REPORT.rate_limits.extra_usage;
+// What that report maps to: percent as utilization, resets_at as ISO with Z.
+const USAGE_FIVE_HOUR = { utilization: 4, resets_at: "2026-10-17T11:09:59.918Z" };
+const USAGE_SEVEN_DAY = { utilization: 64, resets_at: "2026-10-22T02:59:59.918Z" };
 
-type Reply = () => Response;
-const ok = (body: unknown): Reply => () => new Response(JSON.stringify(body), { status: 200 });
-const fail = (status: number, headers: Record<string, string> = {}): Reply => () =>
-  new Response("{}", { status, headers });
-const networkError: Reply = () => {
-  throw new TypeError("fetch failed");
-};
-
-/** A credentials file whose token expires at `expiresAt` (epoch s or ms). */
-function credentials(expiresAt: number, accessToken: string | null = "test-token"): string {
-  return JSON.stringify({
-    claudeAiOauth: {
-      accessToken,
-      refreshToken: "test-refresh",
-      expiresAt,
-      subscriptionType: "max",
-      rateLimitTier: "default_claude_max_20x",
-    },
-  });
+/** The stdout of `claude -p /usage --output-format stream-json --verbose`. */
+function usageStdout(report: unknown = USAGE_REPORT): string {
+  return (
+    [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "s1" }),
+      JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "usage" }] },
+        local_command_run: { command: "usage", args: "" },
+        usage_report: report,
+      }),
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        num_turns: 0,
+        total_cost_usd: 0,
+        result: "usage",
+        local_command: "usage",
+      }),
+    ].join("\n") + "\n"
+  );
 }
-const CLAUDE_JSON_BODY = JSON.stringify({
-  oauthAccount: { emailAddress: "someone@example.com", organizationName: "Example Org" },
-});
-const VALID_FILES = { [CREDENTIALS]: credentials(T0 + 24 * HOUR), [CLAUDE_JSON]: CLAUDE_JSON_BODY };
 
-function harness(opts: { files?: Record<string, string>; replies?: Reply[]; deps?: Partial<QuotaDeps> } = {}) {
+// The stdout of `claude auth status` (claude 2.1.302), with made-up values.
+const AUTH_STDOUT = JSON.stringify(
+  {
+    loggedIn: true,
+    authMethod: "claude.ai",
+    apiProvider: "firstParty",
+    analyticsDisabled: false,
+    projectsDirectory: "/cfg/projects",
+    configDirectory: "/cfg",
+    email: "someone@example.com",
+    orgId: "00000000-0000-0000-0000-000000000000",
+    orgName: "Example Org",
+    subscriptionType: "max",
+  },
+  null,
+  2,
+);
+const ACCOUNT = { email: "someone@example.com", organization: "Example Org", subscription_type: "max", rate_limit_tier: null };
+
+const NOT_LOGGED_IN_RESULT = JSON.stringify({ type: "result", is_error: true, result: "Not logged in · Please run /login" });
+
+type Reply = () => string | Promise<string>;
+const prints = (stdout: string): Reply => () => stdout;
+const exits = (message: string): Reply => () => {
+  throw new Error(message);
+};
+
+interface Call {
+  argv: string[];
+  opts: { cwd?: string; timeoutMs: number };
+}
+
+function harness(opts: { usage?: Reply[]; auth?: Reply[]; cli?: string | null; deps?: Partial<QuotaDeps> } = {}) {
   let now = T0;
-  const files = opts.files ?? {};
-  const replies = [...(opts.replies ?? [])];
-  const requests: Array<{ url: string; headers: Record<string, string> }> = [];
+  const usage = [...(opts.usage ?? [])];
+  const auth = [...(opts.auth ?? [])];
+  const calls: Call[] = [];
   const tracker = new QuotaTracker({
-    readFile: (path) => {
-      if (!(path in files)) throw new Error(`ENOENT: ${path}`);
-      return files[path];
-    },
-    fetch: async (url, init) => {
-      requests.push({ url, headers: init.headers });
-      const reply = replies.shift();
+    run: async (argv, runOpts) => {
+      calls.push({ argv, opts: runOpts });
+      const reply = (argv[1] === "auth" ? auth : usage).shift();
       if (!reply) throw new Error("no reply scripted");
       return reply();
     },
+    findCli: () => (opts.cli === undefined ? CLI : opts.cli),
     now: () => now,
     env: { CLAUDE_CONFIG_DIR: "/cfg" },
     homeDir: () => "/home/test",
@@ -96,7 +126,9 @@ function harness(opts: { files?: Record<string, string>; replies?: Reply[]; deps
   });
   return {
     tracker,
-    requests,
+    calls,
+    usageCalls: () => calls.filter((c) => c.argv[1] === "-p"),
+    authCalls: () => calls.filter((c) => c.argv[1] === "auth"),
     advance: (ms: number) => {
       now += ms;
     },
@@ -105,7 +137,7 @@ function harness(opts: { files?: Record<string, string>; replies?: Reply[]; deps
 
 describe("QuotaTracker: rate_limit_event", () => {
   it("converts utilization to a percentage and resetsAt to ISO, and records status", async () => {
-    const { tracker, requests } = harness();
+    const { tracker, calls } = harness({ cli: null });
     tracker.recordRateLimitEvent(EVENT_INFO);
     expect(await tracker.snapshot()).toEqual({
       five_hour: { utilization: 4, resets_at: FIVE_HOUR_RESET },
@@ -115,16 +147,16 @@ describe("QuotaTracker: rate_limit_event", () => {
         observed_at: "2026-10-16T12:00:00.000Z",
         status: "allowed",
         limited_until: null,
-        live_error: "cannot read /cfg/.credentials.json",
+        live_error: "claude CLI not found on PATH",
         config_dir: "/cfg",
         account: null,
       },
     });
-    expect(requests).toHaveLength(0);
+    expect(calls).toHaveLength(0);
   });
 
   it("rounds a percentage to 2 decimals", async () => {
-    const { tracker } = harness();
+    const { tracker } = harness({ cli: null });
     tracker.recordRateLimitEvent({
       status: "allowed_warning",
       unifiedWindows: {
@@ -139,7 +171,7 @@ describe("QuotaTracker: rate_limit_event", () => {
   });
 
   it("records the status of an event without unifiedWindows, and no window", async () => {
-    const { tracker } = harness();
+    const { tracker } = harness({ cli: null });
     tracker.recordRateLimitEvent({ status: "rejected", resetsAt: 1792161000, rateLimitType: "five_hour" });
     const body = await tracker.snapshot();
     expect(Object.keys(body)).toEqual(["otterly"]);
@@ -147,57 +179,311 @@ describe("QuotaTracker: rate_limit_event", () => {
   });
 });
 
-describe("QuotaTracker: merge", () => {
-  it("passes the live body through whole", async () => {
-    const { tracker, requests } = harness({ files: VALID_FILES, replies: [ok(LIVE_BODY)] });
+describe("QuotaTracker: claude /usage", () => {
+  it("maps the usage_report of claude /usage to five_hour, seven_day, limits and extra_usage", async () => {
+    const { tracker } = harness({ usage: [prints(usageStdout())], auth: [prints(AUTH_STDOUT)] });
     expect(await tracker.snapshot()).toEqual({
-      ...LIVE_BODY,
+      five_hour: USAGE_FIVE_HOUR,
+      seven_day: USAGE_SEVEN_DAY,
+      limits: LIMITS,
+      extra_usage: EXTRA_USAGE,
       otterly: {
-        source: "oauth_usage",
+        source: "usage_command",
         observed_at: "2026-10-16T12:00:00.000Z",
         status: null,
         limited_until: null,
         live_error: null,
         config_dir: "/cfg",
-        account: {
-          email: "someone@example.com",
-          organization: "Example Org",
-          subscription_type: "max",
-          rate_limit_tier: "default_claude_max_20x",
-        },
+        account: ACCOUNT,
       },
     });
-    expect(requests).toHaveLength(1);
   });
 
-  it("lets a rate_limit_event observed after the live body replace five_hour and seven_day", async () => {
-    const { tracker, requests, advance } = harness({ files: VALID_FILES, replies: [ok(LIVE_BODY)] });
+  it("runs exactly the /usage argv, with a 60 s timeout and the given working directory", async () => {
+    const { tracker, usageCalls } = harness({ usage: [prints(usageStdout())], auth: [prints(AUTH_STDOUT)] });
+    await tracker.snapshot({ cwd: "/srv/otterly" });
+    expect(usageCalls()).toEqual([
+      {
+        argv: [
+          CLI,
+          "-p",
+          "/usage",
+          "--output-format",
+          "stream-json",
+          "--verbose",
+          "--safe-mode",
+          "--setting-sources",
+          "",
+          "--strict-mcp-config",
+          "--mcp-config",
+          '{"mcpServers":{}}',
+        ],
+        opts: { cwd: "/srv/otterly", timeoutMs: 60_000 },
+      },
+    ]);
+    expect(usageArgv(CLI)).toEqual(usageCalls()[0].argv);
+    expect(USAGE_TIMEOUT_MS).toBe(60_000);
+  });
+
+  it("reports and holds when there is no claude CLI", async () => {
+    const { tracker, calls } = harness({ cli: null });
+    const body = await tracker.snapshot({ refresh: true });
+    expect(calls).toHaveLength(0);
+    expect(body).toEqual({
+      otterly: {
+        source: "none",
+        observed_at: null,
+        status: null,
+        limited_until: null,
+        live_error: "claude CLI not found on PATH",
+        config_dir: "/cfg",
+        account: null,
+      },
+    });
+  });
+
+  it("reuses a good /usage result for 5 minutes", async () => {
+    const { tracker, usageCalls, advance } = harness({ usage: [prints(usageStdout()), prints(usageStdout())] });
+    expect(LIVE_REUSE_MS).toBe(5 * 60 * 1000);
+    await tracker.snapshot();
+    advance(LIVE_REUSE_MS - 1);
+    const body = await tracker.snapshot();
+    expect(usageCalls()).toHaveLength(1);
+    expect(body.five_hour).toEqual(USAGE_FIVE_HOUR);
+    expect(body.otterly.observed_at).toBe("2026-10-16T12:00:00.000Z");
+    advance(1);
+    await tracker.snapshot();
+    expect(usageCalls()).toHaveLength(2);
+  });
+
+  it("runs /usage on refresh, but never more than once per 60 s", async () => {
+    const { tracker, usageCalls, advance } = harness({
+      usage: [prints(usageStdout()), prints(usageStdout()), prints(usageStdout())],
+    });
+    expect(USAGE_MIN_INTERVAL_MS).toBe(60_000);
+    await tracker.snapshot();
+    advance(USAGE_MIN_INTERVAL_MS - 1);
+    await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(1);
+    advance(1);
+    const body = await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(2);
+    expect(body.otterly.observed_at).toBe("2026-10-16T12:01:00.000Z");
+    await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(2);
+    advance(USAGE_MIN_INTERVAL_MS);
+    await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(3);
+  });
+
+  it.each([
+    ["a non-zero exit", exits("claude exited 1: boom"), "claude /usage failed: claude exited 1: boom"],
+    ["a timeout", exits("CLI timed out after 60000ms"), "claude /usage failed: CLI timed out after 60000ms"],
+    [
+      "output with no usage_report line",
+      prints(NOT_LOGGED_IN_RESULT),
+      "claude /usage printed no usage_report: Not logged in · Please run /login",
+    ],
+  ])("runs no /usage for 60 s after %s, refresh included", async (_label, reply, error) => {
+    const { tracker, usageCalls, advance } = harness({ usage: [reply, prints(usageStdout())] });
+    expect(LIVE_FAILURE_BACKOFF_MS).toBe(60_000);
+    let body = await tracker.snapshot();
+    expect(body.otterly.live_error).toBe(error);
+    expect(body.otterly.source).toBe("none");
+    expect(Object.keys(body)).toEqual(["otterly"]);
+    advance(LIVE_FAILURE_BACKOFF_MS - 1);
+    body = await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(1);
+    expect(body.otterly.live_error).toBe(error);
+    advance(1);
+    body = await tracker.snapshot();
+    expect(usageCalls()).toHaveLength(2);
+    expect(body.otterly).toMatchObject({ source: "usage_command", live_error: null });
+  });
+
+  it("keeps the last good result through a failure", async () => {
+    const { tracker, advance } = harness({ usage: [prints(usageStdout()), exits("claude exited 1: boom")] });
+    await tracker.snapshot();
+    advance(LIVE_REUSE_MS);
+    const body = await tracker.snapshot();
+    expect(body.five_hour).toEqual(USAGE_FIVE_HOUR);
+    expect(body.otterly).toMatchObject({
+      source: "usage_command",
+      observed_at: "2026-10-16T12:00:00.000Z",
+      live_error: "claude /usage failed: claude exited 1: boom",
+    });
+  });
+
+  it("shares one /usage run between concurrent requests", async () => {
+    let release!: (stdout: string) => void;
+    const gate = new Promise<string>((resolve) => {
+      release = resolve;
+    });
+    const { tracker, usageCalls } = harness({ usage: [() => gate, prints(usageStdout())] });
+    const both = Promise.all([tracker.snapshot(), tracker.snapshot({ refresh: true })]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    release(usageStdout());
+    const [a, b] = await both;
+    expect(usageCalls()).toHaveLength(1);
+    expect(a.five_hour).toEqual(USAGE_FIVE_HOUR);
+    expect(b.five_hour).toEqual(USAGE_FIVE_HOUR);
+  });
+
+  it("runs no /usage while the account is at its usage limit; the rate_limit_event figures stand", async () => {
+    const { tracker, usageCalls, advance } = harness({ usage: [prints(usageStdout())] });
+    tracker.recordRateLimitEvent({ ...EVENT_INFO, status: "rejected" });
+    let body = await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(0);
+    expect(body.five_hour).toEqual({ utilization: 4, resets_at: FIVE_HOUR_RESET });
+    expect(body.otterly).toMatchObject({
+      source: "rate_limit_event",
+      status: "rejected",
+      limited_until: FIVE_HOUR_RESET,
+      live_error: `claude /usage not run: the account is at its usage limit until ${FIVE_HOUR_RESET}`,
+    });
+    advance(60_000);
+    tracker.recordRateLimitEvent(EVENT_INFO);
+    body = await tracker.snapshot();
+    expect(usageCalls()).toHaveLength(1);
+    expect(body.otterly).toMatchObject({ source: "usage_command", live_error: null, limited_until: null });
+  });
+
+  it("makes no network request", async () => {
+    const spy = vi.spyOn(globalThis, "fetch");
+    try {
+      const { tracker } = harness({ usage: [prints(usageStdout())], auth: [prints(AUTH_STDOUT)] });
+      await tracker.snapshot({ refresh: true });
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("reports ~/.claude as the config dir when CLAUDE_CONFIG_DIR is unset", async () => {
+    const { tracker } = harness({ cli: null, deps: { env: {} } });
+    expect((await tracker.snapshot()).otterly.config_dir).toBe("/home/test/.claude");
+  });
+});
+
+describe("parseUsageOutput", () => {
+  it("passes limits and extra_usage through verbatim, resets_at included", () => {
+    const parsed = parseUsageOutput(usageStdout());
+    expect(parsed).toEqual({
+      body: { five_hour: USAGE_FIVE_HOUR, seven_day: USAGE_SEVEN_DAY, limits: LIMITS, extra_usage: EXTRA_USAGE },
+    });
+    expect((parsed as { body: { limits: Array<{ resets_at: string }> } }).body.limits[0].resets_at).toBe(
+      "2026-10-17T11:09:59.918669+00:00",
+    );
+  });
+
+  it("skips lines that are not JSON", () => {
+    expect(parseUsageOutput(`Warning: something\n${usageStdout()}`)).toMatchObject({ body: { five_hour: USAGE_FIVE_HOUR } });
+  });
+
+  it("leaves out a window whose entry has no percent", () => {
+    const report = {
+      rate_limits: {
+        limits: [
+          { kind: "session", resets_at: "2026-10-17T11:09:59.918669+00:00" },
+          { kind: "weekly_all", percent: 64, resets_at: "2026-10-22T02:59:59.918692+00:00" },
+        ],
+      },
+    };
+    const parsed = parseUsageOutput(usageStdout(report)) as { body: Record<string, unknown> };
+    expect(Object.keys(parsed.body).sort()).toEqual(["limits", "seven_day"]);
+  });
+
+  it("gives the result text when no line carries a usage_report", () => {
+    expect(parseUsageOutput(NOT_LOGGED_IN_RESULT)).toEqual({
+      problem: "claude /usage printed no usage_report: Not logged in · Please run /login",
+    });
+    expect(parseUsageOutput("")).toEqual({ problem: "claude /usage printed no usage_report" });
+  });
+});
+
+describe("QuotaTracker: claude auth status", () => {
+  it("runs claude auth status with a 30 s timeout and the given working directory", async () => {
+    const { tracker, authCalls } = harness({ auth: [prints(AUTH_STDOUT)] });
+    const body = await tracker.snapshot({ cwd: "/srv/otterly" });
+    expect(authCalls()).toEqual([{ argv: [CLI, "auth", "status"], opts: { cwd: "/srv/otterly", timeoutMs: 30_000 } }]);
+    expect(authStatusArgv(CLI)).toEqual([CLI, "auth", "status"]);
+    expect(AUTH_TIMEOUT_MS).toBe(30_000);
+    expect(body.otterly.account).toEqual(ACCOUNT);
+  });
+
+  it("parses email, orgName, subscriptionType and rateLimitTier, null for each one absent", () => {
+    expect(parseAuthStatus(AUTH_STDOUT)).toEqual(ACCOUNT);
+    expect(parseAuthStatus(JSON.stringify({ loggedIn: true, rateLimitTier: "default_claude_max_20x" }))).toEqual({
+      email: null,
+      organization: null,
+      subscription_type: null,
+      rate_limit_tier: "default_claude_max_20x",
+    });
+  });
+
+  it("gives null for output that is not a JSON object, or says loggedIn: false", () => {
+    expect(parseAuthStatus("Not logged in")).toBeNull();
+    expect(parseAuthStatus("[]")).toBeNull();
+    expect(parseAuthStatus(JSON.stringify({ loggedIn: false, authMethod: "none" }))).toBeNull();
+  });
+
+  it("reports account null when claude auth status fails", async () => {
+    const { tracker, advance } = harness({
+      auth: [prints(AUTH_STDOUT), exits('claude exited 1: {"loggedIn": false}')],
+    });
+    expect((await tracker.snapshot()).otterly.account).toEqual(ACCOUNT);
+    advance(USAGE_MIN_INTERVAL_MS);
+    expect((await tracker.snapshot({ refresh: true })).otterly.account).toBeNull();
+  });
+
+  it("runs claude auth status at most once per 30 minutes, and on refresh at most once per 60 s", async () => {
+    const { tracker, authCalls, advance } = harness({
+      auth: [prints(AUTH_STDOUT), prints(AUTH_STDOUT), prints(AUTH_STDOUT)],
+    });
+    expect(ACCOUNT_REUSE_MS).toBe(30 * 60 * 1000);
+    await tracker.snapshot();
+    advance(ACCOUNT_REUSE_MS - 1);
+    await tracker.snapshot();
+    expect(authCalls()).toHaveLength(1);
+    advance(1);
+    await tracker.snapshot();
+    expect(authCalls()).toHaveLength(2);
+    await tracker.snapshot({ refresh: true });
+    expect(authCalls()).toHaveLength(2);
+    advance(USAGE_MIN_INTERVAL_MS);
+    await tracker.snapshot({ refresh: true });
+    expect(authCalls()).toHaveLength(3);
+  });
+});
+
+describe("QuotaTracker: merge", () => {
+  it("lets a rate_limit_event observed after the /usage result replace five_hour and seven_day", async () => {
+    const { tracker, usageCalls, advance } = harness({ usage: [prints(usageStdout())] });
     await tracker.snapshot();
     advance(60_000);
     tracker.recordRateLimitEvent(EVENT_INFO);
     const body = await tracker.snapshot();
     expect(body.five_hour).toEqual({ utilization: 4, resets_at: FIVE_HOUR_RESET });
     expect(body.seven_day).toEqual({ utilization: 43, resets_at: SEVEN_DAY_RESET });
-    expect(body.seven_day_opus).toEqual(LIVE_BODY.seven_day_opus);
-    expect(body.extra_usage).toEqual(LIVE_BODY.extra_usage);
-    expect(body.limits).toEqual(LIVE_BODY.limits);
+    expect(body.limits).toEqual(LIMITS);
+    expect(body.extra_usage).toEqual(EXTRA_USAGE);
     expect(body.otterly).toMatchObject({
       source: "rate_limit_event",
       observed_at: "2026-10-16T12:01:00.000Z",
       status: "allowed",
     });
-    expect(requests).toHaveLength(1);
+    expect(usageCalls()).toHaveLength(1);
   });
 
-  it("keeps the live figures over a rate_limit_event observed before them", async () => {
-    const { tracker, advance } = harness({ files: VALID_FILES, replies: [ok(LIVE_BODY)] });
+  it("keeps the /usage figures over a rate_limit_event observed before them", async () => {
+    const { tracker, advance } = harness({ usage: [prints(usageStdout())] });
     tracker.recordRateLimitEvent(EVENT_INFO);
     advance(1_000);
     const body = await tracker.snapshot();
-    expect(body.five_hour).toEqual(LIVE_BODY.five_hour);
-    expect(body.seven_day).toEqual(LIVE_BODY.seven_day);
+    expect(body.five_hour).toEqual(USAGE_FIVE_HOUR);
+    expect(body.seven_day).toEqual(USAGE_SEVEN_DAY);
     expect(body.otterly).toMatchObject({
-      source: "oauth_usage",
+      source: "usage_command",
       observed_at: "2026-10-16T12:00:01.000Z",
       status: "allowed",
     });
@@ -205,209 +491,23 @@ describe("QuotaTracker: merge", () => {
 });
 
 describe("QuotaTracker: expired windows", () => {
-  it("reports a live window whose reset time has passed as 0 and null", async () => {
-    const { tracker, advance } = harness({ files: VALID_FILES, replies: [ok(LIVE_BODY), fail(500)] });
+  it("reports a /usage window whose reset time has passed as 0 and null", async () => {
+    const { tracker, advance } = harness({ usage: [prints(usageStdout()), exits("claude exited 1: boom")] });
     await tracker.snapshot();
-    advance(3 * HOUR); // 15:00, the five_hour reset
+    advance(23 * HOUR + 10 * 60_000); // 11:10 on the 17th, past the five_hour reset
     const body = await tracker.snapshot();
     expect(body.five_hour).toEqual({ utilization: 0, resets_at: null });
-    expect(body.seven_day).toEqual(LIVE_BODY.seven_day);
-    expect(body.otterly.live_error).toBe("usage endpoint answered HTTP 500");
+    expect(body.seven_day).toEqual(USAGE_SEVEN_DAY);
+    expect(body.otterly.live_error).toBe("claude /usage failed: claude exited 1: boom");
   });
 
   it("reports an event window whose reset time has passed as 0 and null", async () => {
-    const { tracker, advance } = harness();
+    const { tracker, advance } = harness({ cli: null });
     tracker.recordRateLimitEvent(EVENT_INFO);
     advance(2.5 * HOUR + 1); // just past 14:30, the five_hour reset
     const body = await tracker.snapshot();
     expect(body.five_hour).toEqual({ utilization: 0, resets_at: null });
     expect(body.seven_day).toEqual({ utilization: 43, resets_at: SEVEN_DAY_RESET });
-  });
-});
-
-describe("QuotaTracker: live read", () => {
-  it("sends the CLI's token with the usage endpoint's headers", async () => {
-    const { tracker, requests } = harness({ files: VALID_FILES, replies: [ok(LIVE_BODY)] });
-    await tracker.snapshot();
-    expect(requests).toEqual([
-      {
-        url: USAGE_URL,
-        headers: {
-          Authorization: "Bearer test-token",
-          "anthropic-beta": "oauth-2025-04-20",
-          "User-Agent": `claude-cli/${TESTED_CLAUDE_CLI_VERSION} (external, cli)`,
-        },
-      },
-    ]);
-  });
-
-  it("reads an expiresAt given in epoch seconds", async () => {
-    const { tracker, requests } = harness({
-      files: { [CREDENTIALS]: credentials(Math.floor(T0 / 1000) + 3600) },
-      replies: [ok(LIVE_BODY)],
-    });
-    await tracker.snapshot();
-    expect(requests).toHaveLength(1);
-  });
-
-  it.each([
-    ["epoch seconds, 30 s ahead", Math.floor(T0 / 1000) + 30],
-    ["epoch ms, 30 s ahead", T0 + 30_000],
-    ["epoch ms, already past", T0 - 1_000],
-  ])("makes no request when the token expires within 60 s (%s)", async (_label, expiresAt) => {
-    const { tracker, requests } = harness({ files: { [CREDENTIALS]: credentials(expiresAt) }, replies: [ok(LIVE_BODY)] });
-    const body = await tracker.snapshot();
-    expect(requests).toHaveLength(0);
-    expect(body.otterly.live_error).toMatch(/^access token expires at /);
-    expect(body.otterly.source).toBe("none");
-  });
-
-  it("makes no request when there is no access token", async () => {
-    const { tracker, requests } = harness({
-      files: { [CREDENTIALS]: credentials(T0 + HOUR, null) },
-      replies: [ok(LIVE_BODY)],
-    });
-    const body = await tracker.snapshot();
-    expect(requests).toHaveLength(0);
-    expect(body.otterly.live_error).toBe("no access token in the credentials file");
-  });
-
-  it("looks in ~/.claude and ~/.claude.json when CLAUDE_CONFIG_DIR is unset", async () => {
-    const { tracker, requests } = harness({
-      files: {
-        "/home/test/.claude/.credentials.json": credentials(T0 + HOUR),
-        "/home/test/.claude.json": CLAUDE_JSON_BODY,
-      },
-      replies: [ok(LIVE_BODY)],
-      deps: { env: {} },
-    });
-    const body = await tracker.snapshot();
-    expect(requests).toHaveLength(1);
-    expect(body.otterly.config_dir).toBe("/home/test/.claude");
-    expect(body.otterly.account).toMatchObject({ email: "someone@example.com", organization: "Example Org" });
-  });
-
-  it("reuses a successful body for 5 minutes; refresh skips the reuse", async () => {
-    const { tracker, requests, advance } = harness({
-      files: VALID_FILES,
-      replies: [ok(LIVE_BODY), ok(LIVE_BODY), ok(LIVE_BODY)],
-    });
-    await tracker.snapshot();
-    advance(LIVE_REUSE_MS - 1);
-    await tracker.snapshot();
-    expect(requests).toHaveLength(1);
-    await tracker.snapshot({ refresh: true });
-    expect(requests).toHaveLength(2);
-    advance(LIVE_REUSE_MS);
-    await tracker.snapshot();
-    expect(requests).toHaveLength(3);
-  });
-
-  it("shares one request between concurrent snapshots", async () => {
-    const { tracker, requests } = harness({ files: VALID_FILES, replies: [ok(LIVE_BODY), ok(LIVE_BODY)] });
-    const [a, b] = await Promise.all([tracker.snapshot(), tracker.snapshot()]);
-    expect(requests).toHaveLength(1);
-    expect(a.five_hour).toEqual(LIVE_BODY.five_hour);
-    expect(b.five_hour).toEqual(LIVE_BODY.five_hour);
-  });
-
-  it("backs off 5 minutes after HTTP 429 when Retry-After is shorter; refresh does not shorten it", async () => {
-    const { tracker, requests, advance } = harness({
-      files: VALID_FILES,
-      replies: [ok(LIVE_BODY), fail(429, { "retry-after": "30" }), ok(LIVE_BODY)],
-    });
-    await tracker.snapshot();
-    advance(LIVE_REUSE_MS);
-    let body = await tracker.snapshot();
-    expect(requests).toHaveLength(2);
-    expect(body.otterly.live_error).toBe("usage endpoint answered HTTP 429; next request after 2026-10-16T12:10:00.000Z");
-    // The last good body is kept.
-    expect(body.five_hour).toEqual(LIVE_BODY.five_hour);
-    expect(body.otterly.source).toBe("oauth_usage");
-    advance(LIVE_429_BACKOFF_MS - 1);
-    await tracker.snapshot({ refresh: true });
-    expect(requests).toHaveLength(2);
-    advance(1);
-    body = await tracker.snapshot();
-    expect(requests).toHaveLength(3);
-    expect(body.otterly.live_error).toBeNull();
-  });
-
-  it("backs off for Retry-After after HTTP 429 when it is longer than 5 minutes", async () => {
-    const { tracker, requests, advance } = harness({
-      files: VALID_FILES,
-      replies: [fail(429, { "retry-after": "900" }), ok(LIVE_BODY)],
-    });
-    await tracker.snapshot();
-    advance(900_000 - 1);
-    await tracker.snapshot({ refresh: true });
-    expect(requests).toHaveLength(1);
-    advance(1);
-    const body = await tracker.snapshot();
-    expect(requests).toHaveLength(2);
-    expect(body.five_hour).toEqual(LIVE_BODY.five_hour);
-  });
-
-  it.each([
-    ["HTTP 500", fail(500), "usage endpoint answered HTTP 500"],
-    ["a network error", networkError, "usage request failed: fetch failed"],
-    [
-      "a body that is not JSON",
-      (() => new Response("<html>", { status: 200 })) as Reply,
-      "usage endpoint answered with something other than a JSON object",
-    ],
-  ])("backs off 60 s after %s", async (_label, reply, error) => {
-    const { tracker, requests, advance } = harness({ files: VALID_FILES, replies: [reply, ok(LIVE_BODY)] });
-    let body = await tracker.snapshot();
-    expect(body.otterly.live_error).toBe(error);
-    expect(Object.keys(body)).toEqual(["otterly"]);
-    advance(LIVE_FAILURE_BACKOFF_MS - 1);
-    await tracker.snapshot({ refresh: true });
-    expect(requests).toHaveLength(1);
-    advance(1);
-    body = await tracker.snapshot();
-    expect(requests).toHaveLength(2);
-    expect(body.otterly.source).toBe("oauth_usage");
-  });
-});
-
-describe("QuotaTracker: the credentials are only read", () => {
-  it("writes nothing to the config dir, whatever the outcome", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "otterly-quota-"));
-    try {
-      writeFileSync(join(dir, ".credentials.json"), credentials(T0 + 24 * HOUR));
-      writeFileSync(join(dir, ".claude.json"), CLAUDE_JSON_BODY);
-      const state = () =>
-        readdirSync(dir)
-          .sort()
-          .map((name) => {
-            const path = join(dir, name);
-            return { name, bytes: readFileSync(path, "utf8"), mtimeMs: statSync(path).mtimeMs };
-          });
-      const before = state();
-      let now = T0;
-      const replies: Reply[] = [ok(LIVE_BODY), fail(429), fail(500)];
-      // The real file reader: only the clock and the endpoint are fakes.
-      const tracker = new QuotaTracker({
-        fetch: async () => replies.shift()!(),
-        now: () => now,
-        env: { CLAUDE_CONFIG_DIR: dir },
-      });
-      await tracker.snapshot(); // a good body
-      tracker.recordRateLimitEvent(EVENT_INFO);
-      now += LIVE_REUSE_MS;
-      await tracker.snapshot(); // HTTP 429
-      now += LIVE_429_BACKOFF_MS;
-      await tracker.snapshot(); // HTTP 500
-      now += 24 * HOUR; // the token has expired
-      const body = await tracker.snapshot();
-      expect(replies).toHaveLength(0);
-      expect(body.otterly.live_error).toMatch(/^access token expires at /);
-      expect(body.otterly.account).toMatchObject({ email: "someone@example.com" });
-      expect(state()).toEqual(before);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
   });
 });
 
@@ -418,20 +518,20 @@ describe("QuotaTracker: usage limit", () => {
   const UNTIL = Date.parse(FIVE_HOUR_RESET);
 
   it("starts unlimited", async () => {
-    const { tracker } = harness();
+    const { tracker } = harness({ cli: null });
     expect(tracker.usageLimit()).toBeNull();
     expect((await tracker.snapshot()).otterly.limited_until).toBeNull();
   });
 
   it("is limited until resetsAt after a rejected event", async () => {
-    const { tracker } = harness();
+    const { tracker } = harness({ cli: null });
     tracker.recordRateLimitEvent(REJECTED);
     expect(tracker.usageLimit()).toEqual({ until: UNTIL, type: "five_hour", retryAfterS: 9000 });
     expect((await tracker.snapshot()).otterly).toMatchObject({ status: "rejected", limited_until: FIVE_HOUR_RESET });
   });
 
   it("lifts at resetsAt, rounding Retry-After up to whole seconds until then", async () => {
-    const { tracker, advance } = harness();
+    const { tracker, advance } = harness({ cli: null });
     tracker.recordRateLimitEvent(REJECTED);
     advance(UNTIL - T0 - 1_500);
     expect(tracker.usageLimit()?.retryAfterS).toBe(2);
@@ -443,7 +543,7 @@ describe("QuotaTracker: usage limit", () => {
   });
 
   it("holds LIMIT_HOLD_MS (5 minutes) when the event has no resetsAt, and names the window unknown", async () => {
-    const { tracker, advance } = harness();
+    const { tracker, advance } = harness({ cli: null });
     tracker.recordRateLimitEvent({ status: "rejected" });
     expect(LIMIT_HOLD_MS).toBe(5 * 60 * 1000);
     expect(tracker.usageLimit()).toEqual({ until: T0 + LIMIT_HOLD_MS, type: "unknown", retryAfterS: 300 });
@@ -455,7 +555,7 @@ describe("QuotaTracker: usage limit", () => {
   });
 
   it.each(["allowed", "allowed_warning"])("ends at once with a later %s event", async (status) => {
-    const { tracker, advance } = harness();
+    const { tracker, advance } = harness({ cli: null });
     tracker.recordRateLimitEvent(REJECTED);
     advance(60_000);
     tracker.recordRateLimitEvent({ ...EVENT_INFO, status });
@@ -464,7 +564,7 @@ describe("QuotaTracker: usage limit", () => {
   });
 
   it("is forgotten by reset", () => {
-    const { tracker } = harness();
+    const { tracker } = harness({ cli: null });
     tracker.recordRateLimitEvent(REJECTED);
     tracker.reset();
     expect(tracker.usageLimit()).toBeNull();

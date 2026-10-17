@@ -12,10 +12,13 @@ and uses [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) formatting.
 - **`GET /api/quota`** — the 5-hour and weekly usage of the Claude
   subscription that the `claude` CLI is logged in to, in the shape of
   Anthropic's own usage endpoint, plus an `otterly` key saying where the
-  figures came from. It combines the CLI's `rate_limit_event` lines with
-  Anthropic's usage endpoint, which it reads with the CLI's token at most every
-  5 minutes and backs off from after a failure. The CLI's credentials are only
-  ever read. With `OTTERLY_API_KEY` set, the route requires the bearer token.
+  figures came from. Every figure comes from the CLI itself: its
+  `rate_limit_event` lines, `claude -p /usage` (run only when the route is
+  requested, its result reused for 5 minutes, never more than once per 60 s,
+  and not while the account is at its usage limit) and `claude auth status`
+  for the account. Otterly reads none of the CLI's files and contacts no
+  Anthropic address. With `OTTERLY_API_KEY` set, the route requires the
+  bearer token.
 - **`--host` / `-H <address>`** — the interface to listen on. With no flag,
   Otterly listens on all interfaces, as before.
 - **HTTP 429 at once at the Claude usage limit** — while the latest

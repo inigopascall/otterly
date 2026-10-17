@@ -63,7 +63,8 @@ export const openApiSpec = {
         summary: "Claude subscription usage",
         description:
           "The 5-hour and weekly usage of the Claude subscription the claude CLI is logged in to, " +
-          "in the shape of Anthropic's own usage endpoint, whose other keys are passed through, plus an `otterly` key. " +
+          "read from `claude /usage` and the CLI's rate_limit_event lines, in the shape of Anthropic's own usage endpoint, " +
+          "with `limits` and `extra_usage` passed through, plus an `otterly` key. " +
           "Always 200; with no data the body holds only `otterly`, with source \"none\". " +
           "Requires the API key when OTTERLY_API_KEY is set.",
         operationId: "getQuota",
@@ -73,7 +74,7 @@ export const openApiSpec = {
             name: "refresh",
             in: "query",
             schema: { type: "string", enum: ["1"] },
-            description: "Read Anthropic's usage endpoint even if its last body is under 5 minutes old. A back-off still applies.",
+            description: "Run `claude /usage` even if its last result is under 5 minutes old. It never runs more than once per 60 s.",
           },
         ],
         responses: {
@@ -92,7 +93,7 @@ export const openApiSpec = {
                       properties: {
                         source: {
                           type: "string",
-                          enum: ["oauth_usage", "rate_limit_event", "none"],
+                          enum: ["usage_command", "rate_limit_event", "none"],
                           description: "What supplied the newest five_hour figure",
                         },
                         observed_at: { type: "string", format: "date-time", nullable: true },
@@ -110,7 +111,7 @@ export const openApiSpec = {
                         live_error: {
                           type: "string",
                           nullable: true,
-                          description: "Why the last read of the usage endpoint was skipped or failed",
+                          description: "Why the last `claude /usage` run was skipped or failed",
                         },
                         config_dir: { type: "string" },
                         account: {

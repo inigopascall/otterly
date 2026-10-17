@@ -558,7 +558,7 @@ This is exactly what `npx otterly serve` runs under the hood. Bundle it inside a
 | `GET /playground` | HTML | Interactive API explorer in your browser |
 | `GET /api/status` | JSON | Health + queue stats |
 | `GET /api/metrics` | JSON | Today + lifetime usage, recent runs, top tools |
-| `GET /api/quota` | JSON | Usage of your Claude subscription: the 5-hour and weekly windows, in the shape of Anthropic's own usage endpoint. Needs the `Bearer` token when `OTTERLY_API_KEY` is set |
+| `GET /api/quota` | JSON | Usage of your Claude subscription: the 5-hour and weekly windows, read from `claude /usage` and the CLI's own rate-limit events, in the shape of Anthropic's own usage endpoint. Needs the `Bearer` token when `OTTERLY_API_KEY` is set |
 | `GET /swagger.json` | OpenAPI 3.0 | Full spec. Generate a client in any language. |
 
 Plus all the boring-but-essential stuff:

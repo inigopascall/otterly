@@ -7,8 +7,9 @@ import { startApiServer, type ApiServerHandle } from "../../src/server/index.js"
 import { quota } from "../../src/server/quota.js";
 
 // GET /api/quota, served from the real `quota` singleton. CLAUDE_CONFIG_DIR
-// points at an empty directory for the whole file, so the tracker finds no
-// credentials and never calls Anthropic's usage endpoint.
+// points at an empty directory for the whole file, and the test configuration
+// hides the claude CLI (OTTERLY_DISABLE_CLAUDE_CLI), so the tracker runs no
+// command and reports that it found no CLI.
 
 const savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
 let configDir = "";
@@ -65,7 +66,7 @@ describe("GET /api/quota", () => {
     handle.close();
   });
 
-  it("answers 200 with no window keys and source none when there is no data", async () => {
+  it("answers 200 with only the otterly key, in its full shape, and source none when there is no data", async () => {
     const { status, body } = await get(base, "/api/quota");
     expect(status).toBe(200);
     expect(body).toEqual({
@@ -74,7 +75,7 @@ describe("GET /api/quota", () => {
         observed_at: null,
         status: null,
         limited_until: null,
-        live_error: `cannot read ${join(configDir, ".credentials.json")}`,
+        live_error: "claude CLI not found on PATH",
         config_dir: configDir,
         account: null,
       },
@@ -107,12 +108,12 @@ describe("GET /api/quota", () => {
     expect(body.otterly.observed_at).toMatch(ISO);
   });
 
-  it("passes ?refresh=1 on to the tracker", async () => {
+  it("passes ?refresh=1 and the server's working directory on to the tracker", async () => {
     const spy = vi.spyOn(quota, "snapshot");
     try {
       await get(base, "/api/quota?refresh=1");
       await get(base, "/api/quota");
-      expect(spy.mock.calls).toEqual([[{ refresh: true }], [{ refresh: false }]]);
+      expect(spy.mock.calls).toEqual([[{ refresh: true, cwd: "/test" }], [{ refresh: false, cwd: "/test" }]]);
     } finally {
       spy.mockRestore();
     }

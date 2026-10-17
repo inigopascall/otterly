@@ -105,7 +105,7 @@ start without it (§5).
 | `src/server/sse-stream.ts` | `SseStream`: the SSE chunks of one streamed completion |
 | `src/server/tool-call-stream.ts` | `ToolCallStreamer, reconcileStreamedCalls`: live tool calls |
 | `src/server/retry-notice.ts` | Remembers dropped requests; notice on the retry |
-| `src/server/quota.ts` | `QuotaTracker` and its singleton `quota`: subscription usage for `GET /api/quota`, and the usage limit (§12) |
+| `src/server/quota.ts` | `QuotaTracker` and its singleton `quota`: subscription usage for `GET /api/quota` from `claude -p /usage`, `claude auth status` and `rate_limit_event` lines, and the usage limit (§12) |
 | `tests/fixtures/fake-claude.mjs` | A stand-in CLI that speaks stream-json, for `tests/cli-transport.test.ts` |
 | `tests-cli/claude-cli.test.ts` | The CLI suite: checks the real installed `claude` (§7) |
 
@@ -362,50 +362,62 @@ Non-streamed tool requests are buffered, and fail with HTTP 502 as in §2.
 that the `claude` CLI is logged in to (`QuotaTracker` and its singleton `quota`
 in `server/quota.ts`). The body has the shape of Anthropic's own usage
 endpoint: `five_hour` and `seven_day`, each with `utilization` as a percentage
-(0-100) and `resets_at` as ISO-8601, plus an `otterly` key holding `source`,
+(0-100) and `resets_at` as ISO-8601, `limits` and `extra_usage` when
+`claude /usage` supplied them, plus an `otterly` key holding `source`,
 `observed_at`, `status`, `limited_until`, `live_error`, `config_dir` and
-`account`. The answer
-is always HTTP 200; with no data it holds only `otterly`, with
-`source: "none"`. When `OTTERLY_API_KEY` is set, the route needs the bearer
-token, as the POST routes do, because it names the account; the other GET
-routes stay open.
+`account`. The answer is always HTTP 200; with no data it holds only
+`otterly`, with `source: "none"`. When `OTTERLY_API_KEY` is set, the route
+needs the bearer token, as the POST routes do, because it names the account;
+the other GET routes stay open.
 
-Two sources feed it:
+**Every figure comes from the `claude` CLI.** Otterly reads none of the CLI's
+files, contacts no Anthropic address, and never identifies itself as the CLI.
+`config_dir` is `$CLAUDE_CONFIG_DIR`, or `~/.claude` when that is unset, as a
+string only. Three sources feed the body:
 
 - **`rate_limit_event` lines**, which the CLI prints after each API response.
   `createCLIQueryFn` in `engine.ts` passes every one, from one-shot runs and
   `Session`s alike, to `quota.recordRateLimitEvent`, and still yields the line.
   There `utilization` is a fraction and `resetsAt` is in epoch seconds; they
   are stored as a percentage rounded to 2 decimals and as an ISO string.
-- **Anthropic's usage endpoint**,
-  `GET https://api.anthropic.com/api/oauth/usage`, called with the CLI's access
-  token, `anthropic-beta: oauth-2025-04-20`, and a
-  `claude-cli/<version> (external, cli)` User-Agent.
+- **`claude -p /usage`**, run through `spawnWithAbort` (`usageArgv` in
+  `server/quota.ts`) with stdin closed, Otterly's own environment (so
+  `CLAUDE_CONFIG_DIR` selects the account), the server's working directory,
+  and a 60 s timeout (`USAGE_TIMEOUT_MS`):
+  `claude -p /usage --output-format stream-json --verbose --safe-mode --setting-sources "" --strict-mcp-config --mcp-config '{"mcpServers":{}}'`.
+  It makes no model call. The first stdout line carrying
+  `usage_report.rate_limits` is mapped (`parseUsageOutput`): the `limits[]`
+  entry of kind `session` becomes `five_hour` and `weekly_all` becomes
+  `seven_day` (`percent` as `utilization`, `resets_at` as ISO-8601 with `Z`);
+  `limits` and `extra_usage` are passed through whole, so `weekly_scoped`
+  entries reach the client.
+- **`claude auth status`** (`authStatusArgv`), with the same CLI, environment
+  and working directory and a 30 s timeout (`AUTH_TIMEOUT_MS`). Its JSON gives
+  `otterly.account`: `email`, `orgName` as `organization`,
+  `subscriptionType` as `subscription_type` and `rateLimitTier` as
+  `rate_limit_tier`, `null` for each one absent. `account` is `null` when the
+  command fails or says `loggedIn: false` (`parseAuthStatus`).
 
-**Merge.** The body starts from the last good usage-endpoint body, passed
-through whole. For `five_hour` and `seven_day`, a `rate_limit_event` observed
-after that body replaces `utilization` and `resets_at`. A window whose
-`resets_at` has passed is reported as `utilization: 0`, `resets_at: null`.
+**Merge.** The body starts from the last good `/usage` result. For
+`five_hour` and `seven_day`, a `rate_limit_event` observed after that result
+replaces `utilization` and `resets_at`. A window whose `resets_at` has passed
+is reported as `utilization: 0`, `resets_at: null`.
 
-**Caching.**
+**When the commands run.** Only when `GET /api/quota` is requested.
 
-- A successful usage-endpoint body is reused for 5 minutes (`LIVE_REUSE_MS`).
-  `?refresh=1` skips the reuse.
-- After HTTP 429, no request is made for the longer of `Retry-After` and 5
-  minutes (`LIVE_429_BACKOFF_MS`); after any other failure, for 60 s
-  (`LIVE_FAILURE_BACKOFF_MS`). `?refresh=1` does not shorten either.
-- A request is abandoned after 10 s (`LIVE_TIMEOUT_MS`).
-- The last good body is kept through failures; `otterly.live_error` says why
-  the last read was skipped or failed.
-
-**Credentials are only ever read.** The access token comes from
-`<config dir>/.credentials.json`, the config dir being `$CLAUDE_CONFIG_DIR`, or
-`~/.claude` when that is unset. The account's email and organisation come from
-`.claude.json`: `$CLAUDE_CONFIG_DIR/.claude.json`, or `~/.claude.json`. When the
-token is missing, or expires within 60 s (`TOKEN_EXPIRY_MARGIN_MS`), no request
-is made. Otterly never renews the token and never writes either file: renewing
-rotates the refresh token, which would log the CLI out. The CLI renews the
-token itself when it next starts a run.
+- A good `/usage` result is reused for 5 minutes (`LIVE_REUSE_MS`).
+  `?refresh=1` skips the reuse, but `/usage` never runs more than once per
+  60 s (`USAGE_MIN_INTERVAL_MS`).
+- After a failed run (no CLI, a non-zero exit, a timeout, no `usage_report`
+  line), none for 60 s (`LIVE_FAILURE_BACKOFF_MS`), `?refresh=1` included.
+- Concurrent requests share one run.
+- While the account is at its usage limit (below), `/usage` is not run; the
+  `rate_limit_event` figures stand.
+- `claude auth status` runs at most once per 30 minutes (`ACCOUNT_REUSE_MS`),
+  and on `?refresh=1` at most once per 60 s.
+- The last good result is kept through failures; `otterly.live_error` says
+  why the last `/usage` run was skipped or failed, and is `null` after a
+  success.
 
 **At the usage limit.** A `rate_limit_event` with `status: "rejected"` means
 the account is at its usage limit. The limit lasts until that event's
@@ -492,22 +504,28 @@ test -f tests-cli/claude-cli.test.ts && echo present                            
 test -f tests/fixtures/fake-claude.mjs && echo present                           # present
 grep -F -c 'req.method === "GET" && path === "/api/quota"' src/server/index.ts   # 1
 grep -A4 'path === "/api/quota"' src/server/index.ts | grep -c 'checkAuth(req, ctx)' # 1
-grep -F -c 'jsonResponse(res, 200, await quota.snapshot({ refresh: url.searchParams.get("refresh") === "1" }));' src/server/index.ts # 1
+grep -F -c 'jsonResponse(res, 200, await quota.snapshot({ refresh: url.searchParams.get("refresh") === "1", cwd: ctx.workingDir }));' src/server/index.ts # 1
 grep -F -c 'if (t === "rate_limit_event") quota.recordRateLimitEvent(obj.rate_limit_info);' src/engine.ts # 1
-grep -F -c 'export const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";' src/server/quota.ts # 1
-grep -F -c '"anthropic-beta": "oauth-2025-04-20",' src/server/quota.ts           # 1
-grep -F -c '(external, cli)' src/server/quota.ts                                 # 1
+grep -rnE 'credentials\.json|\.claude\.json|api\.anthropic\.com|oauth|User-Agent' src | wc -l # 0
+grep -rn 'limit-reset' src | wc -l                                               # 0
+grep -cE 'readFile|fetch\(' src/server/quota.ts                                  # 0
+grep -F -c 'return [cli, "-p", "/usage", "--output-format", "stream-json", "--verbose", "--safe-mode", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}"];' src/server/quota.ts # 1
+grep -F -c 'return [cli, "auth", "status"];' src/server/quota.ts                 # 1
+grep -F -c 'run: (argv, o) => spawnWithAbort(argv, { cwd: o.cwd, timeoutMs: o.timeoutMs }),' src/server/quota.ts # 1
+grep -F -c 'const LIMIT_WINDOWS = new Map([["session", "five_hour"], ["weekly_all", "seven_day"]]);' src/server/quota.ts # 1
+grep -F -c 'organization: stringField(value, "orgName"),' src/server/quota.ts    # 1
+grep -F -c 'claude /usage not run: the account is at its usage limit until' src/server/quota.ts # 1
 grep -F -c 'Math.round(fraction * 10_000) / 100' src/server/quota.ts             # 1
 grep -F -c 'const EVENT_WINDOWS = ["five_hour", "seven_day"];' src/server/quota.ts # 1
 grep -F -c 'if (!recorded || (this.live && recorded.at <= this.live.at)) continue;' src/server/quota.ts # 1
 grep -F -c 'body[name] = { ...value, utilization: 0, resets_at: null };' src/server/quota.ts # 1
 grep -F -c 'export const LIVE_REUSE_MS = 5 * 60 * 1000;' src/server/quota.ts      # 1
-grep -F -c 'export const LIVE_429_BACKOFF_MS = 5 * 60 * 1000;' src/server/quota.ts # 1
+grep -F -c 'export const USAGE_MIN_INTERVAL_MS = 60 * 1000;' src/server/quota.ts  # 1
 grep -F -c 'export const LIVE_FAILURE_BACKOFF_MS = 60 * 1000;' src/server/quota.ts # 1
-grep -F -c 'export const LIVE_TIMEOUT_MS = 10 * 1000;' src/server/quota.ts        # 1
-grep -F -c 'export const TOKEN_EXPIRY_MARGIN_MS = 60 * 1000;' src/server/quota.ts # 1
+grep -F -c 'export const USAGE_TIMEOUT_MS = 60 * 1000;' src/server/quota.ts       # 1
+grep -F -c 'export const ACCOUNT_REUSE_MS = 30 * 60 * 1000;' src/server/quota.ts  # 1
+grep -F -c 'export const AUTH_TIMEOUT_MS = 30 * 1000;' src/server/quota.ts        # 1
 grep -F -c 'this.deps.env.CLAUDE_CONFIG_DIR || join(this.deps.homeDir(), ".claude")' src/server/quota.ts # 1
-grep -F -c 'join(configDir, ".claude.json") : join(this.deps.homeDir(), ".claude.json")' src/server/quota.ts # 1
 grep -cE 'writeFile|refresh_token|refreshToken' src/server/quota.ts              # 0
 grep -F -c 'host:             { type: "string",  short: "H" },' src/cli.ts       # 1
 grep -F -c 'host: values.host,' src/cli.ts                                       # 1

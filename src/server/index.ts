@@ -243,7 +243,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
         sendAuthError(res, "native");
         return;
       }
-      jsonResponse(res, 200, await quota.snapshot({ refresh: url.searchParams.get("refresh") === "1" }));
+      jsonResponse(res, 200, await quota.snapshot({ refresh: url.searchParams.get("refresh") === "1", cwd: ctx.workingDir }));
       return;
     }
 

@@ -19,8 +19,9 @@ beforeAll(() => {
   bin = join(dir, "claude");
   writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" "${fixture}" "$@"\n`);
   chmodSync(bin, 0o755);
-  // An empty config dir: quota.snapshot() finds no credentials there, so it
-  // reports the recorded events and makes no request.
+  // An empty config dir. The test configuration hides the claude CLI from
+  // findClaudeCLI, so quota.snapshot() runs no command and reports the
+  // recorded events.
   const configDir = join(dir, "config");
   mkdirSync(configDir);
   process.env.CLAUDE_CONFIG_DIR = configDir;
