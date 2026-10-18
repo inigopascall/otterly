@@ -55,7 +55,7 @@ describe("Ollama-native + model discovery routes", () => {
       const { status, body } = await req("/v1/models");
       expect(status).toBe(200);
       expect(body.object).toBe("list");
-      expect(body.data.some((m: any) => m.id === "claude-sonnet-4-6")).toBe(true);
+      expect(body.data.some((m: any) => m.id === "claude-sonnet-5-5")).toBe(true);
     });
 
     it("GET /api/tags returns models for auto-discovery", async () => {

@@ -25,8 +25,11 @@ export interface ModelInfo {
 
 /** The Claude model catalog. `CLAUDE_MODELS` is an alias of `MODELS`. */
 export const MODELS: ModelInfo[] = [
-  { id: "claude-opus-4-8",             label: "Claude Opus 4",      contextWindow: 200000 },
-  { id: "claude-sonnet-4-6",           label: "Claude Sonnet 4",    contextWindow: 200000 },
+  { id: "claude-opus-5-5",             label: "Claude Opus 5.5",    contextWindow: 1000000 },
+  { id: "claude-opus-5",               label: "Claude Opus 5",      contextWindow: 1000000 },
+  { id: "claude-sonnet-5-5",           label: "Claude Sonnet 5.5",  contextWindow: 1000000 },
+  { id: "claude-sonnet-5",             label: "Claude Sonnet 5",    contextWindow: 1000000 },
+  { id: "claude-haiku-5-5",            label: "Claude Haiku 5.5",   contextWindow: 1000000 },
   { id: "claude-haiku-4-5-20251001",   label: "Claude Haiku 4.5",   contextWindow: 200000 },
 ];
 
@@ -34,7 +37,7 @@ export const MODELS: ModelInfo[] = [
 export const CLAUDE_MODELS = MODELS;
 
 /** Default model identifier. */
-export const DEFAULT_MODEL = "claude-sonnet-4-6";
+export const DEFAULT_MODEL = "claude-opus-5-5";
 
 // ---------------------------------------------------------------------------
 // Accessors
