@@ -1,6 +1,6 @@
 ---
-verified: 2026-10-17
-verified_by: workdonkey
+verified: 2026-10-18
+verified_by: workhorse
 ---
 
 # Otterly: Architecture
@@ -164,10 +164,10 @@ pnpm i -g .
 
 ## 7. Running tests
 
-Run Vitest through pnpm dlx, which downloads a temporary executable and runs it without changing the repo:
+Run the Vitest that `package.json` pins, from the repo's own `node_modules`:
 
 ```
-pnpm dlx vitest run
+pnpm exec vitest run
 ```
 
 `vitest.config.ts` sets `OTTERLY_DISABLE_CLAUDE_CLI=1`, which makes
@@ -184,7 +184,7 @@ resume, a denied and an approved write). Run it after every Claude Code
 upgrade (§5):
 
 ```
-pnpm dlx vitest run --config vitest.cli.config.ts
+pnpm exec vitest run --config vitest.cli.config.ts
 ```
 
 ## 8. Request tracing
@@ -545,4 +545,7 @@ grep -F -c '? { error: { message, type: "rate_limit_error", code: 429 } }' src/s
 awk '/sendAuthError\(res, format\)/{a=NR} /quota\.usageLimit\(\)/{u=NR} /rateLimiter\.allow\(/{r=NR} END{print (a && a<u && u<r) ? "after auth, before the rate limiter" : "out of order"}' src/server/index.ts # after auth, before the rate limiter
 grep -c 'usageLimit' src/server/ws-handler.ts                                     # 0
 test -f tests/server/usage-limit-route.test.ts && echo present                   # present
+grep -c 'pnpm dlx vites[t]' AGENTS.md                                            # 0
+grep -c '^pnpm exec vitest run' AGENTS.md                                        # 2
+grep -F -c '"vitest": "^3.0.0"' package.json                                     # 1
 ```

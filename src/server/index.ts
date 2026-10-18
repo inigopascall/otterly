@@ -175,7 +175,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
     const version = cliSemver(check.cli.version);
     cliLine = `${check.cli.version} at ${check.cli.path} · isolation verified (no tools, no MCP servers)`;
     if (version !== TESTED_CLAUDE_CLI_VERSION) {
-      cliWarning = `claude ${version || check.cli.version} has not been tested with this build (tested: ${TESTED_CLAUDE_CLI_VERSION}). Run the CLI suite: pnpm dlx vitest run --config vitest.cli.config.ts`;
+      cliWarning = `claude ${version || check.cli.version} has not been tested with this build (tested: ${TESTED_CLAUDE_CLI_VERSION}). Run the CLI suite: pnpm exec vitest run --config vitest.cli.config.ts`;
     }
   }
   startTraceRetention();

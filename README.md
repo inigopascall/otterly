@@ -56,11 +56,25 @@ This is a fork of [Otterly](https://github.com/ReallyArtificial/otterly) by Hars
 - A stuck `claude` process is stopped properly, and Ctrl+C stops every `claude` process the server started.
 - Every request gets an answer, even when something fails.
 
+**See how much of your Claude subscription is left**
+
+- `GET /api/quota` reports the 5-hour and weekly usage of the subscription the `claude` program is signed in to, in the same shape as Anthropic's own usage figures. The numbers come from `claude` itself (its `/usage` command, and the usage note it prints after every reply). Otterly reads none of Claude Code's files and contacts no Anthropic address.
+- When the subscription hits its usage limit, Otterly answers new requests at once with HTTP 429 and a `Retry-After` time, instead of starting a `claude` run that would only fail.
+
+**Works as a provider in 9router**
+
+- [My fork of 9router](https://github.com/inigopascall/9router) adds an **Otterly** provider. Point it at an Otterly server's `/v1` address and 9router sends Claude requests through it, and shows the subscription's usage from `/api/quota`.
+
+**Up-to-date model list**
+
+- The model list offers Claude Opus 5.5 and 5, Sonnet 5.5 and 5, Haiku 5.5 and Haiku 4.5. The default is `claude-opus-5-5`.
+
 **Other additions**
 
 - `reasoning_effort` is supported (`low`, `medium`, `high`, `xhigh`, `max`); the default is `medium`.
 - Optional request tracing for debugging (`OTTERLY_TRACE=1`): each request's input, output and timings are saved under `~/.otterly/traces`, and traces older than 7 days are deleted.
 - Multi-turn sessions (`/ws`) and permission prompts now work through the installed `claude` program.
+- `--host` (`-H`) chooses the network address the server listens on, e.g. `--host 127.0.0.1` to keep it to this machine.
 
 **One change for people who call Otterly from their own code**
 
@@ -145,7 +159,8 @@ stream-json protocol. After each upgrade, run the CLI suite from a clone of this
 repository:
 
 ```bash
-pnpm dlx vitest run --config vitest.cli.config.ts
+pnpm install
+pnpm exec vitest run --config vitest.cli.config.ts
 ```
 
 It checks every flag Otterly passes (at no cost), then makes a few short,
@@ -199,7 +214,7 @@ console.log(result.text, result.cost);
 import OpenAI from "openai";
 const ai = new OpenAI({ baseURL: "http://localhost:11435/v1", apiKey: "unused" });
 const res = await ai.chat.completions.create({
-  model: "claude-sonnet-4-6",
+  model: "claude-sonnet-5-5",
   messages: [{ role: "user", content: "Fix the failing tests" }],
 });
 ```
@@ -232,7 +247,7 @@ If you use **OpenClaw**, this is the section that pays for otterly.
 
 On **April 4, 2026**, Anthropic severed the direct path between OpenClaw and your Claude Code subscription. Overnight, OpenClaw users had three new (worse) options: buy extra usage bundles, supply a separate Anthropic API key at full pay-per-token rates, or drain a small parallel "Agent SDK credit" pool. Heavy users reported bills jumping up to **50× their previous monthly outlay**. The OpenClaw author publicly called it a betrayal.
 
-otterly is the routing layer. OpenClaw talks to `localhost:11434`. otterly spawns your authenticated `claude` CLI, which is Anthropic's own product and still allowed to use your subscription, and the request arrives at the exact destination OpenClaw was locked out of. No extra bundles, no API key, no credit-pool draining. Same model, same brain, same subscription.
+otterly is the routing layer. OpenClaw talks to `localhost:11435`. otterly spawns your authenticated `claude` CLI, which is Anthropic's own product and still allowed to use your subscription, and the request arrives at the exact destination OpenClaw was locked out of. No extra bundles, no API key, no credit-pool draining. Same model, same brain, same subscription.
 
 ### Three steps. Then OpenClaw is yours again.
 
@@ -250,7 +265,7 @@ otterly serve   # listens on localhost:11435
 // 3. add otterly as a model provider in your OpenClaw config
 {
   agents: {
-    defaults: { model: { primary: "otterly/claude-sonnet-4-20250514" } },
+    defaults: { model: { primary: "otterly/claude-sonnet-5-5" } },
   },
   models: {
     providers: {
@@ -260,11 +275,11 @@ otterly serve   # listens on localhost:11435
         api: "openai-completions",
         timeoutSeconds: 600,
         models: [{
-          id: "claude-sonnet-4-6",
-          name: "Claude Sonnet 4 (via subscription)",
+          id: "claude-sonnet-5-5",
+          name: "Claude Sonnet 5.5 (via subscription)",
           input: ["text"],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 200000,
+          contextWindow: 1000000,
           maxTokens: 8192,
         }],
       },
@@ -274,7 +289,7 @@ otterly serve   # listens on localhost:11435
 ```
 
 ```bash
-openclaw models set otterly/claude-sonnet-4-20250514
+openclaw models set otterly/claude-sonnet-5-5
 ```
 
 That's the whole patch. Every OpenClaw call now lands on your Claude Code subscription via the local `claude` CLI. **The Agent SDK credit pool never moves, no API-key meter ticks, no extra-usage bundles get consumed.** Watch your Anthropic dashboard. The only thing that moves is your normal Claude Code subscription usage.
@@ -319,10 +334,10 @@ loginctl enable-linger youruser     # survives reboot without a login
 **Sanity check before flipping the default model.** Once `openclaw.json` is patched, test the new provider before pointing all of OpenClaw at it:
 
 ```bash
-openclaw capability model run --model otterly/claude-sonnet-4-6 --prompt "ping"
+openclaw capability model run --model otterly/claude-sonnet-5-5 --prompt "ping"
 ```
 
-If that returns text in a few seconds, you are good: `openclaw models set otterly/claude-sonnet-4-6`. If it hangs, `curl http://localhost:11435/api/status` tells you exactly which queue slot is stuck.
+If that returns text in a few seconds, you are good: `openclaw models set otterly/claude-sonnet-5-5`. If it hangs, `curl http://localhost:11435/api/status` tells you exactly which queue slot is stuck.
 
 ---
 
@@ -336,9 +351,9 @@ In Cline's settings (Cmd-Shift-P → *Cline: Open Settings*), pick **OpenAI Comp
 
 | Field | Value |
 |---|---|
-| Base URL | `http://localhost:11434/v1` |
+| Base URL | `http://localhost:11435/v1` |
 | API Key | `unused` (any non-empty string) |
-| Model ID | `claude-sonnet-4-20250514` |
+| Model ID | `claude-sonnet-5-5` |
 
 Cline streams by default — otterly handles SSE with keepalives so cold spawns don't time out the extension.
 
@@ -347,10 +362,10 @@ Cline streams by default — otterly handles SSE with keepalives so cold spawns 
 Settings → **Models** → toggle **Override OpenAI Base URL**:
 
 ```
-http://localhost:11434/v1
+http://localhost:11435/v1
 ```
 
-Set API Key to anything (e.g. `unused`), then add `claude-sonnet-4-20250514` to *Model Names*. Cursor will call otterly for chat, autocomplete, and Composer.
+Set API Key to anything (e.g. `unused`), then add `claude-sonnet-5-5` to *Model Names*. Cursor will call otterly for chat, autocomplete, and Composer.
 
 ### Continue (`~/.continue/config.json`)
 
@@ -358,10 +373,10 @@ Set API Key to anything (e.g. `unused`), then add `claude-sonnet-4-20250514` to 
 {
   "models": [
     {
-      "title": "Claude Sonnet 4 (via otterly)",
+      "title": "Claude Sonnet 5.5 (via otterly)",
       "provider": "openai",
-      "model": "claude-sonnet-4-20250514",
-      "apiBase": "http://localhost:11434/v1",
+      "model": "claude-sonnet-5-5",
+      "apiBase": "http://localhost:11435/v1",
       "apiKey": "unused"
     }
   ]
@@ -373,16 +388,16 @@ Set API Key to anything (e.g. `unused`), then add `claude-sonnet-4-20250514` to 
 ### Aider
 
 ```bash
-export OPENAI_API_BASE=http://localhost:11434/v1
+export OPENAI_API_BASE=http://localhost:11435/v1
 export OPENAI_API_KEY=unused
-aider --model openai/claude-sonnet-4-20250514
+aider --model openai/claude-sonnet-5-5
 ```
 
 The `openai/` prefix tells Aider to use the OpenAI-compatible path. Add to your shell profile to make it permanent.
 
 ### LiteLLM / LangChain / anything else
 
-Same pattern everywhere: point the base URL at `http://localhost:11434/v1`, send any non-empty API key, name the model `claude-sonnet-4-20250514`. If your client talks to OpenAI today, it talks to otterly with one config change.
+Same pattern everywhere: point the base URL at `http://localhost:11435/v1`, send any non-empty API key, name the model `claude-sonnet-5-5`. If your client talks to OpenAI today, it talks to otterly with one config change.
 
 ---
 
@@ -426,14 +441,14 @@ When you want one running daemon that **any tool, any language, any framework** 
 npx otterly serve
 ```
 
-That's it. Now you have an OpenAI-compatible API on `localhost:11434`. Point anything at it:
+That's it. Now you have an OpenAI-compatible API on `localhost:11435`. Point anything at it:
 
 ```typescript
 // TypeScript with the OpenAI SDK
 import OpenAI from "openai";
 const ai = new OpenAI({ baseURL: "http://localhost:11435/v1", apiKey: "unused" });
 const res = await ai.chat.completions.create({
-  model: "claude-sonnet-4-6",
+  model: "claude-sonnet-5-5",
   messages: [{ role: "user", content: "Write a haiku about otters" }],
 });
 ```
@@ -443,7 +458,7 @@ const res = await ai.chat.completions.create({
 from openai import OpenAI
 ai = OpenAI(base_url="http://localhost:11435/v1", api_key="unused")
 res = ai.chat.completions.create(
-  model="claude-sonnet-4-6",
+  model="claude-sonnet-5-5",
   messages=[{"role": "user", "content": "Write a haiku about otters"}],
 )
 ```
@@ -453,7 +468,7 @@ res = ai.chat.completions.create(
 curl -X POST http://localhost:11435/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-5-5",
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
@@ -481,7 +496,7 @@ curl http://localhost:11435/api/tags
 
 # Ollama-native chat (NDJSON stream, like `ollama run`)
 curl http://localhost:11435/api/chat -d '{
-  "model": "claude-sonnet-4-6",
+  "model": "claude-sonnet-5-5",
   "messages": [{ "role": "user", "content": "Write a haiku about otters" }]
 }'
 ```
@@ -501,7 +516,7 @@ structured `tool_calls` JSON for your client to execute.
 
 ```typescript
 const res = await ai.chat.completions.create({
-  model: "claude-sonnet-4-6",
+  model: "claude-sonnet-5-5",
   messages: [{ role: "user", content: "What's the weather in Paris?" }],
   tools: [{
     type: "function",
@@ -595,10 +610,8 @@ Programmatic options on `startApiServer()` mirror the flags, plus `requestTimeou
 
 ## Rebuild & restart
 
-Rebuild and restart
-
 ```bash
-cd /home/inigo/code/otterly
+cd otterly   # your clone of this repository
 pnpm run build
 pnpm i -g .
 ```
@@ -629,7 +642,7 @@ await session.send(message);   // → AgentResult
 session.close();
 
 // Custom engine with defaults
-const engine = new ClaudeEngine({ model: "claude-sonnet-4-6", maxTurns: 10 });
+const engine = new ClaudeEngine({ model: "claude-sonnet-5-5", maxTurns: 10 });
 
 // Built-in tools are off unless you name them; a handler approves each use
 await claude.run(prompt, { tools: ["Read", "Grep"], onPermission: READONLY });  // read-only
@@ -681,16 +694,28 @@ MIT. Use it for anything, ship it anywhere, don't blame me when an otter gets in
 
 ## Verify
 
-These checks cover the `GET /api/quota` and `-H, --host` rows above. Run from
-the Z-Book. Expected values follow `#`.
+These checks cover the fork's claims above: `GET /api/quota`, the usage-limit
+answer, `-H, --host`, the model list, the ports and the CLI suite command. Run
+from the Z-Book. Expected values follow `#`.
 
 ```bash
 cd /home/inigo/code/iwd/otterly
 grep -F -c 'req.method === "GET" && path === "/api/quota"' src/server/index.ts     # 1
 grep -A4 'path === "/api/quota"' src/server/index.ts | grep -c 'checkAuth(req, ctx)' # 1
 grep -F -c 'const EVENT_WINDOWS = ["five_hour", "seven_day"];' src/server/quota.ts # 1
-grep -F -c 'export const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";' src/server/quota.ts # 1
+grep -c 'api.anthropic.com' src/server/quota.ts                                  # 0
 grep -F -c 'host:             { type: "string",  short: "H" },' src/cli.ts        # 1
 grep -F -c 'host: values.host,' src/cli.ts                                        # 1
 grep -F -c 'server.listen({ port, host: opts.host }' src/server/index.ts           # 1
+grep -F -c 'export const DEFAULT_MODEL = "claude-opus-5-5";' src/server/models.ts # 1
+grep -c '{ id: "claude-' src/server/models.ts                                    # 6
+grep -F -c 'const INFERENCE_PATHS = new Set(' src/server/index.ts                 # 1
+grep -F -c '"Retry-After": String(limit.retryAfterS)' src/server/index.ts         # 1
+grep -c 'localhost:1143[4]' README.md                                             # 0
+grep -c 'pnpm dl[x]' README.md                                                    # 0
+grep -F -c 'pnpm exec vitest run --config vitest.cli.config.ts' src/server/index.ts # 1
 ```
+
+Manual checks:
+
+- The link to the 9router fork in "About this fork" opens the fork on GitHub.
