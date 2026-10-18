@@ -1,6 +1,6 @@
 ---
 verified: 2026-10-18
-verified_by: workhorse
+verified_by: workdonkey
 ---
 
 # Otterly: Architecture
@@ -154,12 +154,16 @@ server listens on all interfaces.
   `--thinking-display` is absent from the official CLI reference, so it is the
   flag most likely to change; the suite checks it.
 
-## 6. Building and re-deploying the global install
+## 6. Deploying to the zbook
+
+The zbook runs Otterly from `/home/inigo/.local/share/otterly-zbook/app`, a `git clone` of this
+repository (`/home/inigo/code/iwd/otterly`), as the systemd user units `otterly@airship`
+(127.0.0.1:11445) and `otterly@iwd` (127.0.0.1:11446). Commit here first, then:
 
 ```
-cd /home/inigo/code/otterly
-pnpm run build
-pnpm i -g .
+git -C ~/.local/share/otterly-zbook/app pull --ff-only
+cd ~/.local/share/otterly-zbook/app && pnpm install --frozen-lockfile && pnpm run build
+systemctl --user restart otterly@airship otterly@iwd
 ```
 
 ## 7. Running tests
@@ -548,4 +552,8 @@ test -f tests/server/usage-limit-route.test.ts && echo present                  
 grep -c 'pnpm dlx vites[t]' AGENTS.md                                            # 0
 grep -c '^pnpm exec vitest run' AGENTS.md                                        # 2
 grep -F -c '"vitest": "^3.0.0"' package.json                                     # 1
+git -C ~/.local/share/otterly-zbook/app remote get-url origin                   # /home/inigo/code/iwd/otterly
+grep -c 'otterly-zbook/app/dist/cli.js serve' ~/.config/systemd/user/otterly@.service # 1
+grep -h OTTERLY_PORT ~/.config/otterly/airship.env ~/.config/otterly/iwd.env    # OTTERLY_PORT=11445, OTTERLY_PORT=11446
+grep -c 'pnpm i [-]g' AGENTS.md                                                  # 0
 ```
