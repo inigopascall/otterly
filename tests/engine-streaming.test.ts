@@ -50,6 +50,97 @@ describe("ClaudeEngine native tool_use in stream_event", () => {
   });
 });
 
+describe("ClaudeEngine structured CLI 429", () => {
+  const init = { type: "system", subtype: "init", session_id: "s", model: "m", cwd: "/tmp", tools: [] };
+
+  it("rejects a structured usage-limit result from OpenAI-opted stream and run", async () => {
+    const messages = [
+      init,
+      { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "prior" }] } },
+      { type: "result", subtype: "success", is_error: true, api_error_status: 429, api_error: "usage_limit_reached", result: "unrelated opaque wording" },
+    ];
+    const engine = new ClaudeEngine({}, queryOf(messages));
+
+    const streamError = await drain(engine.stream("p", { structured429ForOpenAI: true })).then(() => null, (e) => e);
+    expect(streamError).toBeInstanceOf(AgentError);
+    expect((streamError as AgentError).code).toBe("RATE_LIMITED");
+
+    const runError = await engine.run("p", { structured429ForOpenAI: true }).then(() => null, (e) => e);
+    expect(runError).toBeInstanceOf(AgentError);
+    expect((runError as AgentError).code).toBe("RATE_LIMITED");
+  });
+
+  it("keeps default engine handling of structured 429 unchanged", async () => {
+    const messages = [
+      init,
+      { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "prior" }] } },
+      { type: "result", subtype: "success", is_error: true, api_error_status: 429, api_error: "usage_limit_reached", result: "unrelated opaque wording" },
+    ];
+
+    const events = await drain(new ClaudeEngine({}, queryOf(messages)).stream("p"));
+    expect(events.some((event) => (event as { type: string }).type === "result")).toBe(false);
+
+    const runOutcome = await new ClaudeEngine({}, queryOf(messages)).run("p").then(() => "resolved", () => "rejected");
+    expect(runOutcome).toBe("resolved");
+  });
+
+  it("keeps a non-error 429 result successful for stream and run", async () => {
+    const result = { type: "result", subtype: "success", is_error: false, api_error_status: 429, api_error: "usage_limit_reached", result: "done" };
+    const messages = [init, result];
+
+    const events = await drain(new ClaudeEngine({}, queryOf(messages)).stream("p"));
+    expect(events.at(-1)).toMatchObject({ type: "result", text: "done" });
+
+    const runOutcome = await new ClaudeEngine({}, queryOf(messages)).run("p").then(() => "resolved", () => "rejected");
+    expect(runOutcome).toBe("resolved");
+  });
+
+  it("keeps a 503 error result on the existing result path", async () => {
+    const result = { type: "result", subtype: "success", is_error: true, api_error_status: 503, api_error: "service_unavailable", result: "temporary outage" };
+    const messages = [init, result];
+
+    const events = await drain(new ClaudeEngine({}, queryOf(messages)).stream("p"));
+    expect(events.at(-1)?.type).toBe("system");
+
+    const runOutcome = await new ClaudeEngine({}, queryOf(messages)).run("p").then(() => "resolved", () => "rejected");
+    expect(runOutcome).toBe("resolved");
+  });
+
+  it("does not treat a rejected rate-limit event alone as a quota failure", async () => {
+    const result = { type: "result", subtype: "success", is_error: false, result: "done" };
+    const messages = [init, { type: "rate_limit_event", rate_limit_info: { status: "rejected" } }, result];
+
+    const events = await drain(new ClaudeEngine({}, queryOf(messages)).stream("p"));
+    expect(events.at(-1)).toMatchObject({ type: "result", text: "done" });
+
+    const runOutcome = await new ClaudeEngine({}, queryOf(messages)).run("p").then(() => "resolved", () => "rejected");
+    expect(runOutcome).toBe("resolved");
+  });
+
+  it("ends quietly when the caller aborts an active stream", async () => {
+    const controller = new AbortController();
+    let entered: (() => void) | undefined;
+    let release: (() => void) | undefined;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const result = { type: "result", subtype: "success", is_error: false, result: "should not arrive" };
+    const query = () => (async function* () {
+      entered?.();
+      yield init;
+      await gate;
+      yield result;
+    })();
+
+    const pending = drain(new ClaudeEngine({}, query).stream("p", { signal: controller.signal }));
+    await enteredPromise;
+    controller.abort();
+    release?.();
+
+    const events = await pending;
+    expect(events.some((event) => (event as { type: string }).type === "result")).toBe(false);
+  });
+});
+
 describe("streamLines", () => {
   it("yields the first line before the child exits", async () => {
     const script = 'console.log("one"); setTimeout(() => console.log("two"), 2000);';

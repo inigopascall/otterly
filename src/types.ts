@@ -38,6 +38,8 @@ export interface EngineOptions {
   /** When true, client tools are external OpenAI tools: Claude rejects native
    *  tool inventory/activity on this path. */
   clientToolCalls?: boolean;
+  /** Only the OpenAI HTTP route opts in: preserve structured CLI 429 across engine cleanup. */
+  structured429ForOpenAI?: boolean;
   /** Correlation id for logging and file tracing. Set from the HTTP request id
    *  so engine-level log lines line up with the request that produced them. */
   traceId?: string;

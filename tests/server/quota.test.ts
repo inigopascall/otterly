@@ -180,6 +180,8 @@ describe("QuotaTracker: rate_limit_event", () => {
 });
 
 describe("QuotaTracker: claude /usage", () => {
+  const REJECTED = { ...EVENT_INFO, status: "rejected" };
+
   it("maps the usage_report of claude /usage to five_hour, seven_day, limits and extra_usage", async () => {
     const { tracker } = harness({ usage: [prints(usageStdout())], auth: [prints(AUTH_STDOUT)] });
     expect(await tracker.snapshot()).toEqual({
@@ -329,23 +331,180 @@ describe("QuotaTracker: claude /usage", () => {
     expect(b.five_hour).toEqual(USAGE_FIVE_HOUR);
   });
 
-  it("runs no /usage while the account is at its usage limit; the rate_limit_event figures stand", async () => {
-    const { tracker, usageCalls, advance } = harness({ usage: [prints(usageStdout())] });
-    tracker.recordRateLimitEvent({ ...EVENT_INFO, status: "rejected" });
-    let body = await tracker.snapshot({ refresh: true });
-    expect(usageCalls()).toHaveLength(0);
-    expect(body.five_hour).toEqual({ utilization: 4, resets_at: FIVE_HOUR_RESET });
-    expect(body.otterly).toMatchObject({
-      source: "rate_limit_event",
-      status: "rejected",
-      limited_until: FIVE_HOUR_RESET,
-      live_error: `claude /usage not run: the account is at its usage limit until ${FIVE_HOUR_RESET}`,
+  it("starts a fresh /usage for a rejected five_hour limit, clears on valid usage, and shares the interval", async () => {
+    const { tracker, usageCalls, advance } = harness({
+      usage: [prints(usageStdout()), prints(usageStdout())],
     });
-    advance(60_000);
-    tracker.recordRateLimitEvent(EVENT_INFO);
-    body = await tracker.snapshot();
+    tracker.recordRateLimitEvent(REJECTED);
+    const [a, b] = await Promise.all([tracker.snapshot({ refresh: true }), tracker.snapshot({ refresh: true })]);
     expect(usageCalls()).toHaveLength(1);
-    expect(body.otterly).toMatchObject({ source: "usage_command", live_error: null, limited_until: null });
+    expect(a.five_hour).toEqual(USAGE_FIVE_HOUR);
+    expect(b.five_hour).toEqual(USAGE_FIVE_HOUR);
+    expect(a.otterly).toMatchObject({ source: "usage_command", limited_until: null, live_error: null });
+    expect(b.otterly).toMatchObject({ source: "usage_command", limited_until: null, live_error: null });
+    expect(tracker.usageLimit()).toBeNull();
+    await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(1);
+    advance(USAGE_MIN_INTERVAL_MS);
+    await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(2);
+  });
+
+  it("clears a rejected seven_day limit from fresh seven_day usage", async () => {
+    const { tracker, usageCalls } = harness({
+      usage: [prints(usageStdout({ rate_limits: { limits: [{ kind: "weekly_all", percent: 64, resets_at: "2026-10-22T02:59:59.918692+00:00" }] } }))],
+    });
+    tracker.recordRateLimitEvent({ ...REJECTED, rateLimitType: "seven_day", resetsAt: Date.parse(SEVEN_DAY_RESET) / 1000 });
+    const body = await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(1);
+    expect(body.seven_day).toEqual(USAGE_SEVEN_DAY);
+    expect(body.otterly).toMatchObject({ source: "none", status: "rejected", limited_until: null });
+    expect(tracker.usageLimit()).toBeNull();
+  });
+
+  it("keeps an unknown rejected limit after fresh valid windows", async () => {
+    const { tracker, usageCalls } = harness({ usage: [prints(usageStdout())] });
+    tracker.recordRateLimitEvent({
+      status: "rejected",
+      resetsAt: Date.parse(SEVEN_DAY_RESET) / 1000,
+      rateLimitType: "unknown",
+    });
+    const body = await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(1);
+    expect(tracker.usageLimit()?.type).toBe("unknown");
+    expect(body.otterly.limited_until).toBe(SEVEN_DAY_RESET);
+  });
+
+  it("clears a rejected five_hour limit when fresh usage reports zero", async () => {
+    const { tracker, usageCalls } = harness({
+      usage: [prints(usageStdout({ rate_limits: { limits: [{ kind: "session", percent: 0, resets_at: FIVE_HOUR_RESET }] } }))],
+    });
+    tracker.recordRateLimitEvent(REJECTED);
+    await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(1);
+    expect(tracker.usageLimit()).toBeNull();
+  });
+
+  it("keeps five_hour blocked when fresh usage has seven_day but no five_hour percent", async () => {
+    const { tracker } = harness({
+      usage: [prints(usageStdout({ rate_limits: { limits: [{ kind: "weekly_all", percent: 64, resets_at: "2026-10-22T02:59:59.918692+00:00" }] } }))],
+    });
+    tracker.recordRateLimitEvent(REJECTED);
+    const body = await tracker.snapshot({ refresh: true });
+    expect(body.seven_day).toEqual(USAGE_SEVEN_DAY);
+    expect(body.otterly.limited_until).toBe(FIVE_HOUR_RESET);
+    expect(tracker.usageLimit()).toEqual({ until: Date.parse(FIVE_HOUR_RESET), type: "five_hour", retryAfterS: 9000 });
+  });
+
+  it.each([
+    ["five_hour", "missing", {}],
+    ["five_hour", "unknown binding type", { kind: "unknown", percent: 64, resets_at: FIVE_HOUR_RESET }],
+    ["five_hour", "NaN", { kind: "session", percent: Number.NaN, resets_at: FIVE_HOUR_RESET }],
+    ["five_hour", "negative", { kind: "session", percent: -1, resets_at: FIVE_HOUR_RESET }],
+    ["five_hour", "100", { kind: "session", percent: 100, resets_at: FIVE_HOUR_RESET }],
+    ["five_hour", "Infinity", { kind: "session", percent: Number.POSITIVE_INFINITY, resets_at: FIVE_HOUR_RESET }],
+    ["seven_day", "missing", {}],
+    ["seven_day", "unknown binding type", { kind: "unknown", percent: 64, resets_at: SEVEN_DAY_RESET }],
+    ["seven_day", "NaN", { kind: "weekly_all", percent: Number.NaN, resets_at: SEVEN_DAY_RESET }],
+    ["seven_day", "negative", { kind: "weekly_all", percent: -1, resets_at: SEVEN_DAY_RESET }],
+    ["seven_day", "100", { kind: "weekly_all", percent: 100, resets_at: SEVEN_DAY_RESET }],
+    ["seven_day", "Infinity", { kind: "weekly_all", percent: Number.POSITIVE_INFINITY, resets_at: SEVEN_DAY_RESET }],
+  ])("retains a rejected %s window when its %s usage percent is invalid", async (type, label, limit) => {
+    const report = { rate_limits: { limits: [limit] } };
+    const stdout = usageStdout(report);
+    if (label === "NaN" || label === "Infinity") expect(JSON.parse(JSON.stringify(limit)).percent).toBeNull();
+    const { tracker, usageCalls } = harness({ usage: [prints(stdout)] });
+    tracker.recordRateLimitEvent({
+      ...REJECTED,
+      rateLimitType: type,
+      resetsAt: type === "five_hour" ? Date.parse(FIVE_HOUR_RESET) / 1000 : Date.parse(SEVEN_DAY_RESET) / 1000,
+    });
+    const body = await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(1);
+    expect(body.otterly.limited_until).toBe(type === "five_hour" ? FIVE_HOUR_RESET : SEVEN_DAY_RESET);
+    expect(tracker.usageLimit()).not.toBeNull();
+  });
+
+  it.each([
+    ["a failed CLI", exits("claude exited 1: boom")],
+    ["no usage report", prints(NOT_LOGGED_IN_RESULT)],
+  ])("retains the old rejected limit after %s and applies the 60 s backoff", async (_label, reply) => {
+    const { tracker, usageCalls, advance } = harness({ usage: [reply, prints(usageStdout())] });
+    tracker.recordRateLimitEvent(REJECTED);
+    const body = await tracker.snapshot({ refresh: true });
+    expect(body.five_hour).toEqual({ utilization: 4, resets_at: FIVE_HOUR_RESET });
+    expect(body.otterly.limited_until).toBe(FIVE_HOUR_RESET);
+    advance(USAGE_MIN_INTERVAL_MS - 1);
+    await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(1);
+    advance(1);
+    await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(2);
+  });
+
+  it("does not use a prior successful snapshot as evidence after a later rejection", async () => {
+    const { tracker, usageCalls, advance } = harness({ usage: [prints(usageStdout()), prints(usageStdout())] });
+    await tracker.snapshot();
+    advance(USAGE_MIN_INTERVAL_MS);
+    tracker.recordRateLimitEvent(REJECTED);
+    const body = await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(2);
+    expect(body.otterly.source).toBe("usage_command");
+    expect(body.otterly.limited_until).toBeNull();
+  });
+
+  it("shares one injected /usage among concurrent blocked snapshots and probes again after 60 s", async () => {
+    let release!: (stdout: string) => void;
+    const gate = new Promise<string>((resolve) => {
+      release = resolve;
+    });
+    const { tracker, usageCalls, advance } = harness({ usage: [() => gate, prints(usageStdout())] });
+    tracker.recordRateLimitEvent(REJECTED);
+    const both = Promise.all([tracker.snapshot({ refresh: true }), tracker.snapshot({ refresh: true })]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(usageCalls()).toHaveLength(1);
+    release(usageStdout());
+    await both;
+    await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(1);
+    advance(USAGE_MIN_INTERVAL_MS);
+    await tracker.snapshot({ refresh: true });
+    expect(usageCalls()).toHaveLength(2);
+  });
+
+  it("does not let an in-flight /usage clear a newer rejected event", async () => {
+    let release!: (stdout: string) => void;
+    const gate = new Promise<string>((resolve) => {
+      release = resolve;
+    });
+    const { tracker, usageCalls, advance } = harness({ usage: [() => gate] });
+    tracker.recordRateLimitEvent(REJECTED);
+    const probe = tracker.snapshot({ refresh: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(usageCalls()).toHaveLength(1);
+    advance(1);
+    tracker.recordRateLimitEvent({ ...REJECTED, resetsAt: Date.parse(SEVEN_DAY_RESET) / 1000, rateLimitType: "seven_day" });
+    release(usageStdout());
+    const body = await probe;
+    expect(body.otterly.limited_until).toBe(SEVEN_DAY_RESET);
+    expect(tracker.usageLimit()).toEqual({ until: Date.parse(SEVEN_DAY_RESET), type: "seven_day", retryAfterS: 486000 });
+  });
+
+  it("does not let an in-flight /usage clear a newer rejected event when it started unblocked", async () => {
+    let release!: (stdout: string) => void;
+    const gate = new Promise<string>((resolve) => {
+      release = resolve;
+    });
+    const { tracker, usageCalls, advance } = harness({ usage: [() => gate] });
+    const probe = tracker.snapshot({ refresh: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(usageCalls()).toHaveLength(1);
+    advance(1);
+    tracker.recordRateLimitEvent(REJECTED);
+    release(usageStdout());
+    const body = await probe;
+    expect(body.otterly.limited_until).toBe(FIVE_HOUR_RESET);
+    expect(tracker.usageLimit()).not.toBeNull();
   });
 
   it("makes no network request", async () => {

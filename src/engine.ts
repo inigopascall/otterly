@@ -226,6 +226,12 @@ export class CliTerminatedError extends Error {
   }
 }
 
+export class CliUsageLimitError extends AgentError {
+  constructor(text: string) {
+    super("RATE_LIMITED", `Claude API error 429: ${text}`);
+  }
+}
+
 /** Every child spawned by spawnWithAbort that has not exited yet. */
 const liveChildren = new Set<ChildProcess>();
 
@@ -1251,6 +1257,11 @@ export class ClaudeEngine {
             terminalReason: typeof raw.terminal_reason === "string" ? raw.terminal_reason : "",
             text: text.slice(0, 500),
           });
+          if (opts.structured429ForOpenAI === true && apiStatus === 429) {
+            const failure = new CliUsageLimitError(text);
+            abortController.abort(failure);
+            throw failure;
+          }
           abortController.abort();
           throw classifyError(new Error(apiStatus ? `Claude API error ${apiStatus}: ${text}` : text));
         }
@@ -1265,6 +1276,9 @@ export class ClaudeEngine {
         }
       }
     } catch (err) {
+      if (err instanceof CliUsageLimitError && abortController.signal.reason === err && !opts.signal?.aborted) {
+        throw err;
+      }
       if (err instanceof AgentError && err.code === "NATIVE_TOOL_CALL") {
         throw err;
       }

@@ -1,11 +1,11 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
 import http from "http";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setQueryFnForTests, type QueryFn } from "../../src/engine.js";
 import { startApiServer, type ApiServerHandle } from "../../src/server/index.js";
-import { quota } from "../../src/server/quota.js";
+import { quota, type QuotaDeps } from "../../src/server/quota.js";
 
 // The usage limit (quota.ts, index.ts): while the latest rate_limit_event is
 // rejected, the routes that start the claude CLI answer HTTP 429 at once. The
@@ -227,6 +227,90 @@ describe("the usage limit", () => {
     ({ body } = await send(base, "GET", "/api/quota"));
     expect(body.otterly.limited_until).toBeNull();
   });
+
+  it("rechecks fresh /usage before rejecting inference, then serves without a probe once unblocked", async () => {
+    const deps = (quota as unknown as { deps: QuotaDeps }).deps;
+    const originalRun = deps.run;
+    const originalFindCli = deps.findCli;
+    let usageCalls = 0;
+    deps.run = vi.fn(async (argv: string[]) => {
+      if (argv[1] === "-p") {
+        usageCalls++;
+        return JSON.stringify({
+          type: "assistant",
+          usage_report: {
+            rate_limits: {
+              limits: [{
+                kind: "session",
+                percent: 4,
+                resets_at: new Date(Date.now() + 7200000).toISOString(),
+              }],
+            },
+          },
+        }) + "\n";
+      }
+      return '{"loggedIn":false}';
+    });
+    deps.findCli = () => "/fake/claude";
+    try {
+      limitFor(7200);
+      const first = await send(base, "POST", "/v1/chat/completions", CHAT);
+      expect(first.status).toBe(200);
+      expect(first.body.choices[0].message.content).toBe("Hello world");
+      const quotaReply = await send(base, "GET", "/api/quota");
+      expect(quotaReply.body.otterly.limited_until).toBeNull();
+      expect(usageCalls).toBe(1);
+      const second = await send(base, "POST", "/v1/chat/completions", CHAT);
+      expect(second.status).toBe(200);
+      expect(usageCalls).toBe(1);
+      expect(queryCalls).toBe(2);
+    } finally {
+      deps.run = originalRun;
+      deps.findCli = originalFindCli;
+      quota.reset();
+    }
+  });
+
+  it("fresh /usage through GET /api/quota lifts a seven_day block", async () => {
+    const deps = (quota as unknown as { deps: QuotaDeps }).deps;
+    const originalRun = deps.run;
+    const originalFindCli = deps.findCli;
+    let usageCalls = 0;
+    deps.run = vi.fn(async (argv: string[]) => {
+      if (argv[1] === "-p") {
+        usageCalls++;
+        return JSON.stringify({
+          type: "assistant",
+          usage_report: {
+            rate_limits: {
+              limits: [{
+                kind: "weekly_all",
+                percent: 64,
+                resets_at: new Date(Date.now() + 7200000).toISOString(),
+              }],
+            },
+          },
+        }) + "\n";
+      }
+      return '{"loggedIn":false}';
+    });
+    deps.findCli = () => "/fake/claude";
+    try {
+      limitFor(7200, "seven_day");
+      const quotaReply = await send(base, "GET", "/api/quota");
+      expect(quotaReply.status).toBe(200);
+      expect(quotaReply.body.otterly.limited_until).toBeNull();
+      expect(usageCalls).toBe(1);
+      const inference = await send(base, "POST", "/v1/chat/completions", CHAT);
+      expect(inference.status).toBe(200);
+      expect(usageCalls).toBe(1);
+      expect(queryCalls).toBe(1);
+    } finally {
+      deps.run = originalRun;
+      deps.findCli = originalFindCli;
+      quota.reset();
+    }
+  });
 });
 
 describe("the usage limit and the rate limiter", () => {
@@ -286,5 +370,235 @@ describe("the usage limit with OTTERLY_API_KEY set", () => {
     expect(status).toBe(429);
     expectRetryAfter(headers, 7199, 7200);
     expect(queryCalls).toBe(0);
+  });
+});
+
+
+describe("the first usage-limit result from an HTTP route", () => {
+  let handle: ApiServerHandle;
+  let base = "";
+
+  beforeAll(async () => {
+    ({ handle, base } = await start());
+  });
+
+  afterAll(() => {
+    handle.close();
+  });
+
+  function syntheticQuery(assistantText?: string): QueryFn {
+    return () => {
+      queryCalls++;
+      return (async function* () {
+        yield {
+          type: "system",
+          subtype: "init",
+          session_id: "synthetic-session",
+          model: "claude-sonnet-4-20250514",
+          cwd: "/test",
+          tools: [],
+        };
+        if (assistantText !== undefined) {
+          yield { type: "assistant", message: { content: [{ type: "text", text: assistantText }] } };
+        }
+        yield {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 429,
+          api_error: "usage_limit_reached",
+          result: "opaque text unrelated to rate limits",
+        };
+      })();
+    };
+  }
+
+  interface DroppedStream {
+    status: number;
+    body: string;
+    requestError?: Error;
+    responseError?: Error;
+    ended: boolean;
+    closed: boolean;
+  }
+
+  function sendStreamDropped(path: string, body: unknown): Promise<DroppedStream> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let status = 0;
+      let requestError: Error | undefined;
+      let responseError: Error | undefined;
+      let ended = false;
+      let closed = false;
+      const chunks: Buffer[] = [];
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve({
+          status,
+          body: Buffer.concat(chunks).toString(),
+          requestError,
+          responseError,
+          ended,
+          closed,
+        });
+      };
+      const req = http.request(
+        new URL(path, base),
+        { method: "POST", headers: { "Content-Type": "application/json" } },
+        (res) => {
+          status = res.statusCode ?? 0;
+          res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+          res.on("error", (error) => {
+            responseError = error;
+            finish();
+          });
+          res.on("end", () => {
+            ended = true;
+          });
+          res.on("close", () => {
+            closed = true;
+            finish();
+          });
+        },
+      );
+      req.on("error", (error) => {
+        requestError = error;
+        finish();
+      });
+      req.write(JSON.stringify(body));
+      req.end();
+    });
+  }
+
+  function expectDroppedRateLimitStream(reply: DroppedStream): void {
+    const dropped = reply.status === 0;
+    const incomplete = reply.status === 200 && !reply.body.includes("[DONE]");
+    expect(dropped || incomplete).toBe(true);
+    expect(reply.body).not.toContain("finish_reason");
+    expect(reply.body).not.toContain("[DONE]");
+  }
+
+  it("returns a structured 429 for a first usage-limit result without tools", async () => {
+    setQueryFnForTests(syntheticQuery());
+    try {
+      const reply = await send(base, "POST", "/v1/chat/completions", { ...CHAT, stream: false });
+      expect(reply.status).toBe(429);
+      expect(reply.body).toMatchObject({ error: { type: "rate_limit_error" } });
+      expect(reply.body.choices).toBeUndefined();
+      expect(queryCalls).toBe(1);
+    } finally {
+      setQueryFnForTests(query);
+      quota.reset();
+    }
+  });
+
+  it("returns a structured 429 for a first usage-limit result with tools", async () => {
+    setQueryFnForTests(syntheticQuery());
+    try {
+      const reply = await send(base, "POST", "/v1/chat/completions", {
+        ...CHAT,
+        stream: false,
+        tools: [{
+          type: "function",
+          function: {
+            name: "get_weather",
+            description: "Get the weather",
+            parameters: {
+              type: "object",
+              properties: { city: { type: "string" } },
+              required: ["city"],
+            },
+          },
+        }],
+      });
+      expect(reply.status).toBe(429);
+      expect(reply.body).toMatchObject({ error: { type: "rate_limit_error" } });
+      expect(reply.body.choices).toBeUndefined();
+      expect(queryCalls).toBe(1);
+    } finally {
+      setQueryFnForTests(query);
+      quota.reset();
+    }
+  });
+
+  it("does not complete a normal stream after the first usage-limit result", async () => {
+    setQueryFnForTests(syntheticQuery());
+    try {
+      const reply = await sendStreamDropped(base + "/v1/chat/completions", { ...CHAT, stream: true });
+      expectDroppedRateLimitStream(reply);
+      expect(queryCalls).toBe(1);
+    } finally {
+      setQueryFnForTests(query);
+      quota.reset();
+    }
+  });
+
+  it("does not complete a streamed tool request after the first usage-limit result", async () => {
+    setQueryFnForTests(syntheticQuery());
+    try {
+      const reply = await sendStreamDropped(base + "/v1/chat/completions", {
+        ...CHAT,
+        stream: true,
+        tools: [{
+          type: "function",
+          function: {
+            name: "get_weather",
+            description: "Get the weather",
+            parameters: {
+              type: "object",
+              properties: { city: { type: "string" } },
+              required: ["city"],
+            },
+          },
+        }],
+      });
+      expectDroppedRateLimitStream(reply);
+      expect(queryCalls).toBe(1);
+    } finally {
+      setQueryFnForTests(query);
+      quota.reset();
+    }
+  });
+
+  it("keeps a successful result at 200 when a rejected rate-limit event is recorded during it", async () => {
+    const successfulQuery: QueryFn = () => {
+      queryCalls++;
+      return (async function* () {
+        yield {
+          type: "system",
+          subtype: "init",
+          session_id: "synthetic-session",
+          model: "claude-sonnet-4-20250514",
+          cwd: "/test",
+          tools: [],
+        };
+        quota.recordRateLimitEvent({
+          status: "rejected",
+          resetsAt: Math.floor(Date.now() / 1000) + 7200,
+          rateLimitType: "five_hour",
+        });
+        yield { type: "assistant", message: { content: [{ type: "text", text: "hello" }] } };
+        yield {
+          type: "result",
+          subtype: "success",
+          result: "hello",
+          total_cost_usd: 0.01,
+          duration_ms: 1000,
+          session_id: "synthetic-session",
+          usage: { input_tokens: 10, output_tokens: 1 },
+        };
+      })();
+    };
+    setQueryFnForTests(successfulQuery);
+    try {
+      const reply = await send(base, "POST", "/v1/chat/completions", { ...CHAT, stream: false });
+      expect(reply.status).toBe(200);
+      expect(reply.body.choices[0].message.content).toBe("hello");
+      expect(queryCalls).toBe(1);
+    } finally {
+      setQueryFnForTests(query);
+      quota.reset();
+    }
   });
 });

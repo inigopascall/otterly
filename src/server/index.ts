@@ -321,7 +321,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
     // the same way. Answered before the rate limiter, the circuit breaker and
     // the queue, without starting the CLI, and not counted as a
     // circuit-breaker failure.
-    const usageLimit = INFERENCE_PATHS.has(path) ? quota.usageLimit() : null;
+    const usageLimit = INFERENCE_PATHS.has(path) ? await quota.refreshLimit(ctx.workingDir) : null;
     if (usageLimit) {
       sendUsageLimitError(res, format, usageLimit);
       logResponse(requestId, req.method!, path, 429, Date.now() - startTime);

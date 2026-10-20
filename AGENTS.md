@@ -1,6 +1,6 @@
 ---
-verified: 2026-10-18
-verified_by: workdonkey
+verified: 2026-10-20
+verified_by: workmonkey
 ---
 
 # Otterly: Architecture
@@ -249,7 +249,11 @@ Log messages worth grepping: `run_text_sources`, `cli_spawn`, `cli_stdout`,
 `fingerprint` for a request and its retries; `request_fingerprint` also carries
 the `attempt` number. `cli_api_error` records an API failure reported by the
 CLI (overload, rate limit, safeguard refusal) with its `apiErrorStatus` and the
-CLI's own explanation, which is also what the client receives.
+CLI text. For an exact `result.is_error === true` and
+`api_error_status === 429`, structured-429 recovery applies to the OpenAI HTTP
+route: non-streamed requests get HTTP 429 and streamed requests are dropped to
+trigger a retry regardless of the result wording; other status handling is
+unchanged, and the CLI text is logged.
 
 `tool_call_unparseable` is the terse console line for a 502; the bytes that
 caused it are in `tool_call_unparseable_detail` and in
@@ -356,7 +360,8 @@ in-stream error for everything else. Each drop is recorded against a
 fingerprint of the request's model, messages and tools (`retry-notice.ts`,
 kept 10 minutes); the retry's reasoning opens with a notice such as
 `⚠️ Otterly: the previous attempt … (attempt 2)`. The console shows
-`stream_dropped_for_retry`.
+`stream_dropped_for_retry`. The structured-429 recovery applies to the OpenAI HTTP route: an exact
+structured 429 CLI result uses the existing drop/retry path.
 
 Non-streamed tool requests are buffered, and fail with HTTP 502 as in §2.
 
@@ -407,7 +412,8 @@ string only. Three sources feed the body:
 replaces `utilization` and `resets_at`. A window whose `resets_at` has passed
 is reported as `utilization: 0`, `resets_at: null`.
 
-**When the commands run.** Only when `GET /api/quota` is requested.
+**When the commands run.** `/usage` also runs for blocked inference; auth status
+remains `/api/quota`-only.
 
 - A good `/usage` result is reused for 5 minutes (`LIVE_REUSE_MS`).
   `?refresh=1` skips the reuse, but `/usage` never runs more than once per
@@ -415,8 +421,9 @@ is reported as `utilization: 0`, `resets_at: null`.
 - After a failed run (no CLI, a non-zero exit, a timeout, no `usage_report`
   line), none for 60 s (`LIVE_FAILURE_BACKOFF_MS`), `?refresh=1` included.
 - Concurrent requests share one run.
-- While the account is at its usage limit (below), `/usage` is not run; the
-  `rate_limit_event` figures stand.
+- When inference is blocked, `/usage` is freshly run once per 60 s, including
+  with `?refresh=1`; concurrent requests share the run and failures are backed
+  off. No probe runs for unblocked inference.
 - `claude auth status` runs at most once per 30 minutes (`ACCOUNT_REUSE_MS`),
   and on `?refresh=1` at most once per 60 s.
 - The last good result is kept through failures; `otterly.live_error` says
@@ -427,18 +434,24 @@ is reported as `utilization: 0`, `resets_at: null`.
 the account is at its usage limit. The limit lasts until that event's
 `resetsAt`, or for 5 minutes after it when it has none (`LIMIT_HOLD_MS`). A
 later event with any other status ends it at once, and a restart starts
-without one (`usageLimit()` in `server/quota.ts`).
+without one (`usageLimit()` in `server/quota.ts`). A fresh successful `/usage`
+result clears the limit only when the rejected event's binding window (five_hour or seven_day) has a finite utilization value with 0 <= n < 100; unknown/missing/invalid remain blocked.
+An in-flight probe that began before a newer rejected event
+cannot clear that newer limit. Probes run before a blocked-inference 429 after
+auth.
 
 While it lasts, every POST to `/v1/chat/completions`, `/api/run`,
-`/api/stream`, `/api/chat` and `/api/generate` that passes auth is answered at
-once, before the inbound rate limiter, the circuit breaker and the queue
-(`INFERENCE_PATHS` in `server/index.ts`). The CLI is not started, and the
-answer is not a circuit-breaker failure. It is HTTP 429 with `Retry-After` set
-to the seconds until the limit lifts, rounded up and at least 1, and the
-message `Claude usage limit reached (<rateLimitType>); resets at <ISO-8601>.`,
-with `unknown` when the event names no window. `/v1/chat/completions` carries
-the message as `{"error":{"message":…,"type":"rate_limit_error","code":429}}`,
-the other four paths as `{"error":…}`. `/ws` is unaffected.
+`/api/stream`, `/api/chat` and `/api/generate` that passes auth first checks via a due
+`/usage` probe; if it still remains limited, it responds with HTTP 429 before
+the inbound rate limiter, the circuit breaker and the queue
+(`INFERENCE_PATHS` in `server/index.ts`). The `/usage` CLI may start, but no
+model/inference CLI run starts while still blocked, and the answer is not a
+circuit-breaker failure. It is HTTP 429 with `Retry-After` set to the seconds
+until the limit lifts, rounded up and at least 1, and the message `Claude usage
+limit reached (<rateLimitType>); resets at <ISO-8601>.`, with `unknown` when the
+event names no window. `/v1/chat/completions` carries the message as
+`{"error":{"message":…,"type":"rate_limit_error","code":429}}`, the other
+four paths as `{"error":…}`. `/ws` is unaffected.
 
 `otterly.limited_until` in `GET /api/quota` is the time the limit lifts, as
 ISO-8601, while it lasts, and `null` otherwise. Covered by
@@ -486,6 +499,7 @@ grep -F -c 'export const RETRY_NOTICE_TTL_MS = 10 * 60 * 1000;' src/server/retry
 grep -F -c 'the previous attempt' src/server/retry-notice.ts                     # 1
 grep -F -c '"stream_dropped_for_retry"' src/server/routes-openai.ts              # 1
 grep -F -c 'err.code === "NATIVE_TOOL_CALL"' src/server/routes-openai.ts         # 1
+grep -F -c 'err instanceof CliUsageLimitError' src/server/routes-openai.ts       # 1
 grep -F -c 'export const DEFAULT_TRACE_RETENTION_DAYS = 7;' src/server/trace.ts   # 1
 grep -F -c 'export const LOG_ROTATE_BYTES = 50 * 1024 * 1024;' src/server/trace.ts # 1
 grep -F -c 'OTTERLY_TRACE_RETENTION_DAYS' src/server/trace.ts                     # 2
@@ -495,6 +509,11 @@ grep -F -c '"sse-out.tsv"' src/server/sse-stream.ts                             
 grep -F -c '"dropped_for_retry"' src/server/settle.ts                            # 2
 grep -F -c '"request_fingerprint"' src/server/routes-openai.ts                   # 1
 grep -F -c '"cli_api_error"' src/engine.ts                                       # 1
+grep -F -c 'raw.is_error === true' src/engine.ts                                  # 1
+grep -F -c 'opts.structured429ForOpenAI === true && apiStatus === 429' src/engine.ts # 1
+grep -F -c 'structured429ForOpenAI?: boolean;' src/types.ts                       # 1
+grep -F -c 'structured429ForOpenAI: true,' src/server/routes-openai.ts           # 1
+grep -F -c 'abortController.signal.reason === err' src/engine.ts                  # 1
 grep -c 'anthropic-ai/claude-code' package.json                                  # 0
 grep -rlE 'resolveSDK|CLAUDE_BUILTIN_TOOLS|customSystemPrompt' src tests | wc -l # 0
 grep -F -c 'parts.push("--tools", tools.join(","));' src/engine.ts               # 1
@@ -508,6 +527,7 @@ test -f tests-cli/claude-cli.test.ts && echo present                            
 test -f tests/fixtures/fake-claude.mjs && echo present                           # present
 grep -F -c 'req.method === "GET" && path === "/api/quota"' src/server/index.ts   # 1
 grep -A4 'path === "/api/quota"' src/server/index.ts | grep -c 'checkAuth(req, ctx)' # 1
+grep -F -c 'await quota.refreshLimit(ctx.workingDir)' src/server/index.ts        # 1
 grep -F -c 'jsonResponse(res, 200, await quota.snapshot({ refresh: url.searchParams.get("refresh") === "1", cwd: ctx.workingDir }));' src/server/index.ts # 1
 grep -F -c 'if (t === "rate_limit_event") quota.recordRateLimitEvent(obj.rate_limit_info);' src/engine.ts # 1
 grep -rnE 'credentials\.json|\.claude\.json|api\.anthropic\.com|oauth|User-Agent' src | wc -l # 0
@@ -518,7 +538,9 @@ grep -F -c 'return [cli, "auth", "status"];' src/server/quota.ts                
 grep -F -c 'run: (argv, o) => spawnWithAbort(argv, { cwd: o.cwd, timeoutMs: o.timeoutMs }),' src/server/quota.ts # 1
 grep -F -c 'const LIMIT_WINDOWS = new Map([["session", "five_hour"], ["weekly_all", "seven_day"]]);' src/server/quota.ts # 1
 grep -F -c 'organization: stringField(value, "orgName"),' src/server/quota.ts    # 1
-grep -F -c 'claude /usage not run: the account is at its usage limit until' src/server/quota.ts # 1
+grep -F -c 'async refreshLimit(cwd?: string): Promise<UsageLimit | null>' src/server/quota.ts # 1
+grep -F -c 'this.limit.generation === generation' src/server/quota.ts             # 1
+grep -F -c 'Number.isFinite(window.utilization)' src/server/quota.ts             # 1
 grep -F -c 'Math.round(fraction * 10_000) / 100' src/server/quota.ts             # 1
 grep -F -c 'const EVENT_WINDOWS = ["five_hour", "seven_day"];' src/server/quota.ts # 1
 grep -F -c 'if (!recorded || (this.live && recorded.at <= this.live.at)) continue;' src/server/quota.ts # 1
@@ -534,9 +556,11 @@ grep -cE 'writeFile|refresh_token|refreshToken' src/server/quota.ts             
 grep -F -c 'host:             { type: "string",  short: "H" },' src/cli.ts       # 1
 grep -F -c 'host: values.host,' src/cli.ts                                       # 1
 grep -F -c 'server.listen({ port, host: opts.host }' src/server/index.ts          # 1
-test -f tests/server/quota.test.ts && test -f tests/server/quota-route.test.ts && test -f tests/quota-event-tap.test.ts && echo present # present
+test -f tests/server/quota.test.ts && echo 1                                      # 1
+test -f tests/server/quota-route.test.ts && echo 1                               # 1
+test -f tests/quota-event-tap.test.ts && echo 1                                   # 1
 grep -F -c 'export const LIMIT_HOLD_MS = 5 * 60 * 1000;' src/server/quota.ts      # 1
-grep -F -c 'private limit: { until: number; type: string } | null = null;' src/server/quota.ts # 1
+grep -F -c 'private limit: { until: number; type: string; generation: number } | null = null;' src/server/quota.ts # 1
 grep -F -c 'if (this.eventStatus === "rejected") {' src/server/quota.ts          # 1
 grep -F -c 'resetsAt * 1000 : at + LIMIT_HOLD_MS,' src/server/quota.ts           # 1
 grep -F -c 'type: stringField(info, "rateLimitType") ?? "unknown",' src/server/quota.ts # 1
@@ -546,14 +570,17 @@ grep -F -c 'const INFERENCE_PATHS = new Set(["/v1/chat/completions", "/api/run",
 grep -F -c 'Claude usage limit reached (${limit.type}); resets at ${new Date(limit.until).toISOString()}.' src/server/index.ts # 1
 grep -F -c '"Retry-After": String(limit.retryAfterS)' src/server/index.ts         # 1
 grep -F -c '? { error: { message, type: "rate_limit_error", code: 429 } }' src/server/index.ts # 1
-awk '/sendAuthError\(res, format\)/{a=NR} /quota\.usageLimit\(\)/{u=NR} /rateLimiter\.allow\(/{r=NR} END{print (a && a<u && u<r) ? "after auth, before the rate limiter" : "out of order"}' src/server/index.ts # after auth, before the rate limiter
+awk '/sendAuthError\(res, format\)/{a=NR} /await quota\.refreshLimit\(ctx\.workingDir\)/{u=NR} /rateLimiter\.allow\(/{r=NR} END{print (a && a<u && u<r) ? "after auth, before the rate limiter" : "out of order"}' src/server/index.ts # after auth, before the rate limiter
 grep -c 'usageLimit' src/server/ws-handler.ts                                     # 0
 test -f tests/server/usage-limit-route.test.ts && echo present                   # present
+test -f tests/server/openai-streaming.test.ts && echo 1                            # 1
+test -f tests/server/routes.test.ts && echo 1                                     # 1
+test -f tests/engine-streaming.test.ts && echo 1                                   # 1
 grep -c 'pnpm dlx vites[t]' AGENTS.md                                            # 0
 grep -c '^pnpm exec vitest run' AGENTS.md                                        # 2
 grep -F -c '"vitest": "^3.0.0"' package.json                                     # 1
 git -C ~/.local/share/otterly-zbook/app remote get-url origin                   # /home/inigo/code/iwd/otterly
 grep -c 'otterly-zbook/app/dist/cli.js serve' ~/.config/systemd/user/otterly@.service # 1
-grep -h OTTERLY_PORT ~/.config/otterly/airship.env ~/.config/otterly/iwd.env    # OTTERLY_PORT=11445, OTTERLY_PORT=11446
+grep -h OTTERLY_PORT ~/.config/otterly/airship.env ~/.config/otterly/iwd.env | tr '\n' ',' | sed 's/,$//'   # OTTERLY_PORT=11445,OTTERLY_PORT=11446
 grep -c 'pnpm i [-]g' AGENTS.md                                                  # 0
 ```

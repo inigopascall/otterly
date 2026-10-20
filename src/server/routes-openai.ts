@@ -5,7 +5,7 @@
 import type { ServerResponse } from "http";
 import crypto from "crypto";
 import { AgentError } from "../errors.js";
-import { EFFORT_LEVELS, CliTerminatedError, getIdleTimeoutMs } from "../engine.js";
+import { EFFORT_LEVELS, CliTerminatedError, CliUsageLimitError, getIdleTimeoutMs } from "../engine.js";
 import type { EngineOptions } from "../types.js";
 import type { ParsedRequest, ServerContext } from "./routes-native.js";
 import { apiSessions } from "./session-store.js";
@@ -125,6 +125,9 @@ function classifyStreamFailure(err: unknown, signal: AbortSignal): StreamFailure
       return { kind: "retry", reason: `produced no output for ${Math.round(getIdleTimeoutMs() / 1000)} s and was stopped` };
     }
     return { kind: "timeout", timeout: err };
+  }
+  if (err instanceof CliUsageLimitError) {
+    return { kind: "retry", reason: "Claude API returned HTTP 429 for this request" };
   }
   if (err instanceof AgentError && err.code === "NATIVE_TOOL_CALL") {
     return { kind: "retry", reason: "called one of Claude's own tools instead of requesting an external one" };
@@ -266,6 +269,7 @@ export async function handleChatCompletions(
     maxTurns: 1,        // a pure chat completion is one turn; even a leaked tool can't loop
     traceId: req.requestId || "",
     timeoutMs: req.timeoutMs,
+    structured429ForOpenAI: true,
   };
 
   if (traceEnabled()) {

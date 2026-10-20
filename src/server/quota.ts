@@ -1,13 +1,14 @@
 // Usage of the Claude subscription that the claude CLI is logged in to, for
-// GET /api/quota, in the shape of Anthropic's own usage endpoint; and the
-// account's usage limit, which index.ts answers with HTTP 429 (usageLimit).
+// GET /api/quota and the blocked-inference gate, in the shape of Anthropic's
+// own usage endpoint; and the account's usage limit, which index.ts answers
+// with HTTP 429 (usageLimit).
 //
 // Every figure comes from the claude CLI itself. Otterly reads none of the
 // CLI's files and contacts no address on its behalf. Three sources:
 //   - rate_limit_event lines, which the CLI prints after each API response.
 //     createCLIQueryFn in engine.ts passes every one to recordRateLimitEvent.
-//   - `claude -p /usage`, run when GET /api/quota is requested. It prints a
-//     usage_report and makes no model call.
+//   - `claude -p /usage`, run when GET /api/quota or the blocked-inference gate
+//     needs it. It prints a usage_report and makes no model call.
 //   - `claude auth status`, which says who the CLI is logged in as.
 
 import { homedir } from "os";
@@ -116,7 +117,9 @@ export class QuotaTracker {
   private eventStatus: string | null = null;
   /** Set while the latest rate_limit_event is rejected: when the limit lifts
    *  (epoch ms) and the window that binds. */
-  private limit: { until: number; type: string } | null = null;
+  private limit: { until: number; type: string; generation: number } | null = null;
+  /** Provenance generation of the latest valid rate_limit_event. */
+  private eventGeneration = 0;
   /** The last good /usage result, mapped, and when it arrived. */
   private live: { body: Record<string, unknown>; at: number } | null = null;
   /** Why the last /usage run was skipped or failed; null after a success. */
@@ -156,12 +159,14 @@ export class QuotaTracker {
   recordRateLimitEvent(info: unknown): void {
     if (!isObject(info)) return;
     const at = this.deps.now();
+    this.eventGeneration++;
     this.eventStatus = stringField(info, "status");
     if (this.eventStatus === "rejected") {
       const resetsAt = info.resetsAt;
       this.limit = {
         until: typeof resetsAt === "number" && Number.isFinite(resetsAt) ? resetsAt * 1000 : at + LIMIT_HOLD_MS,
         type: stringField(info, "rateLimitType") ?? "unknown",
+        generation: this.eventGeneration,
       };
     } else {
       this.limit = null;
@@ -191,7 +196,8 @@ export class QuotaTracker {
     const now = this.deps.now();
     if (!this.limit || now >= this.limit.until) return null;
     return {
-      ...this.limit,
+      until: this.limit.until,
+      type: this.limit.type,
       retryAfterS: Math.max(1, Math.ceil((this.limit.until - now) / 1000)),
     };
   }
@@ -215,10 +221,21 @@ export class QuotaTracker {
     return this.compose(this.configDir());
   }
 
+  /** Refresh an active usage limit from /usage without reading auth status. */
+  async refreshLimit(cwd?: string): Promise<UsageLimit | null> {
+    if (this.usageLimit()) {
+      await this.maybeReadUsage(false, cwd).catch((err) => {
+        this.liveError = `claude /usage failed: ${clip(errorMessage(err))}`;
+      });
+    }
+    return this.usageLimit();
+  }
+
   /** Forget every figure, hold and account. For tests. */
   reset(): void {
     this.eventWindows.clear();
     this.eventStatus = null;
+    this.eventGeneration = 0;
     this.limit = null;
     this.live = null;
     this.liveError = null;
@@ -231,17 +248,12 @@ export class QuotaTracker {
   }
 
   /**
-   * Run /usage, unless the account is at its usage limit, a run is in flight
-   * (it is shared), the hold after a failure is running, the last run started
-   * under USAGE_MIN_INTERVAL_MS ago, or the last good result is under
-   * LIVE_REUSE_MS old (`refresh` skips only this last check).
+   * Run /usage unless a run is in flight (it is shared), the hold after a
+   * failure is running, the last run started under USAGE_MIN_INTERVAL_MS ago,
+   * or the last good result is under LIVE_REUSE_MS old (`refresh` skips only
+   * this last check when the account is not limited).
    */
   private async maybeReadUsage(refresh: boolean, cwd?: string): Promise<void> {
-    const limited = this.usageLimit();
-    if (limited) {
-      this.liveError = `claude /usage not run: the account is at its usage limit until ${isoFromEpoch(limited.until, 1)}`;
-      return;
-    }
     if (this.pending) {
       await this.pending;
       return;
@@ -249,16 +261,17 @@ export class QuotaTracker {
     const now = this.deps.now();
     if (now < this.noRunBefore) return;
     if (this.lastRunAt !== null && now - this.lastRunAt < USAGE_MIN_INTERVAL_MS) return;
-    if (!refresh && this.live && now - this.live.at < LIVE_REUSE_MS) return;
+    if (!refresh && !this.usageLimit() && this.live && now - this.live.at < LIVE_REUSE_MS) return;
     this.lastRunAt = now;
-    this.pending = this.readUsage(cwd).finally(() => {
+    const generation = this.eventGeneration;
+    this.pending = this.readUsage(cwd, generation).finally(() => {
       this.pending = null;
     });
     await this.pending;
   }
 
   /** One run of `claude -p /usage`, or the reason none was made. */
-  private async readUsage(cwd?: string): Promise<void> {
+  private async readUsage(cwd: string | undefined, generation: number): Promise<void> {
     const cli = this.deps.findCli();
     if (!cli) {
       this.fail("claude CLI not found on PATH");
@@ -279,6 +292,12 @@ export class QuotaTracker {
     this.live = { body: parsed.body, at: this.deps.now() };
     this.liveError = null;
     this.noRunBefore = 0;
+    if (this.limit && this.deps.now() < this.limit.until && this.limit.generation === generation && (this.limit.type === "five_hour" || this.limit.type === "seven_day")) {
+      const window = parsed.body[this.limit.type];
+      if (isObject(window) && typeof window.utilization === "number" && Number.isFinite(window.utilization) && window.utilization >= 0 && window.utilization < 100) {
+        this.limit = null;
+      }
+    }
   }
 
   private fail(reason: string): void {
