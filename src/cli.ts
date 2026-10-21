@@ -62,6 +62,7 @@ if (values.help || command === "help") {
     OTTERLY_REQUEST_TIMEOUT  Seconds; used when --request-timeout is not given
     OTTERLY_STREAM_TIMEOUT   Seconds; used when --stream-timeout is not given
     OTTERLY_IDLE_TIMEOUT     Seconds; used when --idle-timeout is not given
+    OTTERLY_NATIVE_TOOLS     1: streamed requests give Claude the client's tools natively
 
   Endpoints:
     POST /v1/chat/completions   OpenAI-compatible (use any OpenAI client)
@@ -99,6 +100,7 @@ if (command === "serve") {
     requestTimeoutMs: timeoutMs(values["request-timeout"], "OTTERLY_REQUEST_TIMEOUT"),
     streamTimeoutMs: timeoutMs(values["stream-timeout"], "OTTERLY_STREAM_TIMEOUT"),
     idleTimeoutMs: timeoutMs(values["idle-timeout"], "OTTERLY_IDLE_TIMEOUT"),
+    nativeTools: process.env.OTTERLY_NATIVE_TOOLS === "1",
   }).then((handle) => {
     // Graceful shutdown on SIGTERM/SIGINT
     let shutdownInitiated = false;

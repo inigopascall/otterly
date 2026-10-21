@@ -38,6 +38,9 @@ export const PKG_VERSION = loadPkgVersion();
 export interface ServerContext {
   workingDir: string;
   apiKey: string | null;
+  /** Streamed requests with client tools give the model those tools natively
+   *  (native-tools.ts). Off unless OTTERLY_NATIVE_TOOLS=1. */
+  nativeTools?: boolean;
 }
 
 // Augment req with parsed body and request metadata

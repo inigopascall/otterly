@@ -6,6 +6,7 @@ export type ErrorCode =
   | "ABORTED"
   | "SDK_NOT_FOUND"
   | "NATIVE_TOOL_CALL"
+  | "TOOL_ISOLATION"
   | "TIMEOUT"
   | "UNKNOWN";
 

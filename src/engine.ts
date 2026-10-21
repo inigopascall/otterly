@@ -86,7 +86,9 @@ export function cliSemver(version: string): string {
  *
  * The run is isolated unless the caller opts out: no built-in tools, no MCP
  * servers, and no settings, CLAUDE.md, hooks, plugins, skills or auto memory.
- * `tools` and `mcpServers` opt in.
+ * `tools` and `mcpServers` opt in. With `clientToolsNative`, the run's only
+ * tools are those of one placeholder MCP server, and the CLI refuses every
+ * call to them (nativeClientToolFlags).
  */
 export function buildCLICommand(cliBin: string, opts: Record<string, unknown>): string[] {
   const parts = [cliBin, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"];
@@ -112,6 +114,12 @@ export function buildCLICommand(cliBin: string, opts: Record<string, unknown>): 
   // otherwise fall back to a minimal neutral one so the model behaves like a
   // plain text-in/text-out chat API rather than an agentic coding assistant.
   parts.push("--system-prompt", opts.systemPrompt ? String(opts.systemPrompt) : "You are a helpful assistant.");
+
+  // A native client-tool run has its own fixed flag set.
+  if (opts.clientToolsNative !== undefined) {
+    parts.push(...nativeClientToolFlags(opts));
+    return parts;
+  }
 
   // Do not load user/project/local settings or CLAUDE.md project memory, so the
   // model has no repo-specific context the caller did not explicitly send.
@@ -158,6 +166,50 @@ export function buildCLICommand(cliBin: string, opts: Record<string, unknown>): 
   }
 
   return parts;
+}
+
+/**
+ * The flags of a native client-tool run (EngineOptions.clientToolsNative),
+ * after the ones every run has. The run's only tools are those of the one MCP
+ * server named by serverName, a placeholder that executes nothing
+ * (server/native-tools.ts); don't-ask mode with no permission prompts makes
+ * the CLI refuse every call to them itself. No settings, CLAUDE.md, auto
+ * memory or slash commands are loaded, and nothing is saved. --safe-mode
+ * cannot be used here: it stops the placeholder server from loading.
+ *
+ * Throws for any option that would widen what the run may do.
+ */
+function nativeClientToolFlags(opts: Record<string, unknown>): string[] {
+  const native = opts.clientToolsNative && typeof opts.clientToolsNative === "object"
+    ? opts.clientToolsNative as Record<string, unknown>
+    : null;
+  const serverName = native && typeof native.serverName === "string" ? native.serverName : "";
+  if (!serverName) throw new Error("clientToolsNative needs a serverName");
+  const mcp = opts.mcpServers && typeof opts.mcpServers === "object" ? opts.mcpServers as Record<string, unknown> : {};
+  const servers = Object.keys(mcp);
+  if (servers.length !== 1 || servers[0] !== serverName) {
+    throw new Error(`clientToolsNative needs exactly one MCP server, named ${serverName}; got ${JSON.stringify(servers)}`);
+  }
+  if (opts.tools !== undefined && !(Array.isArray(opts.tools) && opts.tools.length === 0)) {
+    throw new Error("clientToolsNative cannot be combined with built-in tools");
+  }
+  if (opts.permissionMode !== "dontAsk") throw new Error("clientToolsNative needs permissionMode dontAsk");
+  if (opts.maxTurns !== 1) throw new Error("clientToolsNative needs maxTurns 1");
+  for (const key of ["canUseTool", "allowedTools", "disallowedTools", "resume"]) {
+    if (opts[key] !== undefined) throw new Error(`clientToolsNative cannot be combined with ${key}`);
+  }
+  return [
+    "--setting-sources", "",
+    "--tools", "",
+    "--strict-mcp-config", "--mcp-config", JSON.stringify({ mcpServers: { [serverName]: mcp[serverName] } }),
+    "--permission-mode", "dontAsk",
+    "--permission-prompts", "none",
+    "--restricted",
+    "--disable-slash-commands",
+    "--no-session-persistence",
+    "--include-hook-events",
+    "--max-turns", "1",
+  ];
 }
 
 /** Render an argv array as one shell-quoted line, for logs and traces. */
@@ -1018,6 +1070,199 @@ export async function verifyClaudeCLI(): Promise<CLIVerification> {
   return { ok: true, cli };
 }
 
+/** The tool inventory a native client-tool run must report. */
+export interface NativeToolInventory {
+  serverName: string;
+  /** The offered names, without the mcp__ prefix. */
+  toolNames: string[];
+}
+
+/**
+ * Check the system/init line of a native client-tool run. Returns null when it
+ * passes, otherwise the problem: its tools must be exactly
+ * mcp__<serverName>__<name> for each offered name; its MCP servers exactly the
+ * one placeholder, connected; no skills, slash commands or memory paths; and
+ * don't-ask permissions.
+ */
+export function checkNativeInit(init: Record<string, unknown>, expected: NativeToolInventory): string | null {
+  const want = new Set(expected.toolNames.map((name) => `mcp__${expected.serverName}__${name}`));
+  const tools = init.tools;
+  if (!Array.isArray(tools) || !tools.every((t) => typeof t === "string")) {
+    return `tools is not a list of names: ${JSON.stringify(tools)}`;
+  }
+  const have = new Set(tools as string[]);
+  if (have.size !== want.size || [...want].some((t) => !have.has(t))) {
+    return `the CLI offers ${JSON.stringify(tools)}, not ${JSON.stringify([...want])}`;
+  }
+  const servers = init.mcp_servers;
+  if (!Array.isArray(servers) || servers.length !== 1) {
+    return `the CLI reports MCP servers ${JSON.stringify(servers)}, not the one placeholder`;
+  }
+  const server = servers[0] && typeof servers[0] === "object" ? servers[0] as Record<string, unknown> : {};
+  if (server.name !== expected.serverName || server.status !== "connected") {
+    return `the placeholder MCP server is ${JSON.stringify(servers[0])}, not ${expected.serverName} and connected`;
+  }
+  for (const key of ["skills", "slash_commands"]) {
+    const value = init[key];
+    if (value !== undefined && !(Array.isArray(value) && value.length === 0)) {
+      return `${key} is ${JSON.stringify(value)}, not empty`;
+    }
+  }
+  if (init.memory_paths !== undefined && init.memory_paths !== null) {
+    return `memory_paths is ${JSON.stringify(init.memory_paths)}, not null`;
+  }
+  if (init.permissionMode !== "dontAsk") {
+    return `permissionMode is ${JSON.stringify(init.permissionMode)}, not dontAsk`;
+  }
+  return null;
+}
+
+/**
+ * The exit that ends a native tool turn: after its result line the CLI exits
+ * 1, which spawnWithAbort reports as a plain Error.
+ */
+function isNativeToolTurnExit(err: unknown): boolean {
+  if (!(err instanceof Error) || err instanceof AgentError || err instanceof CliTerminatedError) return false;
+  return err.message === "claude exited 1" || err.message.startsWith("claude exited 1: ");
+}
+
+/**
+ * Reads the CLI's lines in a native client-tool run (ClaudeEngine.stream),
+ * before normalizeEvents does. It checks the run's isolation, and assembles
+ * each tool call from its streamed input_json_delta fragments. The tool_use
+ * input in an assistant line can differ from what the model sent, so it is
+ * never used. A line that breaks the run's isolation throws TOOL_ISOLATION.
+ */
+class NativeTurnReader {
+  private initChecked = false;
+  private messageStarts = 0;
+  private readonly open = new Map<number, { id: string; name: string; json: string }>();
+  private calls = 0;
+  private stopReason: string | null = null;
+  private stoppedForTools = false;
+  /** Set once a turn that stopped for tool use has had its result line. */
+  toolTurnComplete = false;
+
+  constructor(private readonly expected: NativeToolInventory, private readonly traceId: string) {}
+
+  /** The events a line yields first, and whether it then skips the usual path. */
+  read(raw: Record<string, unknown>): { events: AgentEvent[]; consumed: boolean } {
+    switch (raw.type) {
+      case "system":
+        if (raw.subtype === "init") {
+          const problem = checkNativeInit(raw, this.expected);
+          if (problem) {
+            logDiag("error", {
+              requestId: this.traceId,
+              message: "native_tool_inventory_mismatch",
+              problem,
+              tools: raw.tools,
+              mcpServers: raw.mcp_servers,
+            });
+            throw new AgentError("TOOL_ISOLATION", `The Claude CLI's tools are not the client's tools alone: ${problem}`);
+          }
+          this.initChecked = true;
+        }
+        return { events: [], consumed: false };
+      case "stream_event":
+        return this.readStreamEvent(raw);
+      case "user":
+        this.checkToolResults(raw);
+        return { events: [], consumed: false };
+      case "result":
+        // A tool turn ends at its one-turn limit. That is its normal end, not
+        // an error.
+        if (raw.subtype === "error_max_turns" && this.stoppedForTools) {
+          this.toolTurnComplete = true;
+          const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+          return {
+            events: [{
+              type: "result",
+              text: "",
+              cost: n(raw.total_cost_usd),
+              duration: n(raw.duration_ms),
+              sessionId: typeof raw.session_id === "string" ? raw.session_id : "",
+              usage: (raw.usage && typeof raw.usage === "object"
+                ? raw.usage
+                : { input_tokens: 0, output_tokens: 0 }) as { input_tokens: number; output_tokens: number },
+            }],
+            consumed: true,
+          };
+        }
+        return { events: [], consumed: false };
+      default:
+        return { events: [], consumed: false };
+    }
+  }
+
+  private readStreamEvent(raw: Record<string, unknown>): { events: AgentEvent[]; consumed: boolean } {
+    const pass = { events: [] as AgentEvent[], consumed: false };
+    const ev = raw.event && typeof raw.event === "object" ? raw.event as Record<string, unknown> : null;
+    if (!ev) return pass;
+    const index = typeof ev.index === "number" ? ev.index : -1;
+    switch (ev.type) {
+      case "message_start":
+        if (!this.initChecked) throw this.violation("a message started before the tool inventory was checked");
+        if (++this.messageStarts > 1) throw this.violation("a second API message started in a one-turn run");
+        return { events: [], consumed: true };
+      case "content_block_start": {
+        const block = ev.content_block && typeof ev.content_block === "object" ? ev.content_block as Record<string, unknown> : {};
+        const blockType = typeof block.type === "string" ? block.type : "";
+        if (blockType === "tool_use") {
+          this.open.set(index, { id: String(block.id ?? ""), name: String(block.name ?? ""), json: "" });
+          return { events: [], consumed: true };
+        }
+        if (blockType.endsWith("tool_use")) throw this.violation(`the model started a ${blockType} block`, { name: block.name });
+        return pass;
+      }
+      case "content_block_delta": {
+        const delta = ev.delta && typeof ev.delta === "object" ? ev.delta as Record<string, unknown> : {};
+        if (delta.type !== "input_json_delta") return pass;
+        const call = this.open.get(index);
+        if (call && typeof delta.partial_json === "string") call.json += delta.partial_json;
+        return { events: [], consumed: true };
+      }
+      case "content_block_stop": {
+        const call = this.open.get(index);
+        if (!call) return pass;
+        this.open.delete(index);
+        return {
+          events: [{ type: "client_tool_call", index: this.calls++, id: call.id, name: call.name, argumentsJson: call.json }],
+          consumed: true,
+        };
+      }
+      case "message_delta": {
+        const delta = ev.delta && typeof ev.delta === "object" ? ev.delta as Record<string, unknown> : {};
+        if ("stop_reason" in delta) this.stopReason = typeof delta.stop_reason === "string" ? delta.stop_reason : null;
+        return { events: [], consumed: true };
+      }
+      case "message_stop":
+        this.stoppedForTools = this.stopReason === "tool_use";
+        return { events: [{ type: "turn_stop", stopReason: this.stopReason }], consumed: true };
+      default:
+        return pass;
+    }
+  }
+
+  /** Every tool result in a user line must be one of the CLI's refusals. */
+  private checkToolResults(raw: Record<string, unknown>): void {
+    const message = raw.message && typeof raw.message === "object" ? raw.message as Record<string, unknown> : {};
+    const content = Array.isArray(message.content) ? message.content : [];
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const b = block as Record<string, unknown>;
+      if (b.type === "tool_result" && b.is_error !== true) {
+        throw this.violation("a tool call was not refused", { toolUseId: b.tool_use_id });
+      }
+    }
+  }
+
+  private violation(problem: string, detail: Record<string, unknown> = {}): AgentError {
+    logDiag("error", { requestId: this.traceId, message: "native_tool_isolation_violation", problem, ...detail });
+    return new AgentError("TOOL_ISOLATION", `Native client-tool isolation failed: ${problem}. The run was stopped.`);
+  }
+}
+
 export class ClaudeEngine {
   private defaults: Partial<EngineOptions>;
   private queryFnOverride?: QueryFn;
@@ -1142,6 +1387,12 @@ export class ClaudeEngine {
    */
   async *stream(prompt: string, options?: EngineOptions): AsyncGenerator<AgentEvent> {
     const opts = this.mergeOptions(options);
+    // In a native client-tool run the CLI itself refuses every call; nothing
+    // else may answer or reject one in its place.
+    if (opts.clientToolsNative) {
+      if (opts.clientToolCalls) throw new Error("clientToolsNative cannot be combined with clientToolCalls");
+      if (opts.onPermission) throw new Error("clientToolsNative cannot be combined with onPermission");
+    }
     const queryFn = this.queryFnOverride || await resolveQueryFn();
 
     const abortController = new AbortController();
@@ -1170,6 +1421,7 @@ export class ClaudeEngine {
     if (opts.timeoutMs !== undefined) queryOptions.timeoutMs = opts.timeoutMs;
     if (opts.idleTimeoutMs !== undefined) queryOptions.idleTimeoutMs = opts.idleTimeoutMs;
     if (opts.tools) queryOptions.tools = opts.tools;
+    if (opts.clientToolsNative) queryOptions.clientToolsNative = opts.clientToolsNative;
 
     // Only a caller-supplied system prompt is forwarded; buildCLICommand fills
     // in a neutral one, so "no system message" never carries a hidden default.
@@ -1183,12 +1435,27 @@ export class ClaudeEngine {
     }
 
     const ctx = createEventContext();
+    const native = opts.clientToolsNative ? new NativeTurnReader(opts.clientToolsNative, opts.traceId || "") : null;
 
     try {
       const queryInstance = queryFn({ prompt, options: queryOptions });
 
       for await (const raw of queryInstance) {
         const rawType = raw.type;
+        // A native client-tool run: its isolation checks and tool calls come
+        // first, and some lines go no further.
+        if (native) {
+          if (abortController.signal.aborted) throw new Error("Aborted");
+          let step: { events: AgentEvent[]; consumed: boolean };
+          try {
+            step = native.read(raw);
+          } catch (err) {
+            abortController.abort();
+            throw err;
+          }
+          for (const event of step.events) yield event;
+          if (step.consumed) continue;
+        }
         if (opts.clientToolCalls && rawType === "system" && raw.subtype === "init") {
           const tools = Array.isArray(raw.tools) ? raw.tools : [];
           if (tools.length > 0) {
@@ -1276,10 +1543,22 @@ export class ClaudeEngine {
         }
       }
     } catch (err) {
+      // A native tool turn ends with the CLI exiting 1 after its result line.
+      if (native?.toolTurnComplete && isNativeToolTurnExit(err)) {
+        logDiag("info", {
+          requestId: opts.traceId || "",
+          message: "native_tool_turn_exit",
+          error: (err as Error).message.slice(0, 300),
+        });
+        return;
+      }
       if (err instanceof CliUsageLimitError && abortController.signal.reason === err && !opts.signal?.aborted) {
         throw err;
       }
       if (err instanceof AgentError && err.code === "NATIVE_TOOL_CALL") {
+        throw err;
+      }
+      if (err instanceof AgentError && err.code === "TOOL_ISOLATION") {
         throw err;
       }
       const reason = abortController.signal.reason;

@@ -26,6 +26,7 @@ import { checkAuth, RateLimiter, sendAuthError, sendRateLimitError } from "./mid
 import { generateRequestId, logRequest, logResponse, logError, log } from "./logger.js";
 import { settleResponse } from "./settle.js";
 import { startTraceRetention } from "./trace.js";
+import { verifyNativeClientTools } from "./native-tools.js";
 import { AgentError } from "../errors.js";
 import {
   DEFAULT_TIMEOUT_MS,
@@ -118,6 +119,10 @@ export interface ApiServerOptions {
   /** Check the claude CLI before listening (verifyClaudeCLI in engine.ts) and
    *  refuse to start if the check fails. Default true. */
   verifyCli?: boolean;
+  /** Streamed requests with client tools give the model those tools natively
+   *  (native-tools.ts). Default false. With verifyCli, the server also checks
+   *  this mode's isolation before listening and refuses to start if it fails. */
+  nativeTools?: boolean;
 }
 
 export interface ApiServerHandle {
@@ -178,9 +183,19 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
       cliWarning = `claude ${version || check.cli.version} has not been tested with this build (tested: ${TESTED_CLAUDE_CLI_VERSION}). Run the CLI suite: pnpm exec vitest run --config vitest.cli.config.ts`;
     }
   }
+  // In native client-tool mode, also check that the CLI offers only the
+  // placeholder server's tools and that no call reaches it.
+  let clientToolsLine = opts.nativeTools ? "native (not checked)" : "text instruction";
+  if (opts.nativeTools && opts.verifyCli !== false) {
+    const native = await verifyNativeClientTools(workingDir);
+    if (!native.ok) {
+      throw new Error(native.problem || "The native client-tool check failed.");
+    }
+    clientToolsLine = "native (isolation verified)";
+  }
   startTraceRetention();
 
-  const ctx: ServerContext = { workingDir, apiKey };
+  const ctx: ServerContext = { workingDir, apiKey, nativeTools: opts.nativeTools === true };
   const queue = new RequestQueue({
     maxConcurrent: opts.maxConcurrent,
     maxQueueSize: opts.maxQueueSize,
@@ -485,6 +500,7 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
       console.log(`  Interface     : ${opts.host ?? "all interfaces"}`);
       console.log(`  Timeouts      : ${Math.round(requestTimeoutMs / 1000)} s request · ${Math.round(streamTimeoutMs / 1000)} s stream · ${Math.round(idleTimeoutMs / 1000)} s idle`);
       console.log(`  Claude CLI    : ${cliLine}`);
+      console.log(`  Client tools  : ${clientToolsLine}`);
       if (cliWarning) console.log(`  ⚠ ${cliWarning}`);
       if (apiKey) {
         console.log(`  Auth          : API key required (OTTERLY_API_KEY)`);

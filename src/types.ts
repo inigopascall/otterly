@@ -1,6 +1,6 @@
 // ── Configuration ──
 
-export type PermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan";
+export type PermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk";
 
 export interface EngineOptions {
   /** Working directory for file operations. Defaults to process.cwd() */
@@ -38,6 +38,12 @@ export interface EngineOptions {
   /** When true, client tools are external OpenAI tools: Claude rejects native
    *  tool inventory/activity on this path. */
   clientToolCalls?: boolean;
+  /** Give the model the client's tools as native tools, served by the one MCP
+   *  server named serverName, a placeholder that executes nothing
+   *  (server/native-tools.ts). `toolNames` are the offered names, without the
+   *  mcp__ prefix. The CLI refuses every call; each is reported as a
+   *  client_tool_call event. */
+  clientToolsNative?: { serverName: string; toolNames: string[] };
   /** Only the OpenAI HTTP route opts in: preserve structured CLI 429 across engine cleanup. */
   structured429ForOpenAI?: boolean;
   /** Correlation id for logging and file tracing. Set from the HTTP request id
@@ -125,6 +131,23 @@ export interface ResultEvent {
   usage: { input_tokens: number; output_tokens: number };
 }
 
+/** A client tool the model called in a native client-tool run, which the CLI
+ *  refused. `argumentsJson` is the arguments exactly as the model streamed
+ *  them; `index` counts the run's calls from 0. */
+export interface ClientToolCallEvent {
+  type: "client_tool_call";
+  index: number;
+  id: string;
+  name: string;
+  argumentsJson: string;
+}
+
+/** The end of the model's message in a native client-tool run, with its stop reason. */
+export interface TurnStopEvent {
+  type: "turn_stop";
+  stopReason: string | null;
+}
+
 export type AgentEvent =
   | TextEvent
   | TextDeltaEvent
@@ -133,7 +156,9 @@ export type AgentEvent =
   | ToolResultEvent
   | SystemEvent
   | ErrorEvent
-  | ResultEvent;
+  | ResultEvent
+  | ClientToolCallEvent
+  | TurnStopEvent;
 
 // ── Result (from run()) ──
 

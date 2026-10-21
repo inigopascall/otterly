@@ -132,8 +132,11 @@ export function toOpenAIUsage(usage: unknown): OpenAIUsage {
 /**
  * Convert OpenAI chat messages into a prompt string + systemPrompt
  * for the otterly engine. Detects multimodal content.
+ *
+ * `opts.toolName` renames each tool the history names: each call of an
+ * assistant turn, and the name of a tool turn.
  */
-export function openaiToClaudeInput(body: OpenAIChatRequest): {
+export function openaiToClaudeInput(body: OpenAIChatRequest, opts: { toolName?: (name: string) => string } = {}): {
   prompt: string;
   systemPrompt: string | null;
   isMultimodal: boolean;
@@ -142,6 +145,7 @@ export function openaiToClaudeInput(body: OpenAIChatRequest): {
   let systemPrompt: string | null = null;
   const conversationParts: string[] = [];
   let isMultimodal = false;
+  const toolName = opts.toolName ?? ((name: string) => name);
 
   for (const msg of messages) {
     if (msg.role === "system") {
@@ -166,7 +170,7 @@ export function openaiToClaudeInput(body: OpenAIChatRequest): {
       // An assistant turn may be plain text or a function-call request.
       if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
         const calls = msg.tool_calls
-          .map((tc) => `${tc.function.name}(${tc.function.arguments})`)
+          .map((tc) => `${toolName(tc.function.name)}(${tc.function.arguments})`)
           .join(", ");
         conversationParts.push(`[Previous assistant response]: called function(s) ${calls}`);
       } else {
@@ -176,7 +180,7 @@ export function openaiToClaudeInput(body: OpenAIChatRequest): {
     } else if (msg.role === "tool") {
       // The caller executed a function we requested and is returning its output.
       const text = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content ?? "");
-      const label = msg.name ? `function ${msg.name}` : `function call ${msg.tool_call_id || ""}`.trim();
+      const label = msg.name ? `function ${toolName(msg.name)}` : `function call ${msg.tool_call_id || ""}`.trim();
       conversationParts.push(`[Result of ${label}]: ${text}`);
     }
   }
@@ -517,6 +521,7 @@ export function sseData(obj: unknown): string {
  */
 export function errorToHttpStatus(err: unknown): number {
   if (err instanceof AgentError && err.code === "NATIVE_TOOL_CALL") return 502;
+  if (err instanceof AgentError && err.code === "TOOL_ISOLATION") return 502;
   if (err instanceof AgentError && err.code === "TIMEOUT") return 504;
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   if (msg.includes("anthropic_api_key") || msg.includes("authentication") || msg.includes("not_authenticated") || msg.includes("not logged in")) {

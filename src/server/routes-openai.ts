@@ -6,7 +6,7 @@ import type { ServerResponse } from "http";
 import crypto from "crypto";
 import { AgentError } from "../errors.js";
 import { EFFORT_LEVELS, CliTerminatedError, CliUsageLimitError, getIdleTimeoutMs } from "../engine.js";
-import type { EngineOptions } from "../types.js";
+import type { ClientToolCallEvent, EngineOptions } from "../types.js";
 import type { ParsedRequest, ServerContext } from "./routes-native.js";
 import { apiSessions } from "./session-store.js";
 import type { CircuitBreaker } from "./circuit-breaker.js";
@@ -35,6 +35,19 @@ import { traceEnabled, traceWrite, traceDir } from "./trace.js";
 import { SseStream, sseWrite } from "./sse-stream.js";
 import { ToolCallStreamer, reconcileStreamedCalls, type StreamAction } from "./tool-call-stream.js";
 import { requestFingerprint, recordDrop, retryNotice, clearDrop, dropCount } from "./retry-notice.js";
+import {
+  NATIVE_SERVER_NAME,
+  NATIVE_TOOL_PREFIX,
+  nativeToolsIneligible,
+  nativeHistoryName,
+  createNativeToolDir,
+  removeNativeToolDir,
+  readNativeToolLog,
+  countToolCallsReceived,
+  resolveNativeToolName,
+  coerceNativeArguments,
+  type NativeToolDir,
+} from "./native-tools.js";
 
 /** Abort reason used when the client hangs up before the response is complete. */
 const CLIENT_DISCONNECTED = "client_disconnected";
@@ -131,6 +144,11 @@ function classifyStreamFailure(err: unknown, signal: AbortSignal): StreamFailure
   }
   if (err instanceof AgentError && err.code === "NATIVE_TOOL_CALL") {
     return { kind: "retry", reason: "called one of Claude's own tools instead of requesting an external one" };
+  }
+  // A native client-tool run broke its isolation: an in-stream error, which
+  // the client does not retry.
+  if (err instanceof AgentError && err.code === "TOOL_ISOLATION") {
+    return { kind: "error", err, status: errorToHttpStatus(err) };
   }
   const e = err instanceof Error ? err : new Error(String(err));
   if (e.name === "AbortError" || signal.aborted) return { kind: "disconnected" };
@@ -291,6 +309,22 @@ export async function handleChatCompletions(
     finalSystemPrompt = finalSystemPrompt
       ? `${finalSystemPrompt}\n\n${jsonInstruction}`
       : jsonInstruction;
+  }
+
+  // Native client tools (OTTERLY_NATIVE_TOOLS=1): an eligible request gives the
+  // model the client's tools as real tools, which the CLI refuses to run
+  // (handleNativeToolStream). Every other request takes the paths below.
+  if (ctx.nativeTools) {
+    const reason = nativeToolsIneligible(body);
+    if (reason === null) {
+      if (finalSystemPrompt) options.systemPrompt = finalSystemPrompt;
+      if (model) options.model = model;
+      await handleNativeToolStream(req, res, body, options, model, abortController, fingerprint, circuitBreaker);
+      return;
+    }
+    if (Array.isArray(body.tools) && body.tools.length > 0) {
+      logDiag("info", { requestId: req.requestId || "", message: "native_tools_fallback", reason });
+    }
   }
 
   // Function calling: when the client supplies `tools`, OpenAI semantics say the
@@ -726,6 +760,227 @@ async function handleFunctionCallingStream(
     offeredTools: toolNames,
   });
   await complete("stop", 0);
+}
+
+/**
+ * Native client-tool path, streamed (OTTERLY_NATIVE_TOOLS=1). The CLI is given
+ * the client's tools as real tools, served by a per-request placeholder MCP
+ * server that executes nothing, and refuses every call to them itself. Each
+ * call the model requested arrives as a client_tool_call event, assembled from
+ * its streamed arguments (ClaudeEngine.stream), and is sent to the client as
+ * an OpenAI tool call once the turn has ended.
+ *
+ * A call that reached the placeholder server ends the stream with an in-stream
+ * error and sends no tool call. A turn that stopped before its calls were
+ * complete, arguments that are not a JSON object, and a text reply showing
+ * tool-call intent are dropped, so that the client retries.
+ */
+async function handleNativeToolStream(
+  req: ParsedRequest,
+  res: ServerResponse,
+  body: OpenAIChatRequest,
+  baseOptions: EngineOptions,
+  model: string,
+  abortController: AbortController,
+  fingerprint: string,
+  circuitBreaker?: CircuitBreaker,
+): Promise<void> {
+  const requestId = req.requestId || "";
+  const startedAt = Date.now();
+  const tools = body.tools || [];
+  const toolNames = tools.map((t) => t.function.name);
+  const offered = new Set(toolNames);
+  const prefixedNames = toolNames.map((name) => NATIVE_TOOL_PREFIX + name);
+  // The history names each offered tool as the CLI shows it to the model.
+  const { prompt } = openaiToClaudeInput(body, { toolName: nativeHistoryName(toolNames) });
+
+  const out = new SseStream(res, model, requestId);
+  let files: NativeToolDir | null = null;
+  let reached = -1;
+  try {
+    await out.start();
+    await out.thinking(retryNotice(fingerprint) ?? "");
+    try {
+      files = createNativeToolDir(tools);
+    } catch (err) {
+      await failStream(req, out, err, abortController.signal, fingerprint, startedAt, circuitBreaker);
+      return;
+    }
+
+    const options: EngineOptions = {
+      ...baseOptions,
+      permissionMode: "dontAsk",
+      maxTurns: 1,
+      mcpServers: files.mcpServers,
+      clientToolsNative: { serverName: NATIVE_SERVER_NAME, toolNames },
+    };
+    const engine = makeEngine();
+
+    // The reply arrives as text_delta events and is then repeated as one
+    // consolidated `text` block, which is used only when no delta came first.
+    let sawTextDelta = false;
+    let text = "";
+    let resultText = "";
+    const calls: ClientToolCallEvent[] = [];
+    let stopReason: string | null = null;
+    let usage: unknown;
+    let cost = 0;
+    try {
+      for await (const event of engine.stream(prompt, options)) {
+        if (abortController.signal.aborted) break;
+        if (event.type === "thinking_delta") {
+          await out.thinking(event.delta);
+        } else if (event.type === "text_delta") {
+          sawTextDelta = true;
+          text += event.delta;
+          await out.text(event.delta);
+        } else if (event.type === "text") {
+          if (!sawTextDelta) {
+            text += event.text;
+            await out.text(event.text);
+          }
+        } else if (event.type === "client_tool_call") {
+          calls.push(event);
+        } else if (event.type === "turn_stop") {
+          stopReason = event.stopReason;
+        } else if (event.type === "result") {
+          resultText = event.text || "";
+          usage = event.usage;
+          cost = event.cost;
+        } else if (event.type === "error") {
+          throw event.error;
+        }
+      }
+      if (abortController.signal.aborted) throw new Error("Aborted");
+    } catch (err) {
+      if (err instanceof AgentError && err.code === "TOOL_ISOLATION") {
+        log("error", { requestId, message: "native_tool_isolation_failed", error: err.message });
+      }
+      await failStream(req, out, err, abortController.signal, fingerprint, startedAt, circuitBreaker);
+      return;
+    }
+
+    // The CLI refuses every call itself, so none may reach the placeholder
+    // server. If one did, nothing the model asked for is sent.
+    reached = countToolCallsReceived(files.logPath);
+    if (reached !== 0) {
+      const status = 502;
+      log("error", { requestId, message: "native_tool_call_reached_server", count: reached });
+      metrics.record({
+        ts: Date.now(), endpoint: "chat", status,
+        durationMs: Date.now() - startedAt,
+        cost,
+        ...usageTokens(usage),
+        toolCalls: 0,
+        error: "a native tool call reached the placeholder server",
+      });
+      await out.fail(
+        "Claude Code passed a tool call to Otterly's placeholder tool server instead of refusing it. Nothing was executed and no tool call was returned.",
+        openaiErrorBody(status, "").error.type,
+        status,
+      );
+      return;
+    }
+    circuitBreaker?.onSuccess();
+
+    // A reply that arrived only on the result line is sent here.
+    if (!text && resultText) {
+      text = resultText;
+      await out.text(resultText);
+    }
+    traceWrite(requestId, "engine-text.txt", text);
+
+    const complete = async (reason: "stop" | "tool_calls", toolCalls: number): Promise<void> => {
+      clearDrop(fingerprint);
+      traceWrite(requestId, "stream-sent.txt", out.sentText);
+      traceWrite(requestId, "stream-reasoning.txt", out.sentReasoning);
+      metrics.record({
+        ts: Date.now(), endpoint: "chat", status: 200,
+        durationMs: Date.now() - startedAt,
+        cost,
+        ...usageTokens(usage),
+        toolCalls,
+      });
+      await out.finish(reason, toOpenAIUsage(usage));
+    };
+
+    if (calls.length > 0) {
+      // Each call: its arguments as streamed, its name as the client knows it,
+      // and its top-level arguments coerced to the types its schema declares.
+      const resolved = calls.map((call) => {
+        let args: unknown = null;
+        try {
+          args = JSON.parse(call.argumentsJson === "" ? "{}" : call.argumentsJson);
+        } catch {
+          // not JSON
+        }
+        const isObject = !!args && typeof args === "object" && !Array.isArray(args);
+        const name = resolveNativeToolName(call.name, offered);
+        const tool = tools.find((t) => t.function.name === name.name);
+        const coerced = isObject ? coerceNativeArguments(args as Record<string, unknown>, tool?.function.parameters) : null;
+        return { call, isObject, name, coerced };
+      });
+      traceWrite(requestId, "native-tool-calls.json", JSON.stringify(resolved.map((r) => ({
+        index: r.call.index,
+        rawName: r.call.name,
+        resolvedName: r.name.name,
+        argumentsJson: r.call.argumentsJson,
+        nameFixed: r.name.nameFixed,
+        unknownName: !r.name.known,
+        argumentFixes: r.coerced?.fixed ?? [],
+      })), null, 2));
+
+      if (stopReason !== "tool_use") {
+        dropForRetry(req, out, fingerprint, "stopped before its tool request was complete", startedAt, { stopReason });
+        return;
+      }
+      if (resolved.some((r) => !r.isObject)) {
+        dropForRetry(req, out, fingerprint, "requested a tool with arguments that are not a JSON object", startedAt);
+        return;
+      }
+      for (const r of resolved) {
+        if (!r.name.known) {
+          log("warn", { requestId, message: "native_tool_unknown_name", name: r.call.name, forwardedAs: r.name.name });
+        }
+      }
+      for (let i = 0; i < resolved.length; i++) {
+        const r = resolved[i];
+        await out.toolStart(i, newToolCallId(), r.name.name, JSON.stringify(r.coerced?.args ?? {}));
+      }
+      logDiag("info", {
+        requestId,
+        message: "native_tool_calls",
+        tools: resolved.map((r) => r.name.name),
+        nameFixes: resolved.filter((r) => r.name.nameFixed).map((r) => r.name.name),
+        argumentFixes: resolved.flatMap((r) => (r.coerced?.fixed ?? []).map((key) => `${r.name.name}.${key}`)),
+        unknownNames: resolved.filter((r) => !r.name.known).map((r) => r.call.name),
+      });
+      await complete("tool_calls", resolved.length);
+      return;
+    }
+
+    if (looksLikeToolCallIntent(text, [...toolNames, ...prefixedNames])) {
+      traceWrite(requestId, "unparseable-tool-call.txt", text);
+      // Terse line on the console: this is a genuine failure and should be
+      // visible without tracing turned on.
+      log("error", { requestId, message: "tool_call_unparseable", textLength: text.length });
+      dropForRetry(req, out, fingerprint, "requested a tool in a form Otterly could not parse into OpenAI tool_calls", startedAt, {
+        textLength: text.length,
+      });
+      return;
+    }
+    await complete("stop", 0);
+  } finally {
+    if (files) {
+      // The log is read before its directory goes, on every outcome.
+      if (reached < 0) {
+        reached = countToolCallsReceived(files.logPath);
+        if (reached !== 0) log("error", { requestId, message: "native_tool_call_reached_server", count: reached });
+      }
+      if (traceEnabled()) traceWrite(requestId, "native-mcp.log.ndjson", readNativeToolLog(files.logPath));
+      removeNativeToolDir(files.dir);
+    }
+  }
 }
 
 async function handleSessionNonStreaming(
