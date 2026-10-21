@@ -1,6 +1,6 @@
 ---
-verified: 2026-10-20
-verified_by: workmonkey
+verified: 2026-10-21
+verified_by: workhorse
 ---
 
 # Otterly: Architecture
@@ -32,7 +32,9 @@ start without it (§5).
 - Streaming emits incremental text deltas; the final consolidated block is
   suppressed once deltas have been sent.
 - A function-calling bridge converts the model's tool-call intent into OpenAI
-  `tool_calls`, so clients drive tool execution.
+  `tool_calls`, so clients drive tool execution. With `OTTERLY_NATIVE_TOOLS=1`,
+  an eligible streamed request gives the model the client's tools natively
+  instead (§13).
 - Every run is isolated unless the caller opts in (§2).
 - The CLI runs with `--include-partial-messages --thinking-display summarized`, so
   the model's summarised thinking and its reply arrive as `stream_event` lines
@@ -54,7 +56,8 @@ start without it (§5).
   - `--setting-sources ""`: no user, project or local settings;
   - `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`: no MCP servers.
 
-  The HTTP routes and `/ws` never opt out. A library caller opts in with `tools`
+  The HTTP routes and `/ws` never opt out, except native client-tool mode (§13),
+  which has its own fixed flag set and checks. A library caller opts in with `tools`
   (named built-ins, or `["default"]` for Claude Code's default set), which drops
   `--disallowedTools "*"`, or with `mcpServers`, which also drops `--safe-mode`,
   because safe mode stops servers named in `--mcp-config` from loading.
@@ -104,6 +107,7 @@ start without it (§5).
 | `src/server/openai-compat.ts` | OpenAI translation and the tool bridge |
 | `src/server/sse-stream.ts` | `SseStream`: the SSE chunks of one streamed completion |
 | `src/server/tool-call-stream.ts` | `ToolCallStreamer, reconcileStreamedCalls`: live tool calls |
+| `src/server/native-tools.ts` | Native client-tool mode (§13): eligibility, the placeholder MCP server, name resolution, argument coercion, the startup check |
 | `src/server/retry-notice.ts` | Remembers dropped requests; notice on the retry |
 | `src/server/quota.ts` | `QuotaTracker` and its singleton `quota`: subscription usage for `GET /api/quota` from `claude -p /usage`, `claude auth status` and `rate_limit_event` lines, and the usage limit (§12) |
 | `tests/fixtures/fake-claude.mjs` | A stand-in CLI that speaks stream-json, for `tests/cli-transport.test.ts` |
@@ -457,6 +461,93 @@ four paths as `{"error":…}`. `/ws` is unaffected.
 ISO-8601, while it lasts, and `null` otherwise. Covered by
 `tests/server/usage-limit-route.test.ts` and `tests/server/quota.test.ts`.
 
+## 13. Native client-tool mode
+
+Off unless the server runs with `OTTERLY_NATIVE_TOOLS=1` (`nativeTools` on
+`startApiServer`). For an eligible request it replaces the text instruction of
+§2 and §11: the model gets the client's tools as real tools, calls them in its
+own trained form, and its turn ends at the calls, so nothing is parsed out of
+reply text.
+
+**Eligible** (`nativeToolsIneligible` in `server/native-tools.ts`): a streamed
+request whose `tools` are functions with unique names matching
+`^[A-Za-z0-9_-]{1,56}$`, and whose `tool_choice` is unset or `auto`. Every
+other request takes the text-instruction path, unchanged; with the switch on, a
+diag line `native_tools_fallback` gives the reason. `Session` and `/ws` never
+use the mode.
+
+**What the CLI gets** (`handleNativeToolStream` in `routes-openai.ts`):
+
+- One MCP server, `c`: a placeholder written for each request into a private
+  `otterly-native-*` directory in the system temp folder, and removed when the
+  request ends. It lists the request's tools and executes nothing; a `tools/call`
+  that reaches it is logged and answered with an error. The model
+  sees each tool `x` as `mcp__c__x`.
+- The flags of `nativeClientToolFlags` in `engine.ts`: `--tools ""`,
+  `--setting-sources ""`, `--strict-mcp-config` with that one server,
+  `--permission-mode dontAsk`, `--permission-prompts none`, `--restricted`,
+  `--disable-slash-commands`, `--no-session-persistence`,
+  `--include-hook-events` and `--max-turns 1`. Don't-ask mode with no
+  permission prompts makes the CLI refuse every call itself. `--safe-mode`
+  would stop the placeholder server loading; `--restricted` keeps CLAUDE.md,
+  AGENTS.md and auto memory out instead. `buildCLICommand` throws for any
+  option that would widen the run.
+- The history flattened as in §1, with each offered tool written `mcp__c__x`,
+  and no tool instruction or reminder.
+
+**Isolation checks**
+
+- At startup, `verifyNativeClientTools` starts the CLI once with the native
+  flags, offering one tool and sending a message marked `shouldQuery: false`,
+  so the model is not called. The server refuses to start unless the CLI exits
+  0, `checkNativeInit` passes and no call reached the placeholder. The banner
+  then shows `Client tools  : native (isolation verified)`.
+- In each run, `NativeTurnReader` in `engine.ts` requires the `system/init`
+  line to pass `checkNativeInit`: the tools exactly `mcp__c__<name>` for each
+  offered name; one MCP server, `c`, connected; no skills, slash commands or
+  memory paths; `permissionMode` `dontAsk`. It allows one API message only,
+  rejects any block whose type ends in `tool_use` other than `tool_use` itself,
+  and requires every `tool_result` the CLI writes to be an error. A failure is
+  `TOOL_ISOLATION`, answered with an in-stream error (code 502), which the
+  client does not retry.
+- After the run, the route counts the `tools/call` entries in the
+  placeholder's log (`countToolCallsReceived`). Unless the count is 0, no tool
+  call is sent and the reply is an in-stream error (code 502).
+
+**Reading the calls.** A call's arguments are its `input_json_delta`
+fragments from the `stream_event` lines, joined. The `tool_use` input in the
+`assistant` line is never used: the CLI can alter it (in one run, an escape
+sequence inside a string came out as the character it encodes). A turn that
+ends in calls has `stop_reason` `tool_use`, then a `result` line with
+`subtype` `error_max_turns`, then exit code 1; the engine treats that as the
+turn's normal end (`native_tool_turn_exit`). The route then:
+- resolves each name: `mcp__c__x` is `x`; a plain offered name is accepted and
+  counted as a name fix; any other name is sent without the prefix, with a
+  warn line `native_tool_unknown_name`;
+- replaces each top-level argument that is a string holding JSON of the type
+  its schema declares with that JSON (`coerceNativeArguments`);
+- sends the calls after all content, and ends with
+  `finish_reason: "tool_calls"`.
+
+It drops the stream for a retry (§11) when the calls did not end with
+`stop_reason` `tool_use`, when a call's arguments are not a JSON object, or
+when a reply with no calls shows tool-call intent.
+
+**Traces** gain `native-tool-calls.json` (each call's raw and resolved name,
+arguments and fixes) and `native-mcp.log.ndjson` (the placeholder's log).
+Log messages: `native_tool_calls`, `native_tool_turn_exit`,
+`native_tools_fallback`, `native_tool_unknown_name`,
+`native_tool_call_reached_server`, `native_tool_isolation_failed`,
+`native_tool_isolation_violation`, `native_tool_inventory_mismatch`.
+
+**Tests:** `tests/native-tools.test.ts`, `tests/engine-native-tools.test.ts`
+and `tests/server/native-tools-route.test.ts`; in the CLI suite,
+`tests-cli/native-client-tools.test.ts` runs the startup check against the real
+CLI, at no cost.
+
+**On the zbook** the mode runs on `otterly@iwd` only, as a trial switched by
+`~/code/iwd/9router/zbook/native-trial.sh` (`@code/9router/zbook/README.md`).
+
 ## Verify
 
 Run from the Z-Book. Expected values follow `#`.
@@ -583,4 +674,20 @@ git -C ~/.local/share/otterly-zbook/app remote get-url origin                   
 grep -c 'otterly-zbook/app/dist/cli.js serve' ~/.config/systemd/user/otterly@.service # 1
 grep -h OTTERLY_PORT ~/.config/otterly/airship.env ~/.config/otterly/iwd.env | tr '\n' ',' | sed 's/,$//'   # OTTERLY_PORT=11445,OTTERLY_PORT=11446
 grep -c 'pnpm i [-]g' AGENTS.md                                                  # 0
+grep -F -c 'nativeTools: process.env.OTTERLY_NATIVE_TOOLS === "1",' src/cli.ts       # 1
+grep -F -c 'export function nativeToolsIneligible' src/server/native-tools.ts        # 1
+grep -F -c 'const NATIVE_TOOL_NAME = /^[A-Za-z0-9_-]{1,56}$/;' src/server/native-tools.ts # 1
+grep -F -c 'export const NATIVE_SERVER_NAME = "c";' src/server/native-tools.ts       # 1
+grep -F -c 'mkdtempSync(join(tmpdir(), "otterly-native-"))' src/server/native-tools.ts # 1
+grep -F -c -e '"--permission-prompts", "none",' -e '"--restricted",' -e '"--disable-slash-commands",' -e '"--no-session-persistence",' -e '"--include-hook-events",' src/engine.ts # 5
+grep -F -c 'function nativeClientToolFlags' src/engine.ts                            # 1
+grep -F -c 'export function checkNativeInit' src/engine.ts                           # 1
+grep -F -c 'class NativeTurnReader' src/engine.ts                                     # 1
+grep -F -c 'export function countToolCallsReceived' src/server/native-tools.ts       # 1
+grep -F -c 'export async function verifyNativeClientTools' src/server/native-tools.ts # 1
+grep -F -c 'async function handleNativeToolStream' src/server/routes-openai.ts       # 1
+grep -F -c '| "TOOL_ISOLATION"' src/errors.ts                                         # 1
+grep -F -c 'if (err instanceof AgentError && err.code === "TOOL_ISOLATION") return 502;' src/server/openai-compat.ts # 1
+grep -F -c 'console.log(`  Client tools  : ${clientToolsLine}`);' src/server/index.ts # 1
+test -f tests/native-tools.test.ts && test -f tests/engine-native-tools.test.ts && test -f tests/server/native-tools-route.test.ts && test -f tests-cli/native-client-tools.test.ts && echo present # present
 ```
