@@ -1,6 +1,6 @@
 ---
 verified: 2026-10-23
-verified_by: workhorse
+verified_by: workdonkey
 ---
 
 # Otterly: Architecture
@@ -108,7 +108,7 @@ start without it (§5).
 | `src/server/sse-stream.ts` | `SseStream`: the SSE chunks of one streamed completion |
 | `src/server/tool-call-stream.ts` | `ToolCallStreamer, reconcileStreamedCalls`: live tool calls |
 | `src/server/native-tools.ts` | Native client-tool mode (§13): eligibility, the placeholder MCP server, name resolution, argument coercion, the startup check |
-| `src/server/retry-notice.ts` | Remembers dropped requests; notice on the retry |
+| `src/server/retry-notice.ts` | The attempt ledger: failed attempts per request fingerprint (`settleAttempt`), the retry notice, and the cap (`MAX_ATTEMPTS`) |
 | `src/server/quota.ts` | `QuotaTracker` and its singleton `quota`: subscription usage for `GET /api/quota` from `claude -p /usage`, `claude auth status` and `rate_limit_event` lines, and the usage limit (§12) |
 | `tests/fixtures/fake-claude.mjs` | A stand-in CLI that speaks stream-json, for `tests/cli-transport.test.ts` |
 | `tests-cli/claude-cli.test.ts` | The CLI suite: checks the real installed `claude` (§7) |
@@ -247,7 +247,8 @@ Log messages worth grepping: `run_text_sources`, `cli_spawn`, `cli_stdout`,
 `native_tool_inventory_detected`, `stream_summary`, `fc_response`,
 `response_text`, `cli_timing`, `cli_terminated`, `request_timeout`,
 `response_unsettled`, `cli_progress`, `stream_dropped_for_retry`,
-`tool_call_repaired`, `request_fingerprint`, `cli_api_error`.
+`tool_call_repaired`, `request_fingerprint`, `cli_api_error`,
+`retry_cap_reached`, `request_refused_after_failures`.
 
 `request_fingerprint` and `stream_dropped_for_retry` carry the same 12-character
 `fingerprint` for a request and its retries; `request_fingerprint` also carries
@@ -256,7 +257,7 @@ CLI (overload, rate limit, safeguard refusal) with its `apiErrorStatus` and the
 CLI text. For an exact `result.is_error === true` and
 `api_error_status === 429`, structured-429 recovery applies to the OpenAI HTTP
 route: non-streamed requests get HTTP 429 and streamed requests are dropped to
-trigger a retry regardless of the result wording; other status handling is
+trigger one retry (§11) regardless of the result wording; other status handling is
 unchanged, and the CLI text is logged.
 
 `tool_call_unparseable` is the terse console line for a 502; the bytes that
@@ -357,15 +358,36 @@ reply is then parsed as in the non-streamed path, and that parse decides:
   with what was streamed: the connection is dropped.
 
 Clients on the AI SDK, AiderDesk among them, retry a dropped connection and
-discard the partial reply; they do not retry an HTTP error or an in-stream
-error. Otterly therefore drops the connection for an unparseable or
-unconfirmed tool call, a native tool call and the idle limit, and sends an
-in-stream error for everything else. Each drop is recorded against a
-fingerprint of the request's model, messages and tools (`retry-notice.ts`,
-kept 10 minutes); the retry's reasoning opens with a notice such as
-`⚠️ Otterly: the previous attempt … (attempt 2)`. The console shows
-`stream_dropped_for_retry`. The structured-429 recovery applies to the OpenAI HTTP route: an exact
-structured 429 CLI result uses the existing drop/retry path.
+discard the partial reply; they do not retry an HTTP error, an in-stream
+error, or a stream that ends with `finish_reason: "length"`. Otterly therefore
+drops the connection for an unparseable or unconfirmed tool call, a native
+tool call, the idle limit and an exact structured 429 CLI result, and sends an
+in-stream error for everything else. The retry's reasoning opens with a notice
+such as `⚠️ Otterly: the previous attempt … (attempt 2)`; the console shows
+`stream_dropped_for_retry`.
+
+**One transparent retry per request** (`retry-notice.ts`). A failure that
+happens on every run, retried as if it were transient, would repeat for ever.
+So every `/v1/chat/completions` attempt is settled in an attempt ledger once
+its response has ended (`settleAttempt`, called from `index.ts`), keyed by a
+fingerprint of the request's model, messages and tools:
+
+- a dropped stream, an in-stream error, a timeout or an HTTP 5xx counts as a
+  failed attempt; a success clears the record; a client that hung up, an HTTP
+  4xx answer or a refusal changes nothing;
+- `dropForRetry` drops the stream only while fewer than `MAX_ATTEMPTS`
+  attempts, this one included, have failed. Otherwise the stream ends with an
+  in-stream error naming this attempt's reason and the previous one's
+  (`retry_cap_reached`), which the client does not retry;
+- an identical request that arrives after `MAX_ATTEMPTS` failures is refused
+  without starting the CLI: an in-stream error when streamed, HTTP 400
+  otherwise (`request_refused_after_failures`), and no circuit-breaker
+  failure. It runs again after a success, once its record expires
+  (`RETRY_NOTICE_TTL_MS` after the last failure or attempt, longer than the
+  longest run), or as soon as the request changes, e.g. a new message.
+
+The ledger is in memory and per process: each instance keeps its own, and a
+restart forgets it.
 
 Non-streamed tool requests are buffered, and fail with HTTP 502 as in §2.
 
@@ -540,13 +562,25 @@ It drops the stream for a retry (§11) when the calls did not end with
 `stop_reason` `tool_use`, when a call's arguments are not a JSON object, or
 when a reply with no calls shows tool-call intent.
 
+**A reply cut off at its output limit** (`stop_reason` `max_tokens`) is never
+retried, because the same request would stop the same way. At that
+`turn_stop` the route stops reading, which stops the CLI before its own
+output-limit recovery (asking the model to continue) can start. Every call of
+the turn, finished or not, is discarded. The reply ends with a note in
+`content`, which the model sees in its history, saying what was lost and to ask
+for smaller steps or a lower reasoning effort, then `finish_reason: "length"`
+with usage (`native_output_limit`). The `turn_stop` event carries the
+`message_delta` usage and the names of calls left unfinished
+(`NativeTurnReader`).
+
 **Traces** gain `native-tool-calls.json` (each call's raw and resolved name,
 arguments and fixes) and `native-mcp.log.ndjson` (the placeholder's log).
 Log messages: `native_tool_calls`, `native_tool_turn_exit`,
 `native_tools_fallback`, `native_tool_unknown_name`,
 `native_tool_call_reached_server`, `native_tool_isolation_failed`,
 `native_tool_isolation_violation`, `native_tool_inventory_mismatch`,
-`native_turn_api_retry`, `native_turn_retried`, `native_turn_unexpected`.
+`native_turn_api_retry`, `native_turn_retried`, `native_turn_unexpected`,
+`native_output_limit`.
 
 **Tests:** `tests/native-tools.test.ts`, `tests/engine-native-tools.test.ts`
 and `tests/server/native-tools-route.test.ts`; in the CLI suite,
@@ -595,7 +629,19 @@ grep -F -c 'reasoning_content: text' src/server/sse-stream.ts                   
 grep -F -c 'export const KEEPALIVE_MS = 5000;' src/server/sse-stream.ts          # 1
 grep -F -c 'this.response.destroy();' src/server/sse-stream.ts                   # 1
 grep -F -c 'export function reconcileStreamedCalls' src/server/tool-call-stream.ts # 1
-grep -F -c 'export const RETRY_NOTICE_TTL_MS = 10 * 60 * 1000;' src/server/retry-notice.ts # 1
+grep -F -c 'export const RETRY_NOTICE_TTL_MS = 60 * 60 * 1000;' src/server/retry-notice.ts # 1
+grep -F -c 'export const MAX_ATTEMPTS = 2;' src/server/retry-notice.ts            # 1
+grep -F -c 'const MAX_RECORDS = 1000;' src/server/retry-notice.ts                 # 1
+grep -F -c 'export function settleAttempt' src/server/retry-notice.ts             # 1
+grep -rlE 'recordDrop|dropCount|clearDrop' src tests | wc -l                       # 0
+grep -F -c 'if (parsed.fingerprint) settleAttempt(parsed.fingerprint, res, outcome);' src/server/index.ts # 1
+grep -F -c 'async function dropForRetry' src/server/routes-openai.ts              # 1
+grep -F -c 'if (failedBefore + 1 >= MAX_ATTEMPTS) {' src/server/routes-openai.ts  # 1
+grep -F -c 'if (failedAttempts(fingerprint) >= MAX_ATTEMPTS) {' src/server/routes-openai.ts # 1
+grep -F -c '"retry_cap_reached"' src/server/routes-openai.ts                      # 1
+grep -F -c '"request_refused_after_failures"' src/server/routes-openai.ts         # 1
+grep -F -c 'markFailure(this.response, message);' src/server/sse-stream.ts        # 1
+grep -F -c 'markFailure(this.response, reason ?? "was dropped");' src/server/sse-stream.ts # 1
 grep -F -c 'the previous attempt' src/server/retry-notice.ts                     # 1
 grep -F -c '"stream_dropped_for_retry"' src/server/routes-openai.ts              # 1
 grep -F -c 'err.code === "NATIVE_TOOL_CALL"' src/server/routes-openai.ts         # 1
@@ -702,4 +748,9 @@ test -f tests/native-tools.test.ts && test -f tests/engine-native-tools.test.ts 
 grep -F -c 'if (raw.subtype === "api_retry") return this.readApiRetry(raw);' src/engine.ts # 1
 grep -F -c '| "NATIVE_TURN_UNEXPECTED"' src/errors.ts                                # 1
 grep -F -c 'err.code === "NATIVE_TURN_UNEXPECTED") {' src/server/routes-openai.ts   # 2
+grep -F -c 'if (event.stopReason === "max_tokens") {' src/server/routes-openai.ts   # 1
+grep -F -c 'await complete("length", 0);' src/server/routes-openai.ts              # 1
+grep -F -c '"native_output_limit"' src/server/routes-openai.ts                     # 1
+grep -F -c 'unfinishedCalls?: string[];' src/types.ts                              # 1
+grep -F -c 'unfinishedCalls: [...this.open.values()].map((call) => call.name),' src/engine.ts # 1
 ```

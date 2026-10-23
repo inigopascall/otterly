@@ -51,6 +51,8 @@ export interface ParsedRequest extends IncomingMessage {
   timeoutSignal?: AbortSignal;
   /** The deadline behind timeoutSignal, in ms. */
   timeoutMs?: number;
+  /** The request's fingerprint in the attempt ledger (retry-notice.ts); set for /v1/chat/completions. */
+  fingerprint?: string;
 }
 
 /**

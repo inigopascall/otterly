@@ -1143,6 +1143,8 @@ class NativeTurnReader {
   private readonly open = new Map<number, { id: string; name: string; json: string }>();
   private calls = 0;
   private stopReason: string | null = null;
+  /** The usage the message's message_delta reported. */
+  private usage: Record<string, unknown> | undefined;
   private stoppedForTools = false;
   /** Set once a turn that stopped for tool use has had its result line. */
   toolTurnComplete = false;
@@ -1240,11 +1242,21 @@ class NativeTurnReader {
       case "message_delta": {
         const delta = ev.delta && typeof ev.delta === "object" ? ev.delta as Record<string, unknown> : {};
         if ("stop_reason" in delta) this.stopReason = typeof delta.stop_reason === "string" ? delta.stop_reason : null;
+        if (ev.usage && typeof ev.usage === "object") this.usage = ev.usage as Record<string, unknown>;
         return { events: [], consumed: true };
       }
       case "message_stop":
         this.stoppedForTools = this.stopReason === "tool_use";
-        return { events: [{ type: "turn_stop", stopReason: this.stopReason }], consumed: true };
+        return {
+          events: [{
+            type: "turn_stop",
+            stopReason: this.stopReason,
+            usage: this.usage,
+            // Calls started and never finished: a message cut off mid-call.
+            unfinishedCalls: [...this.open.values()].map((call) => call.name),
+          }],
+          consumed: true,
+        };
       default:
         return pass;
     }
@@ -1276,14 +1288,15 @@ class NativeTurnReader {
 
   /**
    * The CLI retries a failed API request by itself, printing an api_retry
-   * line first. The failed attempt's unfinished calls and stop reason are
-   * discarded, the retried attempt's calls are numbered from 0, and one more
+   * line first. The failed attempt's unfinished calls, stop reason and usage
+   * are discarded, the retried attempt's calls are numbered from 0, and one more
    * message may start.
    */
   private readApiRetry(raw: Record<string, unknown>): { events: AgentEvent[]; consumed: boolean } {
     const attempt = typeof raw.attempt === "number" ? raw.attempt : null;
     this.open.clear();
     this.stopReason = null;
+    this.usage = undefined;
     this.stoppedForTools = false;
     this.calls = 0;
     this.startsAllowed = 1;

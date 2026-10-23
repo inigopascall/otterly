@@ -164,7 +164,7 @@ describe("R8 two parallel native tool calls", () => {
     expect(JSON.parse(calls[1].argumentsJson)).toEqual({ subagentId: "code-runner", prompt: 'Run "ls"' });
 
     const stopAt = events.findIndex((e) => e.type === "turn_stop");
-    expect(events[stopAt]).toEqual({ type: "turn_stop", stopReason: "tool_use" });
+    expect(events[stopAt]).toEqual({ type: "turn_stop", stopReason: "tool_use", usage: { output_tokens: 99 }, unfinishedCalls: [] });
     expect(stopAt).toBeGreaterThan(events.indexOf(calls[1]));
     expect(events.at(-1)).toEqual({ type: "result", text: "", cost: 0.0123, duration: 2100, sessionId: "session-1", usage: USAGE });
     expect(events.some((e) => e.type === "error")).toBe(false);
@@ -256,7 +256,7 @@ describe("R11 a text-only native turn", () => {
     const events = await drain(new ClaudeEngine({}, queryOf(textTurn())).stream("p", NATIVE));
     expect(deltasOf(events, "text_delta")).toEqual(["Hello", " there."]);
     expect(callsOf(events)).toHaveLength(0);
-    expect(events.find((e) => e.type === "turn_stop")).toEqual({ type: "turn_stop", stopReason: "end_turn" });
+    expect(events.find((e) => e.type === "turn_stop")).toEqual({ type: "turn_stop", stopReason: "end_turn", usage: { output_tokens: 99 }, unfinishedCalls: [] });
     expect(events.at(-1)).toMatchObject({ type: "result", text: "Hello there." });
     expect(events.some((e) => e.type === "error")).toBe(false);
   });
@@ -308,7 +308,7 @@ describe("N1 a CLI API retry after a first attempt cut short", () => {
     const calls = callsOf(events);
     expect(calls).toEqual([{ type: "client_tool_call", index: 0, id: "toolu_b", name: "mcp__c__run_task", argumentsJson: '{"subagentId": "code-runner"}' }]);
     expect(events.indexOf(calls[0])).toBeGreaterThan(retryAt);
-    expect(events.at(-2)).toEqual({ type: "turn_stop", stopReason: "tool_use" });
+    expect(events.at(-2)).toEqual({ type: "turn_stop", stopReason: "tool_use", usage: { output_tokens: 99 }, unfinishedCalls: [] });
     expect(events.at(-1)).toEqual({ type: "result", text: "", cost: 0.0123, duration: 2100, sessionId: "session-1", usage: USAGE });
     expect(events.some((e) => e.type === "error")).toBe(false);
   });
@@ -330,7 +330,7 @@ describe("N3 a call left open by a CLI API retry", () => {
     const events = await drain(new ClaudeEngine({}, queryOf(lines)).stream("p", NATIVE));
     expect(callsOf(events)).toEqual([]);
     expect(retriesOf(events)).toEqual([{ type: "turn_retry", attempt: 1 }]);
-    expect(events.find((e) => e.type === "turn_stop")).toEqual({ type: "turn_stop", stopReason: "end_turn" });
+    expect(events.find((e) => e.type === "turn_stop")).toEqual({ type: "turn_stop", stopReason: "end_turn", usage: { output_tokens: 99 }, unfinishedCalls: [] });
     expect(events.at(-1)).toMatchObject({ type: "result", text: "Done." });
     expect(events.some((e) => e.type === "error")).toBe(false);
   });
@@ -362,4 +362,50 @@ describe("N7 the safety signals are still TOOL_ISOLATION", () => {
   const serverTool = (): Line => blockStart(0, { type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: {} });
   const cases: Array<[string, Line[]]> = [["a failed init check", [badInit(), messageStart()]], ["a failed init check after an api_retry", [apiRetry(1), badInit(), messageStart()]], ["a tool_result with is_error false", [init(), messageStart(), ...notRefused()]], ["a tool_result with is_error false after an api_retry", [init(), ...cutAttempt(), apiRetry(1), messageStart(), ...notRefused()]], ["a server_tool_use block", [init(), messageStart(), serverTool()]], ["a server_tool_use block after an api_retry", [init(), ...cutAttempt(), apiRetry(1), messageStart(), serverTool()]]];
   it.each(cases)("throws TOOL_ISOLATION and aborts the run for %s", async (_label, lines) => { await expectAborted([...lines, messageDelta("end_turn"), messageStop()], "TOOL_ISOLATION"); });
+});
+
+// A reply cut off at its output limit, in the shape of a real run: four
+// finished calls, a fifth left open, then message_delta max_tokens with the
+// run's usage, message_stop, and a result line with is_error set.
+const LIMIT_USAGE = {
+  input_tokens: 3,
+  cache_creation_input_tokens: 2048,
+  cache_read_input_tokens: 90000,
+  output_tokens: 128000,
+  output_tokens_details: { thinking_tokens: 116304 },
+};
+
+describe("O1 a reply cut off at its output limit", () => {
+  it("yields turn_stop max_tokens with the message_delta usage and the unfinished call, after the four finished calls", async () => {
+    const names = ["mcp__c__read_files", "mcp__c__run_task", "mcp__c__read_files", "mcp__c__run_task"];
+    const lines: Line[] = [init(), messageStart(), blockStart(0, { type: "thinking", thinking: "" }), thinkingDelta(0, "Thinking at length."), blockStop(0)];
+    names.forEach((name, k) => {
+      const i = k + 1;
+      const id = `toolu_${i}`;
+      lines.push(
+        toolStart(i, id, name),
+        jsonDelta(i, '{"paths": ["/a"]}'),
+        assistantToolUse(id, name, { paths: ["/a"] }),
+        { type: "system", subtype: "permission_denied", tool_name: name, tool_use_id: id, session_id: "session-1" },
+        blockStop(i),
+        toolResult(id, true),
+      );
+    });
+    lines.push(
+      toolStart(5, "toolu_5", "mcp__c__read_files"),
+      jsonDelta(5, '{"paths": ["/b'),
+      se({ type: "message_delta", delta: { stop_reason: "max_tokens", stop_sequence: null }, usage: LIMIT_USAGE }),
+      messageStop(),
+      { type: "rate_limit_event", rate_limit_info: { status: "allowed" } },
+      { type: "result", subtype: "error_max_turns", is_error: true, stop_reason: "max_tokens", session_id: "session-1", total_cost_usd: 1, duration_ms: 1, usage: LIMIT_USAGE },
+    );
+    const events: AgentEvent[] = [];
+    for await (const e of new ClaudeEngine({}, queryOf(lines)).stream("p", NATIVE)) {
+      events.push(e);
+      if (e.type === "turn_stop" && e.stopReason === "max_tokens") break;
+    }
+    expect(events.at(-1)).toEqual({ type: "turn_stop", stopReason: "max_tokens", usage: LIMIT_USAGE, unfinishedCalls: ["mcp__c__read_files"] });
+    expect(callsOf(events).map((c) => c.id)).toEqual(["toolu_1", "toolu_2", "toolu_3", "toolu_4"]);
+    expect(events.some((e) => e.type === "error")).toBe(false);
+  });
 });

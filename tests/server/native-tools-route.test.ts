@@ -3,6 +3,7 @@ import http from "http";
 import { existsSync, readFileSync, appendFileSync } from "fs";
 import { basename, dirname } from "path";
 import { AgentError } from "../../src/errors.js";
+import { requestFingerprint, recordFailure, failedAttempts } from "../../src/server/retry-notice.js";
 
 const state = vi.hoisted(() => ({
   script: null as any,
@@ -67,6 +68,40 @@ function expectDropped(r: Reply): void {
     expect(r.status).toBe(200);
     expect(r.complete).toBe(false);
   }
+}
+
+/** A non-streamed POST: its status and parsed body. */
+function postJson(base: string, body: unknown): Promise<{ status: number; body: any }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(new URL("/v1/chat/completions", base), {
+      method: "POST", agent: false, headers: { "Content-Type": "application/json" },
+    }, (res) => {
+      const parts: Buffer[] = [];
+      res.on("data", (c) => parts.push(c));
+      res.on("end", () => {
+        const raw = Buffer.concat(parts).toString();
+        let parsed: any;
+        try { parsed = JSON.parse(raw); } catch { parsed = raw; }
+        resolve({ status: res.statusCode!, body: parsed });
+      });
+    });
+    req.on("error", reject);
+    req.end(JSON.stringify(body));
+  });
+}
+
+/** A streamed POST whose client hangs up as soon as the first chunk arrives. */
+function postAndHangUp(base: string, body: unknown): Promise<void> {
+  return new Promise((resolve) => {
+    const req = http.request(new URL("/v1/chat/completions", base), {
+      method: "POST", agent: false, headers: { "Content-Type": "application/json" },
+    }, (res) => {
+      res.on("error", () => { /* the hang-up itself */ });
+      res.once("data", () => { req.destroy(); resolve(); });
+    });
+    req.on("error", () => resolve());
+    req.end(JSON.stringify(body));
+  });
 }
 
 const isReasoning = (c: any) => c.choices?.[0]?.delta?.reasoning_content !== undefined;
@@ -283,7 +318,7 @@ describe("R16 the per-request directory", () => {
 
   it("no longer exists after a dropped request", async () => {
     lastDir = "";
-    state.script = seq([call(0, "mcp__c__get_weather", '{"city":"Rome"}'), stop("max_tokens"), result()]);
+    state.script = seq([call(0, "mcp__c__get_weather", '["Rome"]'), stop("tool_use"), result()]);
     const r = await postStream(nativeBase, body("R16 dropped"));
     expectDropped(r);
     expect(lastDir).not.toBe("");
@@ -337,10 +372,14 @@ describe("R18 arguments that are not a JSON object", () => {
 });
 
 describe("R19 calls followed by a stop that is not tool_use", () => {
-  it("drops the stream when the turn stopped with max_tokens", async () => {
+  it("ends with finish_reason length and sends no tool call when the turn stopped with max_tokens", async () => {
     state.script = seq([call(0, "mcp__c__get_weather", '{"city":"Rome"}'), stop("max_tokens"), result()]);
     const r = await postStream(nativeBase, body("R19"));
-    expectDropped(r);
+    expect(r.done).toBe(true);
+    expect(r.complete).toBe(true);
+    expect(r.chunks.some(isTool)).toBe(false);
+    expect(r.chunks.some((c) => c.error)).toBe(false);
+    expect(r.chunks.at(-1).choices[0].finish_reason).toBe("length");
   });
 });
 
@@ -534,5 +573,187 @@ describe("N12 TOOL_ISOLATION from the engine after a CLI API retry", () => {
     expect(r.raw.indexOf('"code":502')).toBeLessThan(r.raw.indexOf("data: [DONE]"));
     expect(r.chunks.some(isTool)).toBe(false);
     expect(await gone(lastDir)).toBe(true);
+  });
+});
+
+const failing = () => seq([call(0, "mcp__c__get_weather", '["Rome"]'), stop("tool_use"), result()]);
+const succeeding = () => seq([call(0, "mcp__c__get_weather", '{"city":"Rome"}'), stop("tool_use"), result()]);
+const BAD_ARGS = "requested a tool with arguments that are not a JSON object";
+const errorOf = (r: Reply) => r.chunks.find((c) => c.error)?.error;
+
+describe("C1 the retry cap", () => {
+  it("drops the first failure, ends the identical second with an in-stream error naming both reasons, and refuses the third without running it", async () => {
+    state.script = failing();
+    const b = body("C1 cap");
+    expectDropped(await postStream(nativeBase, b));
+
+    const second = await postStream(nativeBase, b);
+    expect(second.status).toBe(200);
+    expect(second.done).toBe(true);
+    expect(second.complete).toBe(true);
+    expect(second.chunks.some(isTool)).toBe(false);
+    const capped = errorOf(second);
+    expect(capped.code).toBe(502);
+    expect(capped.message).toBe(
+      `Otterly stopped this request after 2 failed attempts. This attempt: ${BAD_ARGS}. The previous attempt: ${BAD_ARGS}. ` +
+      "Nothing was run, and the request was not retried again; sending a new message continues.",
+    );
+    expect(second.raw.indexOf('{"error"')).toBeLessThan(second.raw.indexOf("data: [DONE]"));
+
+    state.seen.length = 0;
+    const third = await postStream(nativeBase, b);
+    expect(third.status).toBe(200);
+    expect(third.done).toBe(true);
+    const refused = errorOf(third);
+    expect(refused.code).toBe(400);
+    expect(refused.message).toBe(
+      `Otterly did not run this request: the identical request failed 2 times recently (last failure: ${BAD_ARGS}). ` +
+      "It is not retried automatically. Sending a new message, or any change to the request, runs it.",
+    );
+    expect(state.seen).toHaveLength(0);
+  });
+});
+
+describe("C2 a success clears the record", () => {
+  it("drops the identical request again after a success in between, rather than capping it", async () => {
+    let n = 0;
+    state.script = (p: unknown, o: unknown) => (++n === 2 ? succeeding() : failing())(p, o);
+    const b = body("C2 success resets");
+    expectDropped(await postStream(nativeBase, b));
+    const second = await postStream(nativeBase, b);
+    expect(second.done).toBe(true);
+    expect(second.chunks.at(-1).choices[0].finish_reason).toBe("tool_calls");
+    const third = await postStream(nativeBase, b);
+    expectDropped(third);
+    expect(third.chunks.some((c) => c.error)).toBe(false);
+  });
+});
+
+describe("C3 a client that hangs up", () => {
+  it("does not count as a failed attempt", async () => {
+    let n = 0;
+    state.script = (p: unknown, o: any) => {
+      n++;
+      if (n !== 2) return failing()(p, o);
+      return (async function* () {
+        noteDir(o);
+        yield { type: "thinking_delta", delta: "Thinking." };
+        await new Promise<void>((resolve) => {
+          if (o.signal.aborted) resolve();
+          else o.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      })();
+    };
+    const b = body("C3 disconnect");
+    expectDropped(await postStream(nativeBase, b));
+    expect(failedAttempts(requestFingerprint(b))).toBe(1);
+
+    lastDir = "";
+    await postAndHangUp(nativeBase, b);
+    // The server has finished with the request once its directory is gone.
+    for (let i = 0; i < 100 && lastDir === ""; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(lastDir).not.toBe("");
+    expect(await gone(lastDir)).toBe(true);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(failedAttempts(requestFingerprint(b))).toBe(1);
+
+    // Still one failure: the next identical request runs, and is capped.
+    state.seen.length = 0;
+    const third = await postStream(nativeBase, b);
+    expect(state.seen).toHaveLength(1);
+    expect(errorOf(third).code).toBe(502);
+  });
+});
+
+const cutOff = (usage: Record<string, unknown>, unfinishedCalls: string[] = []) => ({ type: "turn_stop", stopReason: "max_tokens", usage, unfinishedCalls });
+const LIMIT_USAGE = { input_tokens: 5, output_tokens: 128000, output_tokens_details: { thinking_tokens: 116304 } };
+
+describe("C4 a reply cut off at its output limit", () => {
+  it("with calls: sends no tool call, ends the content with the note, then length with usage and [DONE], and reads nothing after the stop", async () => {
+    let afterStop = false;
+    state.script = async function* (_p: unknown, options: any) {
+      noteDir(options);
+      yield { type: "thinking_delta", delta: "Planning a lot." };
+      yield call(0, "mcp__c__get_weather", '{"city":"Rome"}');
+      yield cutOff(LIMIT_USAGE, ["mcp__c__read_files"]);
+      afterStop = true;
+      yield result();
+    };
+    const r = await postStream(nativeBase, body("C4 calls"));
+    expect(r.status).toBe(200);
+    expect(r.done).toBe(true);
+    expect(r.complete).toBe(true);
+    expect(r.chunks.some(isTool)).toBe(false);
+    expect(r.chunks.some((c) => c.error)).toBe(false);
+    expect(contentOf(r.chunks).join("")).toBe(
+      "⚠️ Otterly: Claude's reply reached its output limit (128,000 output tokens, 116,304 of them thinking) and was stopped there. " +
+      "The 2 tool calls it was writing (get_weather, read_files) were discarded, and nothing was run. " +
+      "Otterly did not retry it, because the same request would stop the same way. " +
+      "Ask for the work in smaller steps, or lower the reasoning effort.",
+    );
+    const last = r.chunks.at(-1);
+    expect(last.choices[0].finish_reason).toBe("length");
+    expect(last.usage).toMatchObject({ prompt_tokens: 5, completion_tokens: 128000, total_tokens: 128005 });
+    expect(r.raw.trimEnd().endsWith("data: [DONE]")).toBe(true);
+    expect(afterStop).toBe(false);
+  });
+
+  it("with text only: keeps the text, then the note, then length", async () => {
+    state.script = seq([{ type: "text_delta", delta: "Here is the first half" }, cutOff({ output_tokens: 128000 }), result()]);
+    const r = await postStream(nativeBase, body("C4 text"));
+    expect(r.done).toBe(true);
+    const content = contentOf(r.chunks).join("");
+    expect(content.startsWith(
+      "Here is the first half\n\n⚠️ Otterly: Claude's reply reached its output limit (128,000 output tokens) and was stopped there. The reply above is incomplete.",
+    )).toBe(true);
+    expect(r.chunks.some(isTool)).toBe(false);
+    expect(r.chunks.at(-1).choices[0].finish_reason).toBe("length");
+  });
+
+  it("while thinking only: the thinking note, then length", async () => {
+    state.script = seq([{ type: "thinking_delta", delta: "Thinking." }, cutOff({ output_tokens: 128000, output_tokens_details: { thinking_tokens: 128000 } }), result()]);
+    const r = await postStream(nativeBase, body("C4 thinking"));
+    expect(r.done).toBe(true);
+    const content = contentOf(r.chunks).join("");
+    expect(content.startsWith("⚠️ Otterly: Claude's reply reached its output limit (128,000 output tokens, 128,000 of them thinking)")).toBe(true);
+    expect(content).toContain("It spent the whole limit thinking and wrote nothing else.");
+    expect(r.chunks.at(-1).choices[0].finish_reason).toBe("length");
+  });
+
+  it("is never retried: it clears the record, so the identical request after it runs normally, with no retry notice", async () => {
+    let n = 0;
+    state.script = (p: unknown, o: unknown) => {
+      n++;
+      if (n === 1) return failing()(p, o);
+      if (n === 2) return seq([{ type: "text_delta", delta: "Partial" }, cutOff({ output_tokens: 128000 }), result()])(p, o);
+      return succeeding()(p, o);
+    };
+    const b = body("C4 not retried");
+    expectDropped(await postStream(nativeBase, b));
+    const second = await postStream(nativeBase, b);
+    expect(second.done).toBe(true);
+    expect(second.chunks.some((c) => c.error)).toBe(false);
+    expect(second.chunks.at(-1).choices[0].finish_reason).toBe("length");
+    expect(failedAttempts(requestFingerprint(b))).toBe(0);
+    const third = await postStream(nativeBase, b);
+    expect(third.done).toBe(true);
+    expect(third.chunks.at(-1).choices[0].finish_reason).toBe("tool_calls");
+    expect(reasoningOf(third.chunks).some((t) => t.includes("previous attempt"))).toBe(false);
+  });
+});
+
+describe("C5 a non-streamed request whose identical request failed twice", () => {
+  it("gets HTTP 400 and is not run", async () => {
+    const b = body("C5 non-streamed", { stream: false });
+    const fp = requestFingerprint(b);
+    recordFailure(fp, "failed with HTTP 502");
+    recordFailure(fp, "failed with HTTP 502");
+    state.seen.length = 0;
+    const r = await postJson(nativeBase, b);
+    expect(r.status).toBe(400);
+    expect(r.body.error.code).toBe(400);
+    expect(r.body.error.message).toContain("Otterly did not run this request");
+    expect(r.body.error.message).toContain("failed with HTTP 502");
+    expect(state.seen).toHaveLength(0);
   });
 });

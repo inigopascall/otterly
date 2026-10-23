@@ -25,6 +25,7 @@ import { RequestQueue, QueueFullError, QueueTimeoutError } from "./request-queue
 import { checkAuth, RateLimiter, sendAuthError, sendRateLimitError } from "./middleware.js";
 import { generateRequestId, logRequest, logResponse, logError, log } from "./logger.js";
 import { settleResponse } from "./settle.js";
+import { requestFingerprint, settleAttempt } from "./retry-notice.js";
 import { startTraceRetention } from "./trace.js";
 import { verifyNativeClientTools } from "./native-tools.js";
 import { AgentError } from "../errors.js";
@@ -377,6 +378,8 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
     // Attach requestId and timing context for route handlers
     parsed.requestId = requestId;
     parsed.startTime = startTime;
+    // The attempt ledger (retry-notice.ts) knows a chat completion by its fingerprint.
+    if (isOpenai) parsed.fingerprint = requestFingerprint(parsed.body);
 
     // Determine if streaming (affects timeout). Ollama defaults stream to true.
     const isOllamaInfer = path === "/api/chat" || path === "/api/generate";
@@ -417,6 +420,8 @@ export async function startApiServer(opts: ApiServerOptions = {}): Promise<ApiSe
             : outcome === "dropped_for_retry" ? 502
             : res.statusCode || 200;
           logResponse(requestId, req.method!, path, endStatus, Date.now() - startTime, outcome);
+          // Count a failed attempt of this request, or clear its record after a success.
+          if (parsed.fingerprint) settleAttempt(parsed.fingerprint, res, outcome);
           if (inFlight === 0 && drainResolve) drainResolve();
         }
       });

@@ -142,10 +142,15 @@ export interface ClientToolCallEvent {
   argumentsJson: string;
 }
 
-/** The end of the model's message in a native client-tool run, with its stop reason. */
+/** The end of the model's message in a native client-tool run, with its stop
+ *  reason. `usage` is the usage its message_delta reported, if any;
+ *  `unfinishedCalls` names, as the CLI named them, the calls the message
+ *  started and did not finish. */
 export interface TurnStopEvent {
   type: "turn_stop";
   stopReason: string | null;
+  usage?: Record<string, unknown>;
+  unfinishedCalls?: string[];
 }
 
 /** In a native client-tool run, the CLI retried a failed API request by

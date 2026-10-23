@@ -6,7 +6,7 @@ import type { ServerResponse } from "http";
 import crypto from "crypto";
 import { AgentError } from "../errors.js";
 import { EFFORT_LEVELS, CliTerminatedError, CliUsageLimitError, getIdleTimeoutMs } from "../engine.js";
-import type { ClientToolCallEvent, EngineOptions } from "../types.js";
+import type { ClientToolCallEvent, EngineOptions, TurnStopEvent } from "../types.js";
 import type { ParsedRequest, ServerContext } from "./routes-native.js";
 import { apiSessions } from "./session-store.js";
 import type { CircuitBreaker } from "./circuit-breaker.js";
@@ -34,7 +34,16 @@ import { repairToolCalls, looksLikeToolCallIntent } from "./tool-call-repair.js"
 import { traceEnabled, traceWrite, traceDir } from "./trace.js";
 import { SseStream, sseWrite } from "./sse-stream.js";
 import { ToolCallStreamer, reconcileStreamedCalls, type StreamAction } from "./tool-call-stream.js";
-import { requestFingerprint, recordDrop, retryNotice, clearDrop, dropCount } from "./retry-notice.js";
+import {
+  requestFingerprint,
+  retryNotice,
+  failedAttempts,
+  lastFailure,
+  noteAttempt,
+  markFailure,
+  markRefused,
+  MAX_ATTEMPTS,
+} from "./retry-notice.js";
 import {
   NATIVE_SERVER_NAME,
   NATIVE_TOOL_PREFIX,
@@ -79,6 +88,7 @@ async function respondTimeout(
   timeout: AgentError,
 ): Promise<void> {
   const status = 504;
+  markFailure(res, "timed out");
   log("error", {
     requestId: req.requestId || "",
     message: "request_timeout",
@@ -102,6 +112,46 @@ async function respondTimeout(
 /** A fresh OpenAI tool-call id. */
 function newToolCallId(): string {
   return `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+}
+
+/** A reason or message as a clause: trimmed, without its closing full stop. */
+function clause(text: string): string {
+  return text.trim().replace(/\.+$/, "");
+}
+
+/** A token count for people, e.g. 128,000. */
+function tokenCount(n: number): string {
+  return n.toLocaleString("en-US");
+}
+
+/**
+ * The note that ends a native reply cut off at its output limit. The model
+ * reads it in its history, so it says what was lost and what to do instead.
+ * `calls` names the tool calls the reply was writing, as the CLI named them.
+ */
+function outputLimitNote(calls: string[], textSent: boolean, outputTokens?: number, thinkingTokens?: number): string {
+  const figures = outputTokens === undefined ? ""
+    : thinkingTokens === undefined ? ` (${tokenCount(outputTokens)} output tokens)`
+    : ` (${tokenCount(outputTokens)} output tokens, ${tokenCount(thinkingTokens)} of them thinking)`;
+  let lost: string;
+  if (calls.length > 0) {
+    const counts = new Map<string, number>();
+    for (const name of calls) {
+      const short = name.startsWith(NATIVE_TOOL_PREFIX) ? name.slice(NATIVE_TOOL_PREFIX.length) : name;
+      counts.set(short, (counts.get(short) ?? 0) + 1);
+    }
+    const list = [...counts].map(([name, n]) => (n > 1 ? `${name} ×${n}` : name)).join(", ");
+    lost = calls.length === 1
+      ? `The tool call it was writing (${list}) was discarded, and nothing was run.`
+      : `The ${calls.length} tool calls it was writing (${list}) were discarded, and nothing was run.`;
+  } else if (textSent) {
+    lost = "The reply above is incomplete.";
+  } else {
+    lost = "It spent the whole limit thinking and wrote nothing else.";
+  }
+  return `${textSent ? "\n\n" : ""}⚠️ Otterly: Claude's reply reached its output limit${figures} and was stopped there. ${lost} ` +
+    "Otterly did not retry it, because the same request would stop the same way. " +
+    "Ask for the work in smaller steps, or lower the reasoning effort.";
 }
 
 /** Input and output token counts from an engine's usage object, for metrics. */
@@ -163,18 +213,53 @@ function classifyStreamFailure(err: unknown, signal: AbortSignal): StreamFailure
 /**
  * Cut an open stream so that the client re-sends the request. AiderDesk, like
  * any client on the AI SDK, retries a dropped connection and discards the
- * partial reply; it does not retry an HTTP error or an in-stream error. The
- * drop is recorded so that the retry opens with a notice saying why.
+ * partial reply; it does not retry an HTTP error or an in-stream error.
+ *
+ * Only one retry is allowed. When an earlier attempt of the identical request
+ * already failed (the attempt ledger, retry-notice.ts), the stream ends with
+ * an in-stream error naming both failures instead: a failure that repeats on
+ * every run would otherwise be retried for ever. The ledger itself is written
+ * when the response has ended (settleAttempt), not here; the retry then opens
+ * with a notice saying why.
  */
-function dropForRetry(
+async function dropForRetry(
   req: ParsedRequest,
   out: SseStream,
   fingerprint: string,
   reason: string,
   startedAt: number,
   detail: Record<string, unknown> = {},
-): void {
-  recordDrop(fingerprint, reason);
+): Promise<void> {
+  const failedBefore = failedAttempts(fingerprint);
+  if (failedBefore + 1 >= MAX_ATTEMPTS) {
+    const previous = lastFailure(fingerprint) ?? "failed";
+    log("warn", {
+      requestId: req.requestId || "",
+      message: "retry_cap_reached",
+      reason,
+      previousReason: previous,
+      attempt: failedBefore + 1,
+      fingerprint: fingerprint.slice(0, 12),
+      durationMs: Date.now() - startedAt,
+      ...detail,
+    });
+    metrics.record({
+      ts: Date.now(), endpoint: "chat", status: 502,
+      durationMs: Date.now() - startedAt,
+      cost: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0,
+      error: `dropped for retry: ${reason}`,
+    });
+    const status = 502;
+    markFailure(out.response, reason);
+    await out.fail(
+      `Otterly stopped this request after ${failedBefore + 1} failed attempts. ` +
+      `This attempt: ${clause(reason)}. The previous attempt: ${clause(previous)}. ` +
+      "Nothing was run, and the request was not retried again; sending a new message continues.",
+      openaiErrorBody(status, "").error.type,
+      status,
+    );
+    return;
+  }
   log("warn", {
     requestId: req.requestId || "",
     message: "stream_dropped_for_retry",
@@ -189,7 +274,7 @@ function dropForRetry(
     cost: 0, inputTokens: 0, outputTokens: 0, toolCalls: 0,
     error: `dropped for retry: ${reason}`,
   });
-  out.drop();
+  out.drop(reason);
 }
 
 /** Answer a failure on an open stream as classifyStreamFailure decides. */
@@ -208,7 +293,7 @@ async function failStream(
       out.close();
       return;
     case "retry":
-      dropForRetry(req, out, fingerprint, failure.reason, startedAt);
+      await dropForRetry(req, out, fingerprint, failure.reason, startedAt);
       return;
     case "timeout":
       await respondTimeout(req, out.response, startedAt, failure.timeout);
@@ -228,6 +313,42 @@ async function failStream(
       return;
     }
   }
+}
+
+/**
+ * Answer, without running it, a request whose identical request failed
+ * MAX_ATTEMPTS times recently: an in-stream error for a streamed request,
+ * HTTP 400 otherwise. Clients retry neither, and neither counts as a failure
+ * of the request or of the service.
+ */
+async function refuseRepeatedFailure(
+  req: ParsedRequest,
+  res: ServerResponse,
+  body: OpenAIChatRequest,
+  fingerprint: string,
+  stream: boolean,
+): Promise<void> {
+  const last = lastFailure(fingerprint) ?? "failed";
+  const message =
+    `Otterly did not run this request: the identical request failed ${failedAttempts(fingerprint)} times recently ` +
+    `(last failure: ${clause(last)}). It is not retried automatically. ` +
+    "Sending a new message, or any change to the request, runs it.";
+  log("warn", {
+    requestId: req.requestId || "",
+    message: "request_refused_after_failures",
+    fingerprint: fingerprint.slice(0, 12),
+    lastReason: last,
+  });
+  const status = 400;
+  if (stream) {
+    const out = new SseStream(res, body.model || getDefaultModel(), req.requestId || "");
+    await out.start();
+    await out.fail(message, openaiErrorBody(status, "").error.type, status);
+  } else {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(openaiErrorBody(status, message)));
+  }
+  markRefused(res);
 }
 
 /**
@@ -259,17 +380,25 @@ export async function handleChatCompletions(
     effort = mapped;
   }
 
-  const { prompt, systemPrompt, isMultimodal } = openaiToClaudeInput(body);
-  const model = body.model || getDefaultModel();
+  const fingerprint = req.fingerprint ?? requestFingerprint(body);
   const stream = body.stream === true;
-  const fingerprint = requestFingerprint(body);
   // Links a retry to the attempt it repeats: both carry the same fingerprint.
   log("info", {
     requestId: req.requestId || "",
     message: "request_fingerprint",
     fingerprint: fingerprint.slice(0, 12),
-    attempt: dropCount(fingerprint) + 1,
+    attempt: failedAttempts(fingerprint) + 1,
   });
+  // The identical request failed MAX_ATTEMPTS times recently: it is not run
+  // again until a run succeeds, its record expires or the request changes.
+  if (failedAttempts(fingerprint) >= MAX_ATTEMPTS) {
+    await refuseRepeatedFailure(req, res, body, fingerprint, stream);
+    return;
+  }
+  noteAttempt(fingerprint);
+
+  const { prompt, systemPrompt, isMultimodal } = openaiToClaudeInput(body);
+  const model = body.model || getDefaultModel();
 
   const abortController = new AbortController();
   // A client that hangs up and a server deadline both cancel the run, and the
@@ -668,7 +797,6 @@ async function handleFunctionCallingStream(
   const calls = parsed ?? repaired?.calls ?? null;
 
   const complete = async (reason: "stop" | "tool_calls", toolCalls: number): Promise<void> => {
-    clearDrop(fingerprint);
     traceWrite(requestId, "stream-sent.txt", out.sentText);
     traceWrite(requestId, "stream-reasoning.txt", out.sentReasoning);
     logDiag("info", {
@@ -697,7 +825,7 @@ async function handleFunctionCallingStream(
     const reconciled = reconcileStreamedCalls(streamer.sentCalls, calls);
     if (!reconciled.ok) {
       traceWrite(requestId, "unparseable-tool-call.txt", text);
-      dropForRetry(req, out, fingerprint, `streamed a tool call that the finished reply did not confirm (${reconciled.why})`, startedAt, {
+      await dropForRetry(req, out, fingerprint, `streamed a tool call that the finished reply did not confirm (${reconciled.why})`, startedAt, {
         textLength: text.length,
       });
       return;
@@ -745,7 +873,7 @@ async function handleFunctionCallingStream(
       intent: describeToolCallIntent(text, toolNames),
       parseDiag: diag,
     });
-    dropForRetry(req, out, fingerprint, "requested a tool in a form Otterly could not parse into OpenAI tool_calls", startedAt, {
+    await dropForRetry(req, out, fingerprint, "requested a tool in a form Otterly could not parse into OpenAI tool_calls", startedAt, {
       textLength: text.length,
     });
     return;
@@ -778,7 +906,11 @@ async function handleFunctionCallingStream(
  * A call that reached the placeholder server ends the stream with an in-stream
  * error and sends no tool call. A turn that stopped before its calls were
  * complete, arguments that are not a JSON object, and a text reply showing
- * tool-call intent are dropped, so that the client retries.
+ * tool-call intent are dropped, so that the client retries (once; see
+ * dropForRetry). A reply that reached its output limit (stop_reason
+ * max_tokens) is never retried: the CLI is stopped at once, every call of the
+ * turn is discarded, and the response ends with finish_reason "length" and a
+ * note (outputLimitNote).
  */
 async function handleNativeToolStream(
   req: ParsedRequest,
@@ -830,6 +962,7 @@ async function handleNativeToolStream(
     let stopReason: string | null = null;
     let usage: unknown;
     let cost = 0;
+    let cutOff: TurnStopEvent | null = null;
     try {
       for await (const event of engine.stream(prompt, options)) {
         if (abortController.signal.aborted) break;
@@ -848,13 +981,20 @@ async function handleNativeToolStream(
           calls.push(event);
         } else if (event.type === "turn_stop") {
           stopReason = event.stopReason;
+          // The reply reached its output limit. Leaving the loop stops the CLI
+          // and waits for it to exit, so its own recovery (asking the model to
+          // continue) never starts, and nothing after this line is read.
+          if (event.stopReason === "max_tokens") {
+            cutOff = event;
+            break;
+          }
         } else if (event.type === "turn_retry") {
           // The CLI retried a failed API request. A reply already started
           // cannot be taken back, so the client retries the whole request;
           // otherwise the failed attempt's calls are discarded.
           if (out.sentText) {
             abortController.abort();
-            dropForRetry(req, out, fingerprint, "was interrupted by an Anthropic API retry after its reply had started", startedAt, { attempt: event.attempt });
+            await dropForRetry(req, out, fingerprint, "was interrupted by an Anthropic API retry after its reply had started", startedAt, { attempt: event.attempt });
             return;
           }
           calls.length = 0;
@@ -912,8 +1052,7 @@ async function handleNativeToolStream(
     }
     traceWrite(requestId, "engine-text.txt", text);
 
-    const complete = async (reason: "stop" | "tool_calls", toolCalls: number): Promise<void> => {
-      clearDrop(fingerprint);
+    const complete = async (reason: "stop" | "tool_calls" | "length", toolCalls: number): Promise<void> => {
       traceWrite(requestId, "stream-sent.txt", out.sentText);
       traceWrite(requestId, "stream-reasoning.txt", out.sentReasoning);
       metrics.record({
@@ -925,6 +1064,31 @@ async function handleNativeToolStream(
       });
       await out.finish(reason, toOpenAIUsage(usage));
     };
+
+    // A reply cut off at its output limit ends with "length": the client keeps
+    // the text and stops, and does not re-send a request that would stop the
+    // same way. Every call of the turn, complete or not, is discarded.
+    if (cutOff) {
+      const u = cutOff.usage ?? {};
+      const details = u.output_tokens_details && typeof u.output_tokens_details === "object"
+        ? u.output_tokens_details as Record<string, unknown>
+        : {};
+      const outputTokens = typeof u.output_tokens === "number" ? u.output_tokens : undefined;
+      const thinkingTokens = typeof details.thinking_tokens === "number" ? details.thinking_tokens : undefined;
+      const discarded = [...calls.map((c) => c.name), ...(cutOff.unfinishedCalls ?? [])];
+      log("warn", {
+        requestId,
+        message: "native_output_limit",
+        outputTokens: outputTokens ?? null,
+        thinkingTokens: thinkingTokens ?? null,
+        tools: discarded,
+        textChars: out.sentText.length,
+      });
+      await out.text(outputLimitNote(discarded, out.sentText.length > 0, outputTokens, thinkingTokens));
+      if (cutOff.usage) usage = cutOff.usage;
+      await complete("length", 0);
+      return;
+    }
 
     if (calls.length > 0) {
       // Each call: its arguments as streamed, its name as the client knows it,
@@ -953,11 +1117,11 @@ async function handleNativeToolStream(
       })), null, 2));
 
       if (stopReason !== "tool_use") {
-        dropForRetry(req, out, fingerprint, "stopped before its tool request was complete", startedAt, { stopReason });
+        await dropForRetry(req, out, fingerprint, "stopped before its tool request was complete", startedAt, { stopReason });
         return;
       }
       if (resolved.some((r) => !r.isObject)) {
-        dropForRetry(req, out, fingerprint, "requested a tool with arguments that are not a JSON object", startedAt);
+        await dropForRetry(req, out, fingerprint, "requested a tool with arguments that are not a JSON object", startedAt);
         return;
       }
       for (const r of resolved) {
@@ -986,7 +1150,7 @@ async function handleNativeToolStream(
       // Terse line on the console: this is a genuine failure and should be
       // visible without tracing turned on.
       log("error", { requestId, message: "tool_call_unparseable", textLength: text.length });
-      dropForRetry(req, out, fingerprint, "requested a tool in a form Otterly could not parse into OpenAI tool_calls", startedAt, {
+      await dropForRetry(req, out, fingerprint, "requested a tool in a form Otterly could not parse into OpenAI tool_calls", startedAt, {
         textLength: text.length,
       });
       return;
@@ -1198,7 +1362,6 @@ async function handleStreaming(
   }
 
   circuitBreaker?.onSuccess();
-  clearDrop(fingerprint);
   traceWrite(requestId, "stream-sent.txt", out.sentText);
   traceWrite(requestId, "stream-reasoning.txt", out.sentReasoning);
   logDiag("info", {

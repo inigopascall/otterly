@@ -7,6 +7,7 @@ import type { ServerResponse } from "http";
 import crypto from "crypto";
 import { makeStreamChunk, sseData, type OpenAIStreamDelta, type OpenAIUsage } from "./openai-compat.js";
 import { traceAppend } from "./trace.js";
+import { markFailure } from "./retry-notice.js";
 
 /** A keepalive comment is sent after this long without any other write. */
 export const KEEPALIVE_MS = 5000;
@@ -105,13 +106,18 @@ export class SseStream {
   }
 
   /** The final chunk, then `[DONE]`. */
-  async finish(reason: "stop" | "tool_calls", usage?: OpenAIUsage): Promise<void> {
+  async finish(reason: "stop" | "tool_calls" | "length", usage?: OpenAIUsage): Promise<void> {
     await this.send({}, reason, usage);
     await this.done();
   }
 
-  /** An in-stream error, then `[DONE]`. Clients stop on it; they do not retry. */
+  /**
+   * An in-stream error, then `[DONE]`. Clients stop on it; they do not retry.
+   * The attempt is marked as failed, with the message as its reason
+   * (retry-notice.ts).
+   */
   async fail(message: string, type: string, code: number): Promise<void> {
+    markFailure(this.response, message);
     const data = sseData({ error: { message, type, code } });
     this.record(`error:${code}`, Buffer.byteLength(data));
     await sseWrite(this.response, data);
@@ -128,11 +134,12 @@ export class SseStream {
   /**
    * Cut the connection without ending the response. Clients on the AI SDK treat
    * this as a network failure: they discard the partial reply and re-send the
-   * request.
+   * request. `reason` is recorded as why the attempt failed (retry-notice.ts).
    */
-  drop(): void {
+  drop(reason?: string): void {
     this.close();
     this.record("drop", 0);
+    markFailure(this.response, reason ?? "was dropped");
     (this.response as ServerResponse & { otterlyDropped?: boolean }).otterlyDropped = true;
     this.response.destroy();
   }
