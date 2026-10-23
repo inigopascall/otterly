@@ -1131,11 +1131,15 @@ function isNativeToolTurnExit(err: unknown): boolean {
  * before normalizeEvents does. It checks the run's isolation, and assembles
  * each tool call from its streamed input_json_delta fragments. The tool_use
  * input in an assistant line can differ from what the model sent, so it is
- * never used. A line that breaks the run's isolation throws TOOL_ISOLATION.
+ * never used. A line that breaks the run's isolation throws TOOL_ISOLATION;
+ * any other shape it does not expect throws NATIVE_TURN_UNEXPECTED. An
+ * api_retry line, the CLI retrying a failed API request by itself, discards
+ * the failed attempt and permits one more message.
  */
 class NativeTurnReader {
   private initChecked = false;
-  private messageStarts = 0;
+  /** How many more message_start lines may come: one, and one after each api_retry. */
+  private startsAllowed = 1;
   private readonly open = new Map<number, { id: string; name: string; json: string }>();
   private calls = 0;
   private stopReason: string | null = null;
@@ -1163,6 +1167,7 @@ class NativeTurnReader {
           }
           this.initChecked = true;
         }
+        if (raw.subtype === "api_retry") return this.readApiRetry(raw);
         return { events: [], consumed: false };
       case "stream_event":
         return this.readStreamEvent(raw);
@@ -1202,8 +1207,9 @@ class NativeTurnReader {
     const index = typeof ev.index === "number" ? ev.index : -1;
     switch (ev.type) {
       case "message_start":
-        if (!this.initChecked) throw this.violation("a message started before the tool inventory was checked");
-        if (++this.messageStarts > 1) throw this.violation("a second API message started in a one-turn run");
+        if (!this.initChecked) throw this.unexpected("a message started before the tool inventory was checked");
+        if (this.startsAllowed <= 0) throw this.unexpected("a second API message started with no API retry before it");
+        this.startsAllowed--;
         return { events: [], consumed: true };
       case "content_block_start": {
         const block = ev.content_block && typeof ev.content_block === "object" ? ev.content_block as Record<string, unknown> : {};
@@ -1260,6 +1266,37 @@ class NativeTurnReader {
   private violation(problem: string, detail: Record<string, unknown> = {}): AgentError {
     logDiag("error", { requestId: this.traceId, message: "native_tool_isolation_violation", problem, ...detail });
     return new AgentError("TOOL_ISOLATION", `Native client-tool isolation failed: ${problem}. The run was stopped.`);
+  }
+
+  /** A shape this reader does not expect, which is no isolation problem. The error's message is the problem alone. */
+  private unexpected(problem: string): AgentError {
+    logDiag("warn", { requestId: this.traceId, message: "native_turn_unexpected", problem });
+    return new AgentError("NATIVE_TURN_UNEXPECTED", problem);
+  }
+
+  /**
+   * The CLI retries a failed API request by itself, printing an api_retry
+   * line first. The failed attempt's unfinished calls and stop reason are
+   * discarded, the retried attempt's calls are numbered from 0, and one more
+   * message may start.
+   */
+  private readApiRetry(raw: Record<string, unknown>): { events: AgentEvent[]; consumed: boolean } {
+    const attempt = typeof raw.attempt === "number" ? raw.attempt : null;
+    this.open.clear();
+    this.stopReason = null;
+    this.stoppedForTools = false;
+    this.calls = 0;
+    this.startsAllowed = 1;
+    logDiag("info", {
+      requestId: this.traceId,
+      message: "native_turn_api_retry",
+      attempt,
+      maxRetries: raw.max_retries,
+      retryDelayMs: raw.retry_delay_ms,
+      errorStatus: raw.error_status,
+      error: raw.error,
+    });
+    return { events: [{ type: "turn_retry", attempt }], consumed: true };
   }
 }
 
@@ -1559,6 +1596,9 @@ export class ClaudeEngine {
         throw err;
       }
       if (err instanceof AgentError && err.code === "TOOL_ISOLATION") {
+        throw err;
+      }
+      if (err instanceof AgentError && err.code === "NATIVE_TURN_UNEXPECTED") {
         throw err;
       }
       const reason = abortController.signal.reason;

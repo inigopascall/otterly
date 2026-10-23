@@ -522,6 +522,7 @@ export function sseData(obj: unknown): string {
 export function errorToHttpStatus(err: unknown): number {
   if (err instanceof AgentError && err.code === "NATIVE_TOOL_CALL") return 502;
   if (err instanceof AgentError && err.code === "TOOL_ISOLATION") return 502;
+  if (err instanceof AgentError && err.code === "NATIVE_TURN_UNEXPECTED") return 502;
   if (err instanceof AgentError && err.code === "TIMEOUT") return 504;
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   if (msg.includes("anthropic_api_key") || msg.includes("authentication") || msg.includes("not_authenticated") || msg.includes("not logged in")) {

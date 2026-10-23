@@ -145,6 +145,11 @@ function classifyStreamFailure(err: unknown, signal: AbortSignal): StreamFailure
   if (err instanceof AgentError && err.code === "NATIVE_TOOL_CALL") {
     return { kind: "retry", reason: "called one of Claude's own tools instead of requesting an external one" };
   }
+  // A native client-tool run printed a shape Otterly does not expect, which is
+  // no isolation problem: dropped, so that the client retries.
+  if (err instanceof AgentError && err.code === "NATIVE_TURN_UNEXPECTED") {
+    return { kind: "retry", reason: `produced output Otterly did not expect (${err.message})` };
+  }
   // A native client-tool run broke its isolation: an in-stream error, which
   // the client does not retry.
   if (err instanceof AgentError && err.code === "TOOL_ISOLATION") {
@@ -843,6 +848,20 @@ async function handleNativeToolStream(
           calls.push(event);
         } else if (event.type === "turn_stop") {
           stopReason = event.stopReason;
+        } else if (event.type === "turn_retry") {
+          // The CLI retried a failed API request. A reply already started
+          // cannot be taken back, so the client retries the whole request;
+          // otherwise the failed attempt's calls are discarded.
+          if (out.sentText) {
+            abortController.abort();
+            dropForRetry(req, out, fingerprint, "was interrupted by an Anthropic API retry after its reply had started", startedAt, { attempt: event.attempt });
+            return;
+          }
+          calls.length = 0;
+          stopReason = null;
+          const retry = event.attempt !== null ? ` (retry ${event.attempt})` : "";
+          await out.thinking(`\n\n⚠️ Otterly: the connection to Anthropic dropped and Claude Code retried it${retry}.\n\n`);
+          logDiag("info", { requestId, message: "native_turn_retried", attempt: event.attempt });
         } else if (event.type === "result") {
           resultText = event.text || "";
           usage = event.usage;
@@ -855,6 +874,9 @@ async function handleNativeToolStream(
     } catch (err) {
       if (err instanceof AgentError && err.code === "TOOL_ISOLATION") {
         log("error", { requestId, message: "native_tool_isolation_failed", error: err.message });
+      }
+      if (err instanceof AgentError && err.code === "NATIVE_TURN_UNEXPECTED") {
+        log("warn", { requestId, message: "native_turn_unexpected", error: err.message });
       }
       await failStream(req, out, err, abortController.signal, fingerprint, startedAt, circuitBreaker);
       return;

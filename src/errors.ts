@@ -7,6 +7,7 @@ export type ErrorCode =
   | "SDK_NOT_FOUND"
   | "NATIVE_TOOL_CALL"
   | "TOOL_ISOLATION"
+  | "NATIVE_TURN_UNEXPECTED"
   | "TIMEOUT"
   | "UNKNOWN";
 

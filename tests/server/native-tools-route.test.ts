@@ -394,3 +394,145 @@ describe("R22 a TOOL_ISOLATION failure from the engine", () => {
     expect(await gone(lastDir)).toBe(true);
   });
 });
+
+const retried = (attempt: number | null) => ({ type: "turn_retry", attempt });
+
+describe("N8 a CLI API retry before any reply text", () => {
+  it("sends the reasoning with a retry line, then only the retried attempt's call, then tool_calls and [DONE]", async () => {
+    state.script = seq([
+      { type: "thinking_delta", delta: "Planning." },
+      stop(null),
+      retried(1),
+      call(0, "mcp__c__get_weather", '{"city":"Rome"}'),
+      stop("tool_use"),
+      result(),
+    ]);
+    const r = await postStream(nativeBase, body("N8"));
+    expect(r.status).toBe(200);
+    expect(r.done).toBe(true);
+    const reasoning = reasoningOf(r.chunks).join("");
+    expect(reasoning).toContain("Planning.");
+    expect(reasoning).toContain("Claude Code retried it (retry 1)");
+    expect(reasoning.indexOf("Planning.")).toBeLessThan(reasoning.indexOf("Claude Code retried it"));
+    expect(r.chunks.some(isContent)).toBe(false);
+    const calls = toolCallsOf(r.chunks);
+    expect([...calls.keys()]).toEqual([0]);
+    expect(calls.get(0)!.first.function.name).toBe("get_weather");
+    expect(JSON.parse(calls.get(0)!.args)).toEqual({ city: "Rome" });
+    expect(r.chunks.at(-1).choices[0].finish_reason).toBe("tool_calls");
+    expect(r.raw.trimEnd().endsWith("data: [DONE]")).toBe(true);
+  });
+
+  it("leaves out (retry N) when the attempt is unknown", async () => {
+    state.script = seq([retried(null), call(0, "mcp__c__get_weather", '{"city":"Rome"}'), stop("tool_use"), result()]);
+    const r = await postStream(nativeBase, body("N8 no attempt"));
+    expect(r.done).toBe(true);
+    const reasoning = reasoningOf(r.chunks).join("");
+    expect(reasoning).toContain("Claude Code retried it.");
+    expect(reasoning).not.toContain("(retry");
+  });
+});
+
+describe("N9 a CLI API retry after a call", () => {
+  it("sends only the retried attempt's call", async () => {
+    state.script = seq([
+      call(0, "mcp__c__read_files", '{"paths": ["/a"]}'),
+      retried(1),
+      call(0, "mcp__c__get_weather", '{"city":"Rome"}'),
+      stop("tool_use"),
+      result(),
+    ]);
+    const r = await postStream(nativeBase, body("N9"));
+    expect(r.done).toBe(true);
+    const calls = toolCallsOf(r.chunks);
+    expect([...calls.keys()]).toEqual([0]);
+    expect(calls.get(0)!.first.function.name).toBe("get_weather");
+    expect(JSON.parse(calls.get(0)!.args)).toEqual({ city: "Rome" });
+    expect(r.chunks.at(-1).choices[0].finish_reason).toBe("tool_calls");
+  });
+});
+
+describe("N10 a CLI API retry after the reply had started", () => {
+  it("drops the stream and stops the run, removes the per-request directory, and the retry opens with an (attempt 2) notice", async () => {
+    let n = 0;
+    let firstSignal: AbortSignal | undefined;
+    let afterRetry = false;
+    state.script = (p: unknown, o: any) => {
+      n++;
+      if (n === 1) {
+        return (async function* () {
+          noteDir(o);
+          firstSignal = o.signal;
+          yield { type: "text_delta", delta: "Checking " };
+          yield retried(1);
+          afterRetry = true;
+          yield call(0, "mcp__c__get_weather", '{"city":"Rome"}');
+          yield stop("tool_use");
+          yield result();
+        })();
+      }
+      return seq([call(0, "mcp__c__get_weather", '{"city":"Rome"}'), stop("tool_use"), result()])(p, o);
+    };
+    lastDir = "";
+    const b = body("N10");
+    const first = await postStream(nativeBase, b);
+    expectDropped(first);
+    expect(afterRetry).toBe(false);
+    expect(firstSignal?.aborted).toBe(true);
+    expect(lastDir).not.toBe("");
+    expect(await gone(lastDir)).toBe(true);
+    const second = await postStream(nativeBase, b);
+    expect(second.done).toBe(true);
+    const notice = reasoningOf(second.chunks)[0];
+    expect(notice).toContain("(attempt 2)");
+    expect(notice).toContain("interrupted by an Anthropic API retry");
+    expect(second.chunks.at(-1).choices[0].finish_reason).toBe("tool_calls");
+  });
+});
+
+describe("N11 NATIVE_TURN_UNEXPECTED from the engine", () => {
+  it("drops the stream rather than sending an in-stream error, and the retry opens with an (attempt 2) notice", async () => {
+    let n = 0;
+    state.script = (p: unknown, o: any) => {
+      n++;
+      if (n === 1) {
+        return (async function* () {
+          noteDir(o);
+          yield { type: "thinking_delta", delta: "Thinking." };
+          throw new AgentError("NATIVE_TURN_UNEXPECTED", "a second API message started with no API retry before it");
+        })();
+      }
+      return seq([call(0, "mcp__c__get_weather", '{"city":"Rome"}'), stop("tool_use"), result()])(p, o);
+    };
+    const b = body("N11");
+    const first = await postStream(nativeBase, b);
+    expectDropped(first);
+    expect(first.chunks.some((c) => c.error)).toBe(false);
+    const second = await postStream(nativeBase, b);
+    expect(second.done).toBe(true);
+    const notice = reasoningOf(second.chunks)[0];
+    expect(notice).toContain("(attempt 2)");
+    expect(notice).toContain("produced output Otterly did not expect (a second API message started with no API retry before it)");
+    expect(second.chunks.at(-1).choices[0].finish_reason).toBe("tool_calls");
+  });
+});
+
+describe("N12 TOOL_ISOLATION from the engine after a CLI API retry", () => {
+  it("still sends an in-stream error with code 502 and [DONE], with no drop", async () => {
+    lastDir = "";
+    state.script = async function* (_p: unknown, options: any) {
+      noteDir(options);
+      yield retried(1);
+      throw new AgentError("TOOL_ISOLATION", "Native client-tool isolation failed: test. The run was stopped.");
+    };
+    const r = await postStream(nativeBase, body("N12"));
+    expect(r.status).toBe(200);
+    expect(r.done).toBe(true);
+    expect(r.complete).toBe(true);
+    const errorChunk = r.chunks.find((c) => c.error);
+    expect(errorChunk.error.code).toBe(502);
+    expect(r.raw.indexOf('"code":502')).toBeLessThan(r.raw.indexOf("data: [DONE]"));
+    expect(r.chunks.some(isTool)).toBe(false);
+    expect(await gone(lastDir)).toBe(true);
+  });
+});

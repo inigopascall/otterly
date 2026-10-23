@@ -148,6 +148,15 @@ export interface TurnStopEvent {
   stopReason: string | null;
 }
 
+/** In a native client-tool run, the CLI retried a failed API request by
+ *  itself: the failed attempt's unfinished calls are discarded, and the
+ *  retried attempt's calls are counted from 0. `attempt` is the CLI's retry
+ *  number, or null when it gave none. */
+export interface TurnRetryEvent {
+  type: "turn_retry";
+  attempt: number | null;
+}
+
 export type AgentEvent =
   | TextEvent
   | TextDeltaEvent
@@ -158,7 +167,8 @@ export type AgentEvent =
   | ErrorEvent
   | ResultEvent
   | ClientToolCallEvent
-  | TurnStopEvent;
+  | TurnStopEvent
+  | TurnRetryEvent;
 
 // ── Result (from run()) ──
 

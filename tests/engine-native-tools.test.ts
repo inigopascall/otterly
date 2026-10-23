@@ -29,6 +29,8 @@ const init = (over: Line = {}): Line => ({
   plugins: [],
   ...over,
 });
+
+
 const se = (event: Line): Line => ({ type: "stream_event", event, session_id: "session-1", parent_tool_use_id: null });
 const messageStart = (): Line => se({
   type: "message_start",
@@ -226,7 +228,6 @@ describe("R10 TOOL_ISOLATION", () => {
     ["a tool_result with is_error false", [
       init(), messageStart(), toolStart(0, "toolu_a", "mcp__c__read_files"), jsonDelta(0, '{"paths": []}'), blockStop(0), toolResult("toolu_a", false),
     ]],
-    ["a second message_start", [init(), messageStart(), blockStart(0, { type: "text", text: "" }), textDelta(0, "Hi"), blockStop(0), messageStart()]],
     ["a content_block_start of type server_tool_use", [
       init(), messageStart(), blockStart(0, { type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: {} }),
     ]],
@@ -237,6 +238,15 @@ describe("R10 TOOL_ISOLATION", () => {
     const err = await failure(drain(new ClaudeEngine({}, queryOf([...lines, messageDelta("end_turn"), messageStop()], { seen })).stream("p", NATIVE)));
     expect(err).toBeInstanceOf(AgentError);
     expect((err as AgentError).code).toBe("TOOL_ISOLATION");
+    expect((seen[0].abortController as AbortController).signal.aborted).toBe(true);
+  });
+
+  it("throws NATIVE_TURN_UNEXPECTED, not TOOL_ISOLATION, and aborts the run for a second message_start", async () => {
+    const lines = [init(), messageStart(), blockStart(0, { type: "text", text: "" }), textDelta(0, "Hi"), blockStop(0), messageStart()];
+    const seen: Array<Record<string, unknown>> = [];
+    const err = await failure(drain(new ClaudeEngine({}, queryOf([...lines, messageDelta("end_turn"), messageStop()], { seen })).stream("p", NATIVE)));
+    expect(err).toBeInstanceOf(AgentError);
+    expect((err as AgentError).code).toBe("NATIVE_TURN_UNEXPECTED");
     expect((seen[0].abortController as AbortController).signal.aborted).toBe(true);
   });
 });
@@ -262,4 +272,94 @@ describe("R12 options that cannot be combined with clientToolsNative", () => {
     expect(err).toBeInstanceOf(Error);
     expect(called.n).toBe(0);
   });
+});
+
+// A CLI API retry: the CLI prints an api_retry line, then starts the request
+// again with a new message_start.
+const apiRetry = (attempt: unknown): Line => ({
+  type: "system", subtype: "api_retry", attempt, max_retries: 10, retry_delay_ms: 513, error_status: null, error: "unknown", session_id: "session-1",
+});
+/** A first attempt cut short, as before the api_retry: thinking, then message_stop with no message_delta. */
+const cutAttempt = (): Line[] => [messageStart(), blockStart(0, { type: "thinking", thinking: "" }), blockStop(0), messageStop()];
+/** An attempt that completes one call and stops for tool use. */
+const oneCallAttempt = (id: string, name: string, json: string): Line[] => [
+  messageStart(), toolStart(0, id, name), jsonDelta(0, json), blockStop(0), messageDelta("tool_use"), messageStop(),
+];
+const successResult = (text: string): Line => ({
+  type: "result", subtype: "success", is_error: false, result: text, total_cost_usd: 0.001, duration_ms: 900, session_id: "session-1", usage: { input_tokens: 5, output_tokens: 3 },
+});
+const retriesOf = (events: AgentEvent[]) => events.filter((e) => e.type === "turn_retry");
+
+async function expectAborted(lines: Line[], code: string): Promise<void> {
+  const seen: Array<Record<string, unknown>> = [];
+  const err = await failure(drain(new ClaudeEngine({}, queryOf(lines, { seen })).stream("p", NATIVE)));
+  expect(err).toBeInstanceOf(AgentError);
+  expect((err as AgentError).code).toBe(code);
+  expect((seen[0].abortController as AbortController).signal.aborted).toBe(true);
+}
+
+describe("N1 a CLI API retry after a first attempt cut short", () => {
+  it("yields turn_retry, then the retried attempt's one call with index 0, turn_stop tool_use and the result, with no error", async () => {
+    const lines = [init(), { type: "system", subtype: "status", status: "requesting", session_id: "session-1" }, ...cutAttempt(), apiRetry(1), ...oneCallAttempt("toolu_b", "mcp__c__run_task", '{"subagentId": "code-runner"}'), maxTurnsResult()];
+    const throwAfter = new Error("claude exited 1: Error: Reached maximum number of turns (1)");
+    const events = await drain(new ClaudeEngine({}, queryOf(lines, { throwAfter })).stream("p", NATIVE));
+    const retryAt = events.findIndex((e) => e.type === "turn_retry");
+    expect(events[retryAt]).toEqual({ type: "turn_retry", attempt: 1 });
+    const calls = callsOf(events);
+    expect(calls).toEqual([{ type: "client_tool_call", index: 0, id: "toolu_b", name: "mcp__c__run_task", argumentsJson: '{"subagentId": "code-runner"}' }]);
+    expect(events.indexOf(calls[0])).toBeGreaterThan(retryAt);
+    expect(events.at(-2)).toEqual({ type: "turn_stop", stopReason: "tool_use" });
+    expect(events.at(-1)).toEqual({ type: "result", text: "", cost: 0.0123, duration: 2100, sessionId: "session-1", usage: USAGE });
+    expect(events.some((e) => e.type === "error")).toBe(false);
+  });
+});
+
+describe("N2 a CLI API retry after a completed call", () => {
+  it("yields the first attempt's call, turn_retry, then the retried attempt's call numbered from 0", async () => {
+    const lines = [init(), messageStart(), toolStart(0, "toolu_a", "mcp__c__read_files"), jsonDelta(0, '{"paths": ["/a"]}'), blockStop(0), apiRetry(1), ...oneCallAttempt("toolu_b", "mcp__c__run_task", '{"prompt": "ls"}'), maxTurnsResult()];
+    const events = await drain(new ClaudeEngine({}, queryOf(lines)).stream("p", NATIVE));
+    expect(events.filter((e) => e.type === "client_tool_call" || e.type === "turn_retry")).toEqual([{ type: "client_tool_call", index: 0, id: "toolu_a", name: "mcp__c__read_files", argumentsJson: '{"paths": ["/a"]}' }, { type: "turn_retry", attempt: 1 }, { type: "client_tool_call", index: 0, id: "toolu_b", name: "mcp__c__run_task", argumentsJson: '{"prompt": "ls"}' }]);
+    expect(events.at(-1)?.type).toBe("result");
+    expect(events.some((e) => e.type === "error")).toBe(false);
+  });
+});
+
+describe("N3 a call left open by a CLI API retry", () => {
+  it("is discarded: no client_tool_call for it, even when the retried attempt reuses its block index", async () => {
+    const lines = [init(), messageStart(), toolStart(0, "toolu_a", "mcp__c__read_files"), jsonDelta(0, '{"paths": ['), apiRetry(1), messageStart(), blockStart(0, { type: "text", text: "" }), textDelta(0, "Done."), blockStop(0), messageDelta("end_turn"), messageStop(), successResult("Done.")];
+    const events = await drain(new ClaudeEngine({}, queryOf(lines)).stream("p", NATIVE));
+    expect(callsOf(events)).toEqual([]);
+    expect(retriesOf(events)).toEqual([{ type: "turn_retry", attempt: 1 }]);
+    expect(events.find((e) => e.type === "turn_stop")).toEqual({ type: "turn_stop", stopReason: "end_turn" });
+    expect(events.at(-1)).toMatchObject({ type: "result", text: "Done." });
+    expect(events.some((e) => e.type === "error")).toBe(false);
+  });
+});
+
+describe("N4 several api_retry lines in a row", () => {
+  it("permit one more message_start, with no error, and report a non-numeric attempt as null", async () => {
+    const lines = [init(), ...cutAttempt(), apiRetry(1), apiRetry("2"), ...oneCallAttempt("toolu_b", "mcp__c__run_task", '{"prompt": "ls"}'), maxTurnsResult()];
+    const events = await drain(new ClaudeEngine({}, queryOf(lines)).stream("p", NATIVE));
+    expect(retriesOf(events)).toEqual([{ type: "turn_retry", attempt: 1 }, { type: "turn_retry", attempt: null }]);
+    expect(callsOf(events).map((c) => [c.index, c.id])).toEqual([[0, "toolu_b"]]);
+    expect(events.at(-1)?.type).toBe("result");
+    expect(events.some((e) => e.type === "error")).toBe(false);
+  });
+});
+
+describe("N5 a message_start with no api_retry before it", () => {
+  it("throws NATIVE_TURN_UNEXPECTED and aborts the run for two message_starts in a row", async () => { await expectAborted([init(), messageStart(), blockStart(0, { type: "text", text: "" }), textDelta(0, "Hi"), blockStop(0), messageStart(), messageDelta("end_turn"), messageStop()], "NATIVE_TURN_UNEXPECTED"); });
+  it("throws NATIVE_TURN_UNEXPECTED and aborts the run for a third message_start after one api_retry and two attempts", async () => { await expectAborted([init(), ...cutAttempt(), apiRetry(1), ...cutAttempt(), ...cutAttempt()], "NATIVE_TURN_UNEXPECTED"); });
+});
+
+describe("N6 a message_start before system/init", () => {
+  it("throws NATIVE_TURN_UNEXPECTED and aborts the run", async () => { await expectAborted([messageStart(), init(), messageDelta("end_turn"), messageStop()], "NATIVE_TURN_UNEXPECTED"); });
+});
+
+describe("N7 the safety signals are still TOOL_ISOLATION", () => {
+  const badInit = () => init({ tools: ["mcp__c__read_files", "mcp__c__run_task", "Bash"] });
+  const notRefused = (): Line[] => [toolStart(0, "toolu_a", "mcp__c__read_files"), jsonDelta(0, '{"paths": []}'), blockStop(0), toolResult("toolu_a", false)];
+  const serverTool = (): Line => blockStart(0, { type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: {} });
+  const cases: Array<[string, Line[]]> = [["a failed init check", [badInit(), messageStart()]], ["a failed init check after an api_retry", [apiRetry(1), badInit(), messageStart()]], ["a tool_result with is_error false", [init(), messageStart(), ...notRefused()]], ["a tool_result with is_error false after an api_retry", [init(), ...cutAttempt(), apiRetry(1), messageStart(), ...notRefused()]], ["a server_tool_use block", [init(), messageStart(), serverTool()]], ["a server_tool_use block after an api_retry", [init(), ...cutAttempt(), apiRetry(1), messageStart(), serverTool()]]];
+  it.each(cases)("throws TOOL_ISOLATION and aborts the run for %s", async (_label, lines) => { await expectAborted([...lines, messageDelta("end_turn"), messageStop()], "TOOL_ISOLATION"); });
 });

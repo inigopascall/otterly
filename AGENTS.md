@@ -505,11 +505,18 @@ use the mode.
 - In each run, `NativeTurnReader` in `engine.ts` requires the `system/init`
   line to pass `checkNativeInit`: the tools exactly `mcp__c__<name>` for each
   offered name; one MCP server, `c`, connected; no skills, slash commands or
-  memory paths; `permissionMode` `dontAsk`. It allows one API message only,
-  rejects any block whose type ends in `tool_use` other than `tool_use` itself,
-  and requires every `tool_result` the CLI writes to be an error. A failure is
+  memory paths; `permissionMode` `dontAsk`. It rejects any block whose type
+  ends in `tool_use` other than `tool_use` itself, and requires every
+  `tool_result` the CLI writes to be an error. These failures are
   `TOOL_ISOLATION`, answered with an in-stream error (code 502), which the
   client does not retry.
+- The reader allows one API message, plus one more after each `system/api_retry`
+  line: the CLI retrying a failed API request by itself. The failed attempt's
+  calls are discarded and a `turn_retry` event is yielded; the route adds a
+  retry line to the reasoning, or drops the stream for a retry (§11) when reply
+  text had already been sent. Any other shape the reader does not expect, such
+  as a second message with no retry before it, is `NATIVE_TURN_UNEXPECTED`: the
+  stream is dropped so that the client retries, not answered with an error.
 - After the run, the route counts the `tools/call` entries in the
   placeholder's log (`countToolCallsReceived`). Unless the count is 0, no tool
   call is sent and the reply is an in-stream error (code 502).
@@ -538,7 +545,8 @@ arguments and fixes) and `native-mcp.log.ndjson` (the placeholder's log).
 Log messages: `native_tool_calls`, `native_tool_turn_exit`,
 `native_tools_fallback`, `native_tool_unknown_name`,
 `native_tool_call_reached_server`, `native_tool_isolation_failed`,
-`native_tool_isolation_violation`, `native_tool_inventory_mismatch`.
+`native_tool_isolation_violation`, `native_tool_inventory_mismatch`,
+`native_turn_api_retry`, `native_turn_retried`, `native_turn_unexpected`.
 
 **Tests:** `tests/native-tools.test.ts`, `tests/engine-native-tools.test.ts`
 and `tests/server/native-tools-route.test.ts`; in the CLI suite,
@@ -691,4 +699,7 @@ grep -F -c '| "TOOL_ISOLATION"' src/errors.ts                                   
 grep -F -c 'if (err instanceof AgentError && err.code === "TOOL_ISOLATION") return 502;' src/server/openai-compat.ts # 1
 grep -F -c 'console.log(`  Client tools  : ${clientToolsLine}`);' src/server/index.ts # 1
 test -f tests/native-tools.test.ts && test -f tests/engine-native-tools.test.ts && test -f tests/server/native-tools-route.test.ts && test -f tests-cli/native-client-tools.test.ts && echo present # present
+grep -F -c 'if (raw.subtype === "api_retry") return this.readApiRetry(raw);' src/engine.ts # 1
+grep -F -c '| "NATIVE_TURN_UNEXPECTED"' src/errors.ts                                # 1
+grep -F -c 'err.code === "NATIVE_TURN_UNEXPECTED") {' src/server/routes-openai.ts   # 2
 ```
