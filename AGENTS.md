@@ -1,5 +1,5 @@
 ---
-verified: 2026-10-21
+verified: 2026-10-23
 verified_by: workhorse
 ---
 
@@ -545,8 +545,9 @@ and `tests/server/native-tools-route.test.ts`; in the CLI suite,
 `tests-cli/native-client-tools.test.ts` runs the startup check against the real
 CLI, at no cost.
 
-**On the zbook** the mode runs on `otterly@iwd` only, as a trial switched by
-`~/code/iwd/9router/zbook/native-trial.sh` (`@code/9router/zbook/README.md`).
+**On the zbook** the mode is a trial switched per instance (`otterly@iwd`,
+`otterly@airship`) by `~/code/iwd/9router/zbook/native-trial.sh`
+(`@code/9router/zbook/README.md`).
 
 ## Verify
 
