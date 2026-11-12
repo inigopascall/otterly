@@ -67,7 +67,7 @@ This is a fork of [Otterly](https://github.com/ReallyArtificial/otterly) by Hars
 
 **Up-to-date model list**
 
-- The model list offers Claude Opus 5.5 and 5, Sonnet 5.5 and 5, Haiku 5.5 and Haiku 4.5. The default is `claude-opus-5-5`.
+- The model list offers Claude Fable 5.2 and 5.1, Opus 5.5 and 5, Sonnet 5.5 and 5, Haiku 5.5 and Haiku 4.5. The default is `claude-opus-5-5`.
 
 **Other additions**
 
@@ -708,7 +708,7 @@ grep -F -c 'host:             { type: "string",  short: "H" },' src/cli.ts      
 grep -F -c 'host: values.host,' src/cli.ts                                        # 1
 grep -F -c 'server.listen({ port, host: opts.host }' src/server/index.ts           # 1
 grep -F -c 'export const DEFAULT_MODEL = "claude-opus-5-5";' src/server/models.ts # 1
-grep -c '{ id: "claude-' src/server/models.ts                                    # 6
+grep -c '{ id: "claude-' src/server/models.ts                                    # 8
 grep -F -c 'const INFERENCE_PATHS = new Set(' src/server/index.ts                 # 1
 grep -F -c '"Retry-After": String(limit.retryAfterS)' src/server/index.ts         # 1
 grep -c 'localhost:1143[4]' README.md                                             # 0

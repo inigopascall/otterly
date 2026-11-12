@@ -160,15 +160,10 @@ server listens on all interfaces.
 
 ## 6. Deploying to the zbook
 
-The zbook runs Otterly from `/home/inigo/.local/share/otterly-zbook/app`, a `git clone` of this
-repository (`/home/inigo/code/iwd/otterly`), as the systemd user units `otterly@airship`
-(127.0.0.1:11445) and `otterly@iwd` (127.0.0.1:11446). Commit here first, then:
-
-```
-git -C ~/.local/share/otterly-zbook/app pull --ff-only
-cd ~/.local/share/otterly-zbook/app && pnpm install --frozen-lockfile && pnpm run build
-systemctl --user restart otterly@airship otterly@iwd
-```
+The zbook runs Otterly as the systemd user units `otterly@airship` (127.0.0.1:11445) and
+`otterly@iwd` (127.0.0.1:11446), each from one of two clones of this repository; which clone a
+unit runs is set per unit. How to tell, how to deploy, and how to upgrade the `claude` CLI
+there: KB `Ops/zbook-stack/31-otterly-and-9router-fork.md`.
 
 ## 7. Running tests
 
@@ -665,7 +660,7 @@ grep -rlE 'resolveSDK|CLAUDE_BUILTIN_TOOLS|customSystemPrompt' src tests | wc -l
 grep -F -c 'parts.push("--tools", tools.join(","));' src/engine.ts               # 1
 grep -F -c 'parts.push("--disallowedTools", "*");' src/engine.ts                 # 1
 grep -F -c 'parts.push("--permission-prompt-tool", "stdio");' src/engine.ts      # 1
-grep -F -c 'export const TESTED_CLAUDE_CLI_VERSION = "2.1.296";' src/engine.ts   # 1
+grep -F -c 'export const TESTED_CLAUDE_CLI_VERSION = "2.1.322";' src/engine.ts   # 1
 grep -F -c 'export function setQueryFnForTests' src/engine.ts                    # 1
 grep -F -c 'await verifyClaudeCLI()' src/server/index.ts                         # 1
 grep -F -c '"test:cli": "vitest run --config vitest.cli.config.ts"' package.json # 1

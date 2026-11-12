@@ -44,7 +44,7 @@ let cachedCLIInfo: ClaudeCLIInfo | null | undefined;
 
 /** The claude CLI version the CLI suite (tests-cli/) last passed against.
  *  Update it whenever that suite passes on a newer version. */
-export const TESTED_CLAUDE_CLI_VERSION = "2.1.296";
+export const TESTED_CLAUDE_CLI_VERSION = "2.1.322";
 
 /** Shown when no claude CLI is on PATH. */
 export const CLI_NOT_FOUND_MESSAGE =

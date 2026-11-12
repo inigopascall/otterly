@@ -25,6 +25,8 @@ export interface ModelInfo {
 
 /** The Claude model catalog. `CLAUDE_MODELS` is an alias of `MODELS`. */
 export const MODELS: ModelInfo[] = [
+  { id: "claude-fable-5-2",            label: "Claude Fable 5.2",   contextWindow: 1000000 },
+  { id: "claude-fable-5-1",            label: "Claude Fable 5.1",   contextWindow: 1000000 },
   { id: "claude-opus-5-5",             label: "Claude Opus 5.5",    contextWindow: 1000000 },
   { id: "claude-opus-5",               label: "Claude Opus 5",      contextWindow: 1000000 },
   { id: "claude-sonnet-5-5",           label: "Claude Sonnet 5.5",  contextWindow: 1000000 },
