@@ -660,7 +660,7 @@ grep -rlE 'resolveSDK|CLAUDE_BUILTIN_TOOLS|customSystemPrompt' src tests | wc -l
 grep -F -c 'parts.push("--tools", tools.join(","));' src/engine.ts               # 1
 grep -F -c 'parts.push("--disallowedTools", "*");' src/engine.ts                 # 1
 grep -F -c 'parts.push("--permission-prompt-tool", "stdio");' src/engine.ts      # 1
-grep -F -c 'export const TESTED_CLAUDE_CLI_VERSION = "2.1.322";' src/engine.ts   # 1
+grep -F -c 'export const TESTED_CLAUDE_CLI_VERSION = "2.1.331";' src/engine.ts   # 1
 grep -F -c 'export function setQueryFnForTests' src/engine.ts                    # 1
 grep -F -c 'await verifyClaudeCLI()' src/server/index.ts                         # 1
 grep -F -c '"test:cli": "vitest run --config vitest.cli.config.ts"' package.json # 1
